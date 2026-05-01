@@ -1,5 +1,7 @@
 # Reolink -> YOLO 사람 트래커 -> OSC (공유 projection UV)
 # 이 파일을 config.yaml로 복사한 뒤 실제 카메라 URL/비밀번호를 로컬에서 채우세요.
+# <camera-ip>는 현장 네트워크에서 카메라가 받은 IP입니다.
+# 라우터, Mac Internet Sharing 직결, 설치 장소가 바뀌면 다시 확인해서 갱신하세요.
 
 model: yolo26n.pt
 device: mps

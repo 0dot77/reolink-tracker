@@ -21,7 +21,7 @@ uv pip install -r requirements.txt
 cp config.example.yaml config.yaml
 ```
 
-그 다음 `config.yaml`에 실제 카메라 URL, 비밀번호, 모델, OSC 대상 주소를 입력합니다. `config.yaml`에는 RTSP 인증 정보가 들어갈 수 있으므로 git에 커밋하지 않습니다.
+그 다음 `config.yaml`에 실제 카메라 URL, 비밀번호, 모델, OSC 대상 주소를 입력합니다. 카메라 IP는 공간과 네트워크 구성마다 달라질 수 있으므로 현장에서 확인한 값을 넣습니다. `config.yaml`에는 RTSP 인증 정보가 들어갈 수 있으므로 git에 커밋하지 않습니다.
 
 첫 실행 시 `yolo26n.pt`가 작업 폴더에 다운로드됩니다. YOLO26은 Ultralytics가 2026-01-14에 공개한 모델로, NMS 없는 end-to-end inference, CPU 기준 약 43% 속도 향상, 긴 복도 끝의 작은 사람 감지에 도움이 되는 small-target STAL head가 특징입니다.
 
@@ -36,6 +36,18 @@ python tracker.py --show
 ```
 
 카메라, 모델, OSC 대상은 `config.yaml`에서 수정합니다. 수정 후에는 프로그램을 다시 시작합니다.
+
+`--show` 미리보기 키:
+
+- `q` 또는 `Esc`: 종료
+- `h`: HUD 표시 토글
+- `u`: projection UV canvas 표시 토글
+- `1`-`9`: focus camera 선택
+- `d`: focus camera에 region 그리기 시작
+- 마우스 왼쪽 클릭 4회: projection 기준 top-left -> top-right -> bottom-right -> bottom-left 순서로 image point 입력
+- `Backspace`: region 그리기 중 마지막 점 취소
+- `x`: focus camera의 마지막 region 삭제
+- `w`: 현재 region 편집 내용을 로컬 `config.yaml`에 저장
 
 ## AI / GitHub 작업 방식
 
@@ -72,7 +84,7 @@ python tracker.py --show
 
 ## 캘리브레이션 / region 설정
 
-현재 `viewer.py`의 region draw mode는 v2 TODO입니다. `README`가 먼저 설명하던 `d` 키 기반 4점 드로잉은 아직 실제 구현과 맞지 않습니다. 당장은 `config.yaml`의 `regions`를 직접 작성하거나, Issue #2에서 문서와 구현을 맞추는 작업을 진행합니다.
+`viewer.py`는 `--show`에서 focus camera의 region을 4점 클릭으로 추가하고 `w`로 로컬 `config.yaml`에 저장할 수 있습니다. 저장된 region은 기본적으로 첫 projection의 전체 UV `[0.0, 0.0, 1.0, 1.0]`로 생성됩니다. 여러 카메라가 한 projection을 나눠 담당하는 설치에서는 저장 후 `projection_uv`와 `dispatch_uv`를 원하는 slice로 조정합니다. `config.example.yaml`에는 공유 가능한 예시 구조만 두고, 실제 RTSP URL과 비밀번호가 들어가는 `config.yaml`은 로컬에만 유지합니다.
 
 region의 4개 `image_points`는 **projection-UV 방향** 기준으로 입력합니다.
 
@@ -82,12 +94,28 @@ top-left -> top-right -> bottom-right -> bottom-left
 
 이는 카메라 이미지에서 보이는 순서가 아니라 projection/world 기준 순서입니다. 그래서 서로 마주 보는 복도 카메라 2대가 거울처럼 반대로 보이더라도 같은 공유 UV 프레임으로 매핑할 수 있습니다.
 
+예시:
+
+```yaml
+cameras:
+  - name: cam0
+    regions:
+      - id: near_half
+        projection_id: corridor
+        image_points: [[120, 90], [760, 95], [790, 470], [100, 460]]
+        projection_uv: [0.0, 0.0, 0.55, 1.0]
+        dispatch_uv: [0.0, 0.0, 0.50, 1.0]
+        min_bbox_height_px: 24
+```
+
 ## 카메라 2대 네트워크 구성
 
-도구는 `config.yaml`에 적힌 RTSP URL만 사용합니다. 아래 중 하나를 선택하면 됩니다.
+도구는 `config.yaml`에 적힌 RTSP URL만 사용합니다. 카메라 IP는 고정된 프로젝트 값이 아니라 현재 공간의 네트워크에서 받은 값입니다. 장소를 옮기거나 직결/공유기 구성을 바꾸면 Reolink 앱, 공유기 DHCP 목록, 또는 `arp`로 IP를 다시 확인한 뒤 `config.yaml`을 갱신합니다.
+
+아래 중 하나를 선택하면 됩니다.
 
 1. **두 카메라를 라우터에 연결**: 추천 방식입니다. 두 카메라를 iPTIME LAN 포트에 꽂으면 DHCP로 `172.30.1.x` 대역 IP를 받고, Mac은 Wi-Fi나 LAN으로 접속합니다.
-2. **두 카메라를 스위치로 직접 연결**: Mac의 USB-Ethernet 어댑터에 작은 unmanaged 5-port switch를 연결합니다. Mac에서 DHCP를 제공해야 하므로 System Settings -> General -> Sharing -> Internet Sharing을 사용합니다.
+2. **두 카메라를 스위치로 직접 연결**: Mac의 USB-Ethernet 어댑터에 작은 unmanaged 5-port switch를 연결합니다. Mac에서 DHCP를 제공해야 하므로 System Settings -> General -> Sharing -> Internet Sharing을 사용합니다. 이 경우 카메라는 보통 `192.168.2.x` 같은 주소를 받습니다.
 3. **하나는 직접 연결, 하나는 Wi-Fi 경유**: 동작은 가능하지만 경로가 섞여 설정이 복잡해집니다.
 
 ## 지연 시간 튜닝

@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 # Force low-latency RTSP via FFmpeg backend. Must be set before importing cv2 ops.
 os.environ.setdefault(
@@ -51,6 +52,21 @@ from region import (
 )
 
 PERSON_CLASS_ID = 0  # COCO
+
+
+class ConfigError(ValueError):
+    """Raised when config.yaml is structurally valid YAML but not runnable."""
+
+
+def _redact_url(url: str) -> str:
+    """Hide credentials when logging camera URLs."""
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    host = parts.netloc.rsplit("@", 1)[1]
+    return urlunsplit(
+        (parts.scheme, f"<credentials>@{host}", parts.path, parts.query, parts.fragment)
+    )
 
 
 @dataclass
@@ -90,7 +106,7 @@ class FrameGrabber(threading.Thread):
             if not first:
                 self.reconnects += 1
             first = False
-            print(f"[{self.cam.name}] connected: {self.cam.url}")
+            print(f"[{self.cam.name}] connected: {_redact_url(self.cam.url)}")
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok:
@@ -138,7 +154,7 @@ class CamWorker:
         self.osc_count = 0
 
     def update_regions(self, regions: list[Region]) -> None:
-        """Hook for v2 viewer-driven region edits."""
+        """Replace active regions after operator edits in the viewer."""
         self.cam.regions = regions
         self.last_ids = {r.id: set() for r in regions}
         self.last_ids[""] = set()
@@ -264,10 +280,61 @@ class CamWorker:
         return overlays, self.cam.regions
 
 
+def _require_mapping(value: object, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{label} must be a mapping")
+    return value
+
+
+def _require_sequence(value: object, label: str) -> list:
+    if not isinstance(value, list):
+        raise ConfigError(f"{label} must be a list")
+    return value
+
+
+def _require_uv_rect(value: object, label: str) -> tuple[float, float, float, float]:
+    rect = _require_sequence(value, label)
+    if len(rect) != 4:
+        raise ConfigError(f"{label} must contain 4 values [u0, v0, u1, v1]")
+    try:
+        return tuple(float(v) for v in rect)
+    except (TypeError, ValueError) as ex:
+        raise ConfigError(f"{label} must contain numeric values") from ex
+
+
+def _require_field(entry: dict, key: str, label: str) -> object:
+    if key not in entry or entry[key] in (None, ""):
+        raise ConfigError(f"{label} is missing required field '{key}'")
+    return entry[key]
+
+
+def _validate_camera_url(url: object, label: str) -> str:
+    if not isinstance(url, str) or not url.strip():
+        raise ConfigError(f"{label}.url must be a non-empty RTSP URL")
+    if "<" in url or ">" in url:
+        raise ConfigError(
+            f"{label}.url still contains placeholder values. Copy "
+            "config.example.yaml to config.yaml, then replace <camera-ip> and "
+            "<urlencoded-password> with the real Reolink RTSP URL."
+        )
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "rtsp" or not parts.netloc:
+        raise ConfigError(
+            f"{label}.url must be an rtsp:// URL, got {_redact_url(url)}"
+        )
+    return url
+
+
 def _parse_projections(cfg: dict) -> dict[str, Projection]:
     out: dict[str, Projection] = {}
-    for entry in cfg.get("projections", []) or []:
-        pid = entry["id"]
+    projection_entries = _require_sequence(
+        cfg.get("projections", []) or [],
+        "projections",
+    )
+    for idx, entry in enumerate(projection_entries):
+        label = f"projections[{idx}]"
+        entry = _require_mapping(entry, label)
+        pid = _require_field(entry, "id", label)
         ps = entry.get("pixel_size")
         ws = entry.get("world_size_m")
         out[pid] = Projection(
@@ -280,29 +347,42 @@ def _parse_projections(cfg: dict) -> dict[str, Projection]:
 
 def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[Region]:
     regions: list[Region] = []
-    for r in cam_entry.get("regions", []) or []:
-        pid = r["projection_id"]
+    cam_name = cam_entry.get("name", "<unnamed>")
+    region_entries = _require_sequence(
+        cam_entry.get("regions", []) or [],
+        f"camera {cam_name}.regions",
+    )
+    for idx, r in enumerate(region_entries):
+        label = f"camera {cam_name} region[{idx}]"
+        r = _require_mapping(r, label)
+        rid = _require_field(r, "id", label)
+        pid = _require_field(r, "projection_id", f"{label} {rid}")
         if pid not in projections:
-            print(
-                f"warn: camera {cam_entry.get('name')} region {r.get('id')} "
-                f"references unknown projection_id={pid}; skipping"
+            known = ", ".join(sorted(projections.keys())) or "(none configured)"
+            raise ConfigError(
+                f"{label} {rid} references unknown projection_id={pid!r}; "
+                f"known projections: {known}"
             )
-            continue
-        proj_uv = tuple(r["projection_uv"])
-        disp_uv = tuple(r.get("dispatch_uv", proj_uv))
+        if "projection_uv" not in r:
+            raise ConfigError(f"{label} {rid} is missing required field 'projection_uv'")
+        if "image_points" not in r:
+            raise ConfigError(f"{label} {rid} is missing required field 'image_points'")
+        proj_uv = _require_uv_rect(r["projection_uv"], f"{label} {rid}.projection_uv")
+        if "dispatch_uv" in r:
+            disp_uv = _require_uv_rect(r["dispatch_uv"], f"{label} {rid}.dispatch_uv")
+        else:
+            disp_uv = proj_uv
+        image_points = _require_sequence(r["image_points"], f"{label} {rid}.image_points")
         try:
             validate_dispatch(proj_uv, disp_uv)
-            H = build_homography([tuple(p) for p in r["image_points"]], proj_uv)
-        except ValueError as ex:
-            print(
-                f"warn: camera {cam_entry.get('name')} region {r.get('id')}: {ex}; skipping"
-            )
-            continue
+            H = build_homography([tuple(p) for p in image_points], proj_uv)
+        except (TypeError, ValueError) as ex:
+            raise ConfigError(f"{label} {rid}: {ex}") from ex
         regions.append(
             Region(
-                id=r["id"],
+                id=rid,
                 projection_id=pid,
-                image_points=[tuple(p) for p in r["image_points"]],
+                image_points=[tuple(p) for p in image_points],
                 projection_uv=proj_uv,
                 dispatch_uv=disp_uv,
                 min_bbox_height_px=int(r.get("min_bbox_height_px", 0)),
@@ -312,9 +392,58 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
     return regions
 
 
+def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg]:
+    if "cameras" not in cfg:
+        raise ConfigError("config is missing required top-level 'cameras' list")
+    camera_entries = _require_sequence(cfg.get("cameras"), "cameras")
+    if not camera_entries:
+        raise ConfigError("config must define at least one camera in 'cameras'")
+
+    cams: list[CamCfg] = []
+    for idx, entry in enumerate(camera_entries):
+        label = f"cameras[{idx}]"
+        entry = _require_mapping(entry, label)
+        name = _require_field(entry, "name", label)
+        url = _validate_camera_url(
+            _require_field(entry, "url", label),
+            f"camera {name}",
+        )
+        cams.append(
+            CamCfg(
+                name=name,
+                url=url,
+                osc_prefix=entry.get("osc_prefix", f"/cam/{name}"),
+                regions=_parse_regions(entry, projections),
+            )
+        )
+    return cams
+
+
 def load_cfg(path: Path) -> dict:
     with open(path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    if cfg is None:
+        raise ConfigError(f"{path} is empty")
+    return _require_mapping(cfg, str(path))
+
+
+def _region_to_cfg(region: Region) -> dict:
+    out = {
+        "id": region.id,
+        "projection_id": region.projection_id,
+        "image_points": [[round(float(x), 1), round(float(y), 1)]
+                         for x, y in region.image_points],
+        "projection_uv": [float(v) for v in region.projection_uv],
+        "dispatch_uv": [float(v) for v in region.dispatch_uv],
+    }
+    if region.min_bbox_height_px:
+        out["min_bbox_height_px"] = int(region.min_bbox_height_px)
+    return out
+
+
+def save_cfg(path: Path, cfg: dict) -> None:
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
 
 def main() -> int:
@@ -325,22 +454,13 @@ def main() -> int:
     ap.add_argument("--device", default=None, help="override device (mps|cpu|cuda)")
     args = ap.parse_args()
 
-    cfg = load_cfg(Path(args.config))
-
-    projections = _parse_projections(cfg)
-
-    cams: list[CamCfg] = []
-    for c in cfg.get("cameras", []) or []:
-        cams.append(
-            CamCfg(
-                name=c["name"],
-                url=c["url"],
-                osc_prefix=c.get("osc_prefix", f"/cam/{c['name']}"),
-                regions=_parse_regions(c, projections),
-            )
-        )
-    if not cams:
-        print("error: no cameras in config")
+    config_path = Path(args.config)
+    try:
+        cfg = load_cfg(config_path)
+        projections = _parse_projections(cfg)
+        cams = _parse_cameras(cfg, projections)
+    except (OSError, yaml.YAMLError, ConfigError) as ex:
+        print(f"config error: {ex}", file=sys.stderr)
         return 2
 
     osc_cfg = cfg.get("osc", {}) or {}
@@ -375,7 +495,21 @@ def main() -> int:
         # Lazy-import so headless runs don't pay viewer's import cost.
         from viewer import CamFrame, TrackOverlay, Viewer
 
-        viewer = Viewer(projections)
+        def _on_regions_changed(cam_idx: int, regions: list[Region]) -> None:
+            workers[cam_idx].update_regions(regions)
+            cfg["cameras"][cam_idx]["regions"] = [
+                _region_to_cfg(region) for region in regions
+            ]
+
+        def _on_save() -> None:
+            save_cfg(config_path, cfg)
+            print(f"saved config: {config_path}")
+
+        viewer = Viewer(
+            projections,
+            on_regions_changed=_on_regions_changed,
+            on_save=_on_save,
+        )
 
     stop_flag = threading.Event()
 
