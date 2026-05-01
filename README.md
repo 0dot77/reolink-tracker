@@ -1,12 +1,10 @@
 # reolink-tracker
 
-Two-camera Reolink → YOLO26 person detection + BoT-SORT tracking → OSC.
-Designed for low-latency interactive installations (TouchDesigner, Max, Unity, ...).
-ByteTrack is still selectable as a faster alternative.
+Reolink 카메라 2대의 RTSP 스트림을 받아 YOLO26 사람 감지 + BoT-SORT 트래킹을 수행하고 OSC로 좌표를 내보내는 도구입니다. TouchDesigner, Max, Unity 같은 인터랙티브 설치 작업에서 낮은 지연 시간으로 사람 위치를 쓰기 위해 만들었습니다. 더 빠른 대안으로 ByteTrack도 선택할 수 있습니다.
 
-## Setup
+## 설치
 
-PyTorch wheels are stable on Python 3.11–3.12. Don't use 3.14.
+PyTorch 휠은 Python 3.11-3.12에서 안정적입니다. Python 3.14는 쓰지 않는 편이 좋습니다.
 
 ```bash
 cd /Users/taeyang/Developer/tools/reolink-tracker
@@ -15,117 +13,94 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-(`pip install -r requirements.txt` works too if you don't have `uv`.)
+`uv`가 없으면 `pip install -r requirements.txt`를 써도 됩니다.
 
-Create a local config from the sanitized example:
+공유용 예시 설정을 로컬 설정으로 복사합니다.
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-Then edit `config.yaml` with real camera URLs, passwords, model, and OSC target.
-`config.yaml` is intentionally gitignored because it can contain RTSP
-credentials.
+그 다음 `config.yaml`에 실제 카메라 URL, 비밀번호, 모델, OSC 대상 주소를 입력합니다. `config.yaml`에는 RTSP 인증 정보가 들어갈 수 있으므로 git에 커밋하지 않습니다.
 
-First run downloads `yolo26n.pt` into the working directory. YOLO26 was released
-by Ultralytics on 2026-01-14: NMS-free end-to-end inference, ~+43% CPU speed,
-and a small-target STAL head that helps far-end people in long corridors.
+첫 실행 시 `yolo26n.pt`가 작업 폴더에 다운로드됩니다. YOLO26은 Ultralytics가 2026-01-14에 공개한 모델로, NMS 없는 end-to-end inference, CPU 기준 약 43% 속도 향상, 긴 복도 끝의 작은 사람 감지에 도움이 되는 small-target STAL head가 특징입니다.
 
-## Run
+## 실행
 
 ```bash
-# headless (OSC only)
+# 헤드리스 실행, OSC만 송신
 python tracker.py
 
-# with preview windows (one per camera; press q to quit)
+# 미리보기 창 표시, 종료는 q
 python tracker.py --show
 ```
 
-Edit `config.yaml` for cameras, model, OSC target. Restart after editing.
+카메라, 모델, OSC 대상은 `config.yaml`에서 수정합니다. 수정 후에는 프로그램을 다시 시작합니다.
 
-## AI / GitHub workflow
+## AI / GitHub 작업 방식
 
-This repo keeps project context in versioned markdown so AI coding tools do not
-depend on chat history alone:
+이 레포는 AI 코딩 도구가 채팅 기록에만 의존하지 않도록 프로젝트 맥락을 버전 관리되는 Markdown 파일에 저장합니다.
 
-- `docs/product.md` — product goal, users, MVP, non-goals
-- `docs/tech.md` — architecture and verification notes
-- `docs/ai-rules.md` — stable instructions for AI agents
-- `docs/decisions.md` — important decisions and reversals
+- `docs/product.md`: 제품 목적, 사용자, MVP, 비목표
+- `docs/tech.md`: 아키텍처와 검증 방법
+- `docs/ai-rules.md`: AI 에이전트가 따라야 할 안정적인 규칙
+- `docs/decisions.md`: 중요한 결정과 번복 기록
 
-Use GitHub Issues for small tasks and Pull Requests for review, even when
-working solo. The PR diff becomes the place to review AI-generated changes
-before they reach `main`.
+혼자 작업하더라도 GitHub Issue를 작은 작업 단위로 쓰고, Pull Request에서 변경 diff를 확인하는 흐름을 권장합니다. PR 화면은 AI가 만든 변경을 `main`에 넣기 전에 검토하는 장소입니다.
 
-## OSC schema
+## OSC 스키마
 
-Coordinates are emitted in a **shared projection UV space**, identified by
-`projection_id`. Two cameras pointing at the same physical floor projection share
-one `projection_id`; their `(u, v)` values are directly comparable.
+좌표는 `projection_id`로 식별되는 **공유 projection UV 공간**으로 송신됩니다. 같은 실제 바닥 프로젝션을 보는 카메라 2대는 같은 `projection_id`를 공유하며, 각 카메라가 내보내는 `(u, v)` 값은 서로 비교할 수 있습니다.
 
-| Address | Args | When |
+| 주소 | 인자 | 송신 시점 |
 |---|---|---|
-| `/proj/<projection_id>/cam/<cam_name>/track/<id>` | `u, v, conf` (+ `u_px, v_px` when the projection has `pixel_size`) | every frame the track's foot is inside the camera's region polygon and inside its `dispatch_uv` slice |
-| `/proj/<projection_id>/cam/<cam_name>/track/<id>/lost` | none | once when an id disappears or leaves dispatch |
-| `/proj/<projection_id>/count` | int | every frame, sum across cameras |
-| `/proj/<projection_id>/cam/<cam_name>/count` | int | every frame |
-| `/proj/<projection_id>/cam/<cam_name>/active` | list of ids | every frame, only if non-empty |
+| `/proj/<projection_id>/cam/<cam_name>/track/<id>` | `u, v, conf` (`pixel_size`가 있으면 `u_px, v_px` 추가) | 트랙의 발 위치가 카메라 region polygon 안이고 `dispatch_uv` slice 안일 때 매 프레임 |
+| `/proj/<projection_id>/cam/<cam_name>/track/<id>/lost` | 없음 | ID가 사라지거나 dispatch 영역을 벗어났을 때 한 번 |
+| `/proj/<projection_id>/count` | int | 카메라 전체 합산 count, 매 프레임 |
+| `/proj/<projection_id>/cam/<cam_name>/count` | int | 카메라별 count, 매 프레임 |
+| `/proj/<projection_id>/cam/<cam_name>/active` | id 목록 | 활성 ID가 있을 때 매 프레임 |
 
-`(u=0, v=0)` is the top-left of the projection; `(u=1, v=1)` is the bottom-right.
-`id` is stable per camera as long as the track holds; ids are still independent
-across cameras in v1 (cross-camera fusion is deferred to v2).
+`(u=0, v=0)`은 projection의 좌상단, `(u=1, v=1)`은 우하단입니다. `id`는 카메라별로 트랙이 유지되는 동안 안정적입니다. v1에서는 카메라 간 ID fusion을 하지 않으므로 서로 다른 카메라의 ID는 독립적입니다.
 
-Legacy image-space messages (`<cam_prefix>/track/<id>` with `cx, cy, w, h, conf`)
-are still emitted when `osc.legacy_image_space: true` is set in `config.yaml`.
-Default is off.
+`osc.legacy_image_space: true`를 `config.yaml`에 설정하면 예전 image-space 메시지(`<cam_prefix>/track/<id>`와 `cx, cy, w, h, conf`)도 함께 송신합니다. 기본값은 꺼져 있습니다.
 
-## TouchDesigner receiver
+## TouchDesigner 수신
 
-- Add an **OSC In DAT** (or **OSC In CHOP** for numeric streams).
-- Network Port: `7000` (or whatever you set in `config.yaml`).
-- Use the address pattern `/proj/corridor/cam/*/track/*` with wildcards to accept
-  all cameras and all tracks for a given projection.
+- **OSC In DAT** 또는 숫자 스트림용 **OSC In CHOP**를 추가합니다.
+- Network Port는 `config.yaml`의 포트와 맞춥니다. 기본값은 `7000`입니다.
+- 주소 패턴은 `/proj/corridor/cam/*/track/*`처럼 wildcard를 써서 특정 projection의 모든 카메라와 트랙을 받을 수 있습니다.
 
-## Calibration / region drawing
+## 캘리브레이션 / region 설정
 
-Run with `python tracker.py --show`, focus a camera tile, then press `d` to
-draw a 4-point region on that camera. Click order is **projection-UV
-orientation**: top-left → top-right → bottom-right → bottom-left as seen on the
-projection, NOT as seen in the camera image. After the four clicks, the console
-prompts for `projection_id`, `projection_uv` (the UV slice these four pixels
-cover, e.g. `0,0,0.55,1`), and an optional `dispatch_uv` (defaults to
-`projection_uv` if blank). The region is written back to `config.yaml`.
+현재 `viewer.py`의 region draw mode는 v2 TODO입니다. `README`가 먼저 설명하던 `d` 키 기반 4점 드로잉은 아직 실제 구현과 맞지 않습니다. 당장은 `config.yaml`의 `regions`를 직접 작성하거나, Issue #2에서 문서와 구현을 맞추는 작업을 진행합니다.
 
-Because clicks follow world/UV order rather than image order, the two cameras
-in a face-to-face mirrored corridor setup still produce coherent shared
-coordinates without any per-camera flip flag.
+region의 4개 `image_points`는 **projection-UV 방향** 기준으로 입력합니다.
 
-## Network setup for two cameras
+```text
+top-left -> top-right -> bottom-right -> bottom-left
+```
 
-Pick one. The tool only cares about the URLs in `config.yaml`.
+이는 카메라 이미지에서 보이는 순서가 아니라 projection/world 기준 순서입니다. 그래서 서로 마주 보는 복도 카메라 2대가 거울처럼 반대로 보이더라도 같은 공유 UV 프레임으로 매핑할 수 있습니다.
 
-1. **Both into a router** (recommended) — plug both into the iPTIME LAN ports;
-   they get DHCP IPs in `172.30.1.x`. Mac talks over Wi-Fi or its LAN port.
-   Easiest, most reliable.
+## 카메라 2대 네트워크 구성
 
-2. **Both direct via switch** — a small unmanaged 5-port switch on the Mac's
-   USB-Ethernet adapter. Run a DHCP server on the Mac (System Settings →
-   General → Sharing → Internet Sharing) so both cameras get IPs.
+도구는 `config.yaml`에 적힌 RTSP URL만 사용합니다. 아래 중 하나를 선택하면 됩니다.
 
-3. **One direct, one via Wi-Fi** — works but mixed paths add complexity.
+1. **두 카메라를 라우터에 연결**: 추천 방식입니다. 두 카메라를 iPTIME LAN 포트에 꽂으면 DHCP로 `172.30.1.x` 대역 IP를 받고, Mac은 Wi-Fi나 LAN으로 접속합니다.
+2. **두 카메라를 스위치로 직접 연결**: Mac의 USB-Ethernet 어댑터에 작은 unmanaged 5-port switch를 연결합니다. Mac에서 DHCP를 제공해야 하므로 System Settings -> General -> Sharing -> Internet Sharing을 사용합니다.
+3. **하나는 직접 연결, 하나는 Wi-Fi 경유**: 동작은 가능하지만 경로가 섞여 설정이 복잡해집니다.
 
-## Latency tuning
+## 지연 시간 튜닝
 
-The included FFmpeg flags (`nobuffer`, `low_delay`, `max_delay=500ms`,
-`reorder_queue=0`) plus `BUFFERSIZE=1` give roughly 200–400 ms glass-to-OSC
-latency on the sub stream. To go lower, drop the camera's keyframe interval to
-1 second in Reolink Client → Display → Stream → Frame Interval.
+포함된 FFmpeg 옵션(`nobuffer`, `low_delay`, `max_delay=500ms`, `reorder_queue=0`)과 `BUFFERSIZE=1` 조합은 sub stream 기준 약 200-400 ms glass-to-OSC 지연을 목표로 합니다. 더 낮추려면 Reolink Client -> Display -> Stream -> Frame Interval에서 keyframe interval을 1초로 낮춥니다.
 
-## Common issues
+## 자주 생기는 문제
 
-- **Black preview / `read failed`** — check the URL with `ffprobe`:
-  `ffprobe -rtsp_transport tcp 'rtsp://admin:%21pass@1.2.3.4:554/h264Preview_01_sub'`
-- **401 Unauthorized** — username is `admin`, not the device friendly name.
-- **`h264Preview_01_main` won't decode** — many Reolink models are H.265 main + H.264 sub. Use `_sub`.
-- **MPS `not implemented` warning** — upgrade ultralytics, or set `device: cpu` in config.
-- **Track IDs jumping** — switch tracker to `bytetrack.yaml` (faster, less smooth) or escalate to StrongSORT (best ID stability under occlusion). Default is `botsort.yaml`.
+- **검은 미리보기 / `read failed`**: URL을 `ffprobe`로 확인합니다.
+  ```bash
+  ffprobe -rtsp_transport tcp 'rtsp://admin:%21pass@1.2.3.4:554/h264Preview_01_sub'
+  ```
+- **401 Unauthorized**: username은 장치 별칭이 아니라 `admin`입니다.
+- **`h264Preview_01_main`이 디코딩되지 않음**: 많은 Reolink 모델은 main이 H.265, sub가 H.264입니다. `_sub`를 사용합니다.
+- **MPS `not implemented` warning**: ultralytics를 업그레이드하거나 `config.yaml`에서 `device: cpu`로 설정합니다.
+- **Track ID가 자주 튐**: `bytetrack.yaml`은 더 빠르지만 덜 부드럽습니다. 기본값은 `botsort.yaml`입니다. 가림이 심하면 StrongSORT 같은 별도 대안을 검토합니다.

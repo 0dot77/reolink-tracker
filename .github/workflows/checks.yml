@@ -7,11 +7,12 @@ on:
 
 jobs:
   python-syntax:
+    name: Python 문법 검사
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Compile Python files
+      - name: Python 파일 컴파일
         run: python -m py_compile tracker.py region.py viewer.py

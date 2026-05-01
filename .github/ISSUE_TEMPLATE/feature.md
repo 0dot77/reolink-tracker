@@ -1,23 +1,23 @@
 ---
-name: Feature
-about: Plan a small feature or improvement
+name: 기능
+about: 작은 기능 또는 개선 작업을 계획합니다
 title: "[Feature] "
 labels: enhancement
 ---
 
-## Goal
+## 목표
 
 
-## Current Behavior
+## 현재 동작
 
 
-## Desired Behavior
+## 원하는 동작
 
 
-## Acceptance Criteria
+## 완료 기준
 
 - [ ] 
 
-## Context For AI
+## AI에게 필요한 맥락
 
 

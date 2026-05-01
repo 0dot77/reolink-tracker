@@ -1,20 +1,20 @@
 # AGENTS.md
 
-This repository is a small Python tool for Reolink RTSP camera tracking in an interactive installation pipeline.
+이 저장소는 인터랙티브 설치 작업을 위한 Reolink RTSP 카메라 트래킹 Python 도구입니다.
 
-## Working Rules
+## 작업 규칙
 
-- Keep `config.yaml`, model weights, virtualenvs, caches, and OMX runtime state out of git.
-- Use `config.example.yaml` for shareable configuration shape.
-- Do not commit real RTSP URLs, passwords, device IPs that imply private network setup, or project-private credentials.
-- Preserve the primary OSC schema unless the TouchDesigner/receiver side is updated at the same time.
-- Keep changes small and verify with at least `python -m py_compile tracker.py region.py viewer.py`.
+- `config.yaml`, 모델 weight, virtualenv, 캐시, OMX runtime state는 git에 넣지 않습니다.
+- 공유 가능한 설정 구조는 `config.example.yaml`에 둡니다.
+- 실제 RTSP URL, 비밀번호, 사설 장비 IP, 프로젝트 전용 credential은 커밋하지 않습니다.
+- TouchDesigner/수신기 쪽을 같이 바꾸지 않는 한 primary OSC 스키마는 유지합니다.
+- 변경은 작게 유지하고, 최소한 `python -m py_compile tracker.py region.py viewer.py`로 검증합니다.
 
-## Project Context
+## 프로젝트 문맥
 
-- Product context lives in `docs/product.md`.
-- Technical context lives in `docs/tech.md`.
-- AI coding rules live in `docs/ai-rules.md`.
-- Decisions and reversals live in `docs/decisions.md`.
+- 제품 문맥: `docs/product.md`
+- 기술 문맥: `docs/tech.md`
+- AI 코딩 규칙: `docs/ai-rules.md`
+- 결정과 번복 기록: `docs/decisions.md`
 
-Read those files before making non-trivial changes.
+사소하지 않은 변경 전에는 위 파일들을 먼저 읽습니다.

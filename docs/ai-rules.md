@@ -1,33 +1,33 @@
-# AI Coding Rules
+# AI 코딩 규칙
 
-Use this file as the stable context for Codex, Claude Code, Cursor, or any other AI coding agent.
+Codex, Claude Code, Cursor 또는 다른 AI 코딩 에이전트가 안정적으로 참고할 규칙입니다.
 
-## Before Editing
+## 수정 전
 
-- Read `README.md`, `docs/product.md`, `docs/tech.md`, and this file.
-- Check `git status` and do not overwrite unrelated user changes.
-- Treat `config.yaml` as private local state.
+- `README.md`, `docs/product.md`, `docs/tech.md`, 이 파일을 먼저 읽습니다.
+- `git status`를 확인하고, 관련 없는 사용자 변경을 덮어쓰지 않습니다.
+- `config.yaml`은 private local state로 취급합니다.
 
-## Implementation Preferences
+## 구현 선호
 
-- Prefer small, reversible changes.
-- Reuse the current `tracker.py` / `region.py` / `viewer.py` boundaries.
-- Do not add dependencies unless the task explicitly needs them.
-- Keep OSC address and argument order backward-compatible unless the task is a schema migration.
-- Keep camera credentials and installation-private details out of committed files.
+- 작고 되돌리기 쉬운 변경을 선호합니다.
+- 현재의 `tracker.py` / `region.py` / `viewer.py` 경계를 먼저 재사용합니다.
+- 작업이 명시적으로 필요로 하지 않는 한 새 dependency를 추가하지 않습니다.
+- OSC 주소와 argument 순서는 schema migration 작업이 아닌 이상 backward-compatible하게 유지합니다.
+- 카메라 credential과 설치 현장 private detail은 커밋하지 않습니다.
 
-## Verification Before Completion
+## 완료 전 검증
 
-- Run `python -m py_compile tracker.py region.py viewer.py`.
-- If region math changes, run `python region.py` after dependencies are installed.
-- If runtime behavior changes, document what still needs live-camera validation.
+- `python -m py_compile tracker.py region.py viewer.py`를 실행합니다.
+- region 수학을 바꿨다면 dependency가 설치된 환경에서 `python region.py`를 실행합니다.
+- runtime behavior를 바꿨다면 live-camera validation이 아직 필요한지 명시합니다.
 
-## Good Issue Shape
+## 좋은 Issue 형태
 
-Each GitHub Issue should include:
+각 GitHub Issue에는 다음을 포함합니다.
 
-- Goal
-- Current behavior
-- Desired behavior
-- Acceptance criteria
-- Any live-installation constraints
+- 목표
+- 현재 동작
+- 원하는 동작
+- 완료 기준
+- 현장 설치 제약이 있다면 그 내용

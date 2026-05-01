@@ -1,22 +1,22 @@
 ---
-name: Bug
-about: Track a runtime, calibration, or OSC bug
+name: 버그
+about: runtime, calibration, OSC 관련 문제를 기록합니다
 title: "[Bug] "
 labels: bug
 ---
 
-## Symptom
+## 증상
 
 
-## Expected Behavior
+## 기대 동작
 
 
-## Steps / Setup
+## 재현 단계 / 환경
 
 
-## Logs Or Screenshots
+## 로그 또는 스크린샷
 
 
-## Acceptance Criteria
+## 완료 기준
 
 - [ ] 
