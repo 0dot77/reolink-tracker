@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pt
+yolov8*.pt
+runs/
+.DS_Store
+
+# Local/runtime state
+config.yaml
+.omx/
+.omc/
+
+# Keep a sanitized config in git.
+!config.example.yaml

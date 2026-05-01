@@ -1,0 +1,35 @@
+# Reolink -> YOLO person tracker -> OSC (shared projection UV)
+# Copy to config.yaml and fill in real camera URLs/passwords locally.
+
+model: yolo26n.pt
+device: mps
+imgsz: 640
+conf: 0.35
+tracker: botsort.yaml
+
+osc:
+  host: 127.0.0.1
+  port: 7000
+  legacy_image_space: false
+
+projections:
+  - id: corridor
+    pixel_size: [9600, 1080]
+    world_size_m: [40.0, 4.5]
+
+cameras:
+  - name: cam0
+    url: rtsp://admin:<urlencoded-password>@<camera-ip>:554/h264Preview_01_sub
+    osc_prefix: /cam/0
+    regions: []
+
+  # - name: cam1
+  #   url: rtsp://admin:<urlencoded-password>@<camera-ip>:554/h264Preview_01_sub
+  #   osc_prefix: /cam/1
+  #   regions:
+  #     - id: far_half
+  #       projection_id: corridor
+  #       image_points: [[150, 140], [770, 130], [790, 470], [130, 460]]
+  #       projection_uv: [0.45, 0.0, 1.0, 1.0]
+  #       dispatch_uv: [0.50, 0.0, 1.0, 1.0]
+  #       min_bbox_height_px: 24
