@@ -39,7 +39,7 @@ python tracker.py --show
 
 `--show` 미리보기 키:
 
-- `q` 또는 `Esc`: 종료
+- `q` 또는 `Esc`: 종료 (slice 편집 중에는 편집 모드만 빠져나옵니다)
 - `h`: HUD 표시 토글
 - `u`: projection UV canvas 표시 토글
 - `1`-`9`: focus camera 선택
@@ -47,6 +47,12 @@ python tracker.py --show
 - 마우스 왼쪽 클릭 4회: projection 기준 top-left -> top-right -> bottom-right -> bottom-left 순서로 image point 입력
 - `Backspace`: region 그리기 중 마지막 점 취소
 - `x`: focus camera의 마지막 region 삭제
+- `e`: focus camera region의 `projection_uv` / `dispatch_uv` slice 편집 모드 시작 / 다음 region으로 순환 / 마지막 region 이후엔 종료
+- `t`: 편집 대상 토글 — `projection_uv` ↔ `dispatch_uv`
+- `g`: 편집할 모서리 순환 — `u0 → v0 → u1 → v1`
+- `[` / `]`: 선택한 모서리 -0.01 / +0.01 nudge
+- `,` / `.`: 선택한 모서리 -0.05 / +0.05 nudge
+- `r`: 편집 중인 slice 초기화 (`projection`은 `[0,0,1,1]`로, `dispatch`는 `projection_uv`와 같게)
 - `w`: 현재 region 편집 내용을 로컬 `config.yaml`에 저장
 
 ## AI / GitHub 작업 방식
@@ -84,7 +90,7 @@ python tracker.py --show
 
 ## 캘리브레이션 / region 설정
 
-`viewer.py`는 `--show`에서 focus camera의 region을 4점 클릭으로 추가하고 `w`로 로컬 `config.yaml`에 저장할 수 있습니다. 저장된 region은 기본적으로 첫 projection의 전체 UV `[0.0, 0.0, 1.0, 1.0]`로 생성됩니다. 여러 카메라가 한 projection을 나눠 담당하는 설치에서는 저장 후 `projection_uv`와 `dispatch_uv`를 원하는 slice로 조정합니다. `config.example.yaml`에는 공유 가능한 예시 구조만 두고, 실제 RTSP URL과 비밀번호가 들어가는 `config.yaml`은 로컬에만 유지합니다.
+`viewer.py`는 `--show`에서 focus camera의 region을 4점 클릭으로 추가하고 `w`로 로컬 `config.yaml`에 저장할 수 있습니다. 새로 그린 region은 기본적으로 첫 projection의 전체 UV `[0.0, 0.0, 1.0, 1.0]`로 만들어집니다. 여러 카메라가 한 projection을 나눠 담당하는 설치에서는 viewer 안에서 직접 slice를 조정할 수 있습니다. `e`로 편집 모드를 시작해 region을 선택하고 `t`로 `projection_uv` / `dispatch_uv` 대상을 전환, `g`로 모서리(`u0` `v0` `u1` `v1`)를 고른 뒤 `[` `]`(±0.01) 또는 `,` `.`(±0.05)로 값을 움직입니다. UV canvas에서는 `projection_uv`가 점선 외곽 + 옅은 채움으로, `dispatch_uv`가 진한 채움 + 실선으로 구분되어 보이고, 편집 중인 slice에는 강조선이 추가됩니다. `dispatch_uv`가 `projection_uv`의 부분집합이 아니게 되는 변경은 status 메시지로 거부되고 `w`로 저장되는 값에는 반영되지 않습니다. `config.example.yaml`에는 공유 가능한 예시 구조만 두고, 실제 RTSP URL과 비밀번호가 들어가는 `config.yaml`은 로컬에만 유지합니다.
 
 region의 4개 `image_points`는 **projection-UV 방향** 기준으로 입력합니다.
 

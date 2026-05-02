@@ -6,13 +6,13 @@ regions can be sketched with 4 mouse clicks and written back to config.yaml.
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Sequence, Optional
 
 import numpy as np
 import cv2
 
-from region import Region, Projection, build_homography
+from region import Region, Projection, build_homography, validate_dispatch
 
 WINDOW_NAME = "reolink-tracker"
 
@@ -27,7 +27,14 @@ _C_NO_HIT = (160, 160, 160)
 _C_REGION_POLY = (0, 200, 0)
 _C_FOCUS = (0, 255, 255)
 _C_DRAFT = (0, 220, 255)
+_C_EDIT_PROJ = (255, 255, 255)
+_C_EDIT_DISPATCH = (0, 255, 255)
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+_EDIT_EDGES = ("u0", "v0", "u1", "v1")
+_NUDGE_FINE = 0.01
+_NUDGE_COARSE = 0.05
+_UV_MIN_SPAN = 0.01
 
 
 @dataclass
@@ -54,6 +61,10 @@ class CamFrame:
 
 def _grid_shape(n: int) -> tuple[int, int]:
     return (1, 1) if n <= 1 else (1, 2) if n == 2 else (2, 2)
+
+
+def _fmt_uv(uv: tuple[float, float, float, float]) -> str:
+    return f"[{uv[0]:.2f},{uv[1]:.2f},{uv[2]:.2f},{uv[3]:.2f}]"
 
 
 def _draw_hud(tile: np.ndarray, cam: CamFrame) -> None:
@@ -146,8 +157,35 @@ def _draw_dotted_rect(img: np.ndarray, p0: tuple[int, int], p1: tuple[int, int],
         cv2.line(img, (x1, y), (x1, min(y + dash, y1)), color, 1)
 
 
+def _uv_to_panel_rect(uv: tuple[float, float, float, float],
+                      cw: int, ch: int,
+                      inset_top: int = 24, inset: int = 3
+                      ) -> tuple[int, int, int, int]:
+    """Convert a UV rect to integer panel pixels with edge inset for visibility."""
+    u0, v0, u1, v1 = uv
+    x0 = int(round(u0 * (cw - 1)))
+    y0 = int(round(v0 * (ch - 1)))
+    x1 = int(round(u1 * (cw - 1)))
+    y1 = int(round(v1 * (ch - 1)))
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    x0 = min(max(x0 + inset, inset), cw - inset - 1)
+    y0 = min(max(y0 + inset, inset_top), ch - inset - 1)
+    x1 = max(min(x1 - inset, cw - inset - 1), x0 + 1)
+    y1 = max(min(y1 - inset, ch - inset - 1), y0 + 1)
+    return x0, y0, x1, y1
+
+
 def _render_uv_canvas(cams: Sequence[CamFrame],
-                      projections: dict[str, Projection]) -> Optional[np.ndarray]:
+                      projections: dict[str, Projection],
+                      edit_target: Optional[tuple[int, str, str]] = None
+                      ) -> Optional[np.ndarray]:
+    """Render a top-down panel per projection.
+
+    `edit_target`, when set, is `(cam_idx, region_id, kind)` where kind is
+    "projection" or "dispatch". The targeted slice gets a thick yellow
+    highlight so the operator can see what their nudge keys are moving.
+    """
     if not projections:
         return None
     panels: list[np.ndarray] = []
@@ -161,9 +199,6 @@ def _render_uv_canvas(cams: Sequence[CamFrame],
         cv2.putText(panel, proj_id, (8, 18), _FONT, 0.5,
                     (200, 200, 200), 1, cv2.LINE_AA)
 
-        # Region projection_uv outlines. Newly drawn regions default to the
-        # full projection, so inset the visual rectangle to keep it visible
-        # instead of hiding under the panel border.
         reg_lookup: dict[tuple[int, str], Region] = {}
         for ci, cam in enumerate(cams):
             color = _CAM_COLORS[ci % len(_CAM_COLORS)]
@@ -171,29 +206,34 @@ def _render_uv_canvas(cams: Sequence[CamFrame],
                 reg_lookup[(ci, reg.id)] = reg
                 if reg.projection_id != proj_id:
                     continue
-                u0, v0, u1, v1 = reg.projection_uv
-                x0 = int(round(u0 * (cw - 1)))
-                y0 = int(round(v0 * (ch - 1)))
-                x1 = int(round(u1 * (cw - 1)))
-                y1 = int(round(v1 * (ch - 1)))
-                x0, x1 = sorted((x0, x1))
-                y0, y1 = sorted((y0, y1))
-                x0 = min(max(x0 + 3, 3), cw - 4)
-                y0 = min(max(y0 + 3, 24), ch - 4)
-                x1 = max(min(x1 - 3, cw - 4), x0 + 1)
-                y1 = max(min(y1 - 3, ch - 4), y0 + 1)
+                # projection_uv: faint fill + dotted outline.
+                px0, py0, px1, py1 = _uv_to_panel_rect(reg.projection_uv, cw, ch)
                 overlay = panel.copy()
-                cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
-                cv2.addWeighted(overlay, 0.12, panel, 0.88, 0, dst=panel)
-                _draw_dotted_rect(
-                    panel,
-                    (x0, y0),
-                    (x1, y1),
-                    color,
-                )
+                cv2.rectangle(overlay, (px0, py0), (px1, py1), color, -1)
+                cv2.addWeighted(overlay, 0.10, panel, 0.90, 0, dst=panel)
+                _draw_dotted_rect(panel, (px0, py0), (px1, py1), color)
+
+                # dispatch_uv: stronger fill + solid outline; this is what
+                # actually drives OSC dispatch so it should read at a glance.
+                dx0, dy0, dx1, dy1 = _uv_to_panel_rect(reg.dispatch_uv, cw, ch)
+                overlay = panel.copy()
+                cv2.rectangle(overlay, (dx0, dy0), (dx1, dy1), color, -1)
+                cv2.addWeighted(overlay, 0.30, panel, 0.70, 0, dst=panel)
+                cv2.rectangle(panel, (dx0, dy0), (dx1, dy1), color, 1, cv2.LINE_AA)
+
                 label = f"{cam.name}:{reg.id}"
-                cv2.putText(panel, label, (x0 + 6, min(y1 - 6, y0 + 18)),
+                cv2.putText(panel, label, (px0 + 6, min(py1 - 6, py0 + 18)),
                             _FONT, 0.45, color, 1, cv2.LINE_AA)
+
+                if edit_target is not None:
+                    et_ci, et_rid, et_kind = edit_target
+                    if et_ci == ci and et_rid == reg.id:
+                        if et_kind == "projection":
+                            cv2.rectangle(panel, (px0, py0), (px1, py1),
+                                          _C_EDIT_PROJ, 2, cv2.LINE_AA)
+                        else:
+                            cv2.rectangle(panel, (dx0, dy0), (dx1, dy1),
+                                          _C_EDIT_DISPATCH, 2, cv2.LINE_AA)
 
         for ci, cam in enumerate(cams):
             color = _CAM_COLORS[ci % len(_CAM_COLORS)]
@@ -245,8 +285,12 @@ class Viewer:
         self.focus_idx = 0
         self.draw_mode = False
         self.draft_points: list[tuple[float, float]] = []
+        # UV slice editing state. `edit_region_id` is None when not editing.
+        self.edit_region_id: Optional[str] = None
+        self.edit_kind: str = "projection"          # "projection" | "dispatch"
+        self.edit_edge_idx: int = 0                  # index into _EDIT_EDGES
         self.status = (
-            "d draw | click 4 pts TL,TR,BR,BL | x delete | w save | "
+            "d draw | x delete | e edit slices | w save | "
             "h/u toggles | 1-9 focus | q quit"
         )
         self._last_cams: Sequence[CamFrame] = []
@@ -333,9 +377,146 @@ class Viewer:
             self.status = f"{cam.name} has no regions to delete"
             return
         removed = cam.regions[-1]
+        if removed.id == self.edit_region_id:
+            self._exit_edit_mode()
         if self.on_regions_changed is not None:
             self.on_regions_changed(self.focus_idx, list(cam.regions[:-1]))
         self.status = f"deleted {removed.id}; press w to save config"
+
+    def _exit_edit_mode(self) -> None:
+        self.edit_region_id = None
+        self.edit_edge_idx = 0
+        self.edit_kind = "projection"
+
+    def _focused_cam(self) -> Optional[CamFrame]:
+        if self.focus_idx >= len(self._last_cams):
+            return None
+        return self._last_cams[self.focus_idx]
+
+    def _focused_region(self) -> Optional[Region]:
+        cam = self._focused_cam()
+        if cam is None or self.edit_region_id is None:
+            return None
+        for reg in cam.regions:
+            if reg.id == self.edit_region_id:
+                return reg
+        return None
+
+    def _toggle_edit_mode(self) -> None:
+        cam = self._focused_cam()
+        if cam is None or not cam.regions:
+            self.status = "no region to edit; draw one with d first"
+            self._exit_edit_mode()
+            return
+        ids = [r.id for r in cam.regions]
+        if self.edit_region_id is None or self.edit_region_id not in ids:
+            # Enter edit mode on the first region of the focused camera.
+            self.edit_region_id = ids[0]
+            self.edit_kind = "projection"
+            self.edit_edge_idx = 0
+        else:
+            # Already editing — cycle to next region within the focused cam,
+            # exiting after the last one.
+            cur = ids.index(self.edit_region_id)
+            if cur + 1 < len(ids):
+                self.edit_region_id = ids[cur + 1]
+                self.edit_kind = "projection"
+                self.edit_edge_idx = 0
+            else:
+                self._exit_edit_mode()
+                self.status = "exited slice edit mode"
+                return
+        self.status = self._edit_status()
+
+    def _toggle_edit_kind(self) -> None:
+        if self.edit_region_id is None:
+            return
+        self.edit_kind = "dispatch" if self.edit_kind == "projection" else "projection"
+        self.status = self._edit_status()
+
+    def _cycle_edit_edge(self) -> None:
+        if self.edit_region_id is None:
+            return
+        self.edit_edge_idx = (self.edit_edge_idx + 1) % len(_EDIT_EDGES)
+        self.status = self._edit_status()
+
+    def _edit_status(self) -> str:
+        edge = _EDIT_EDGES[self.edit_edge_idx]
+        return (f"edit {self.edit_kind}_uv {self.edit_region_id} edge={edge}"
+                f"  [/]±{_NUDGE_FINE:.2f}  ,/.±{_NUDGE_COARSE:.2f}"
+                f"  t kind  g edge  r reset  e next/exit")
+
+    def _reset_edit_slice(self) -> None:
+        cam = self._focused_cam()
+        reg = self._focused_region()
+        if cam is None or reg is None:
+            return
+        if self.edit_kind == "projection":
+            new_proj = (0.0, 0.0, 1.0, 1.0)
+            new_disp = new_proj
+        else:
+            new_proj = reg.projection_uv
+            new_disp = reg.projection_uv
+        self._apply_slice_change(cam, reg, new_proj, new_disp,
+                                 reason=f"reset {self.edit_kind}_uv")
+
+    def _nudge_slice(self, delta: float) -> None:
+        cam = self._focused_cam()
+        reg = self._focused_region()
+        if cam is None or reg is None:
+            return
+        edge = _EDIT_EDGES[self.edit_edge_idx]
+        new_proj = list(reg.projection_uv)
+        new_disp = list(reg.dispatch_uv)
+        target = new_proj if self.edit_kind == "projection" else new_disp
+        idx = _EDIT_EDGES.index(edge)
+        nv = round(target[idx] + delta, 4)
+        # Clamp to [0, 1] and keep min span between paired edges.
+        if idx == 0:        # u0
+            nv = max(0.0, min(nv, target[2] - _UV_MIN_SPAN))
+        elif idx == 2:      # u1
+            nv = min(1.0, max(nv, target[0] + _UV_MIN_SPAN))
+        elif idx == 1:      # v0
+            nv = max(0.0, min(nv, target[3] - _UV_MIN_SPAN))
+        else:               # v1
+            nv = min(1.0, max(nv, target[1] + _UV_MIN_SPAN))
+        target[idx] = nv
+        self._apply_slice_change(cam, reg, tuple(new_proj), tuple(new_disp),
+                                 reason=f"{self.edit_kind}.{edge}={nv:+.2f}")
+
+    def _apply_slice_change(self, cam: CamFrame, reg: Region,
+                            new_proj: tuple[float, float, float, float],
+                            new_disp: tuple[float, float, float, float],
+                            reason: str) -> None:
+        """Validate, rebuild homography, and push the new region list back."""
+        try:
+            # If projection_uv shrank below dispatch_uv, clip dispatch to fit
+            # so the operator can keep editing without an immediate rejection.
+            if self.edit_kind == "projection":
+                pu0, pv0, pu1, pv1 = new_proj
+                du0, dv0, du1, dv1 = new_disp
+                new_disp = (
+                    max(du0, pu0), max(dv0, pv0),
+                    min(du1, pu1), min(dv1, pv1),
+                )
+            validate_dispatch(new_proj, new_disp)
+            new_H = build_homography(reg.image_points, new_proj)
+        except ValueError as ex:
+            self.status = f"slice rejected: {ex}"
+            return
+
+        updated_region = replace(
+            reg,
+            projection_uv=new_proj,
+            dispatch_uv=new_disp,
+            H=new_H,
+        )
+        new_regions = [updated_region if r.id == reg.id else r
+                       for r in cam.regions]
+        if self.on_regions_changed is not None:
+            self.on_regions_changed(self.focus_idx, new_regions)
+        self.status = (f"{reason}  proj={_fmt_uv(new_proj)} "
+                       f"disp={_fmt_uv(new_disp)}  (w to save)")
 
     def _draw_draft(self, canvas: np.ndarray) -> None:
         if not self.draft_points or self.focus_idx >= len(self._last_cams):
@@ -392,7 +573,10 @@ class Viewer:
             canvas = _compose_grid(tiles, self.tile_size, self.focus_idx)
             self._draw_draft(canvas)
             if self.show_uv:
-                uv = _render_uv_canvas(cams, self.projections)
+                edit_target = None
+                if self.edit_region_id is not None and self._focused_region() is not None:
+                    edit_target = (self.focus_idx, self.edit_region_id, self.edit_kind)
+                uv = _render_uv_canvas(cams, self.projections, edit_target)
                 if uv is not None:
                     canvas = _hstack_match_height(canvas, uv)
             self._draw_status(canvas)
@@ -404,6 +588,10 @@ class Viewer:
             self.draft_points = []
             self.status = "draw cancelled"
             return True
+        if key == 27 and self.edit_region_id is not None:
+            self._exit_edit_mode()
+            self.status = "exited slice edit mode"
+            return True
         if key in (ord("q"), 27):
             return False
         if key == ord("h"):
@@ -413,6 +601,7 @@ class Viewer:
         elif key == ord("d"):
             self.draw_mode = True
             self.draft_points = []
+            self._exit_edit_mode()
             self.status = "draw mode: click 4 focused-camera points"
         elif key in (8, 127):
             if self.draft_points:
@@ -424,12 +613,29 @@ class Viewer:
             if self.on_save is not None:
                 self.on_save()
             self.status = "config saved"
+        elif key == ord("e"):
+            self._toggle_edit_mode()
+        elif key == ord("t") and self.edit_region_id is not None:
+            self._toggle_edit_kind()
+        elif key == ord("g") and self.edit_region_id is not None:
+            self._cycle_edit_edge()
+        elif key == ord("r") and self.edit_region_id is not None:
+            self._reset_edit_slice()
+        elif key == ord("[") and self.edit_region_id is not None:
+            self._nudge_slice(-_NUDGE_FINE)
+        elif key == ord("]") and self.edit_region_id is not None:
+            self._nudge_slice(+_NUDGE_FINE)
+        elif key == ord(",") and self.edit_region_id is not None:
+            self._nudge_slice(-_NUDGE_COARSE)
+        elif key == ord(".") and self.edit_region_id is not None:
+            self._nudge_slice(+_NUDGE_COARSE)
         elif ord("1") <= key <= ord("9"):
             idx = key - ord("1")
             if idx < len(cams):
                 self.focus_idx = idx
                 self.draft_points = []
                 self.draw_mode = False
+                self._exit_edit_mode()
                 self.status = f"focused {cams[idx].name}"
         return True
 
