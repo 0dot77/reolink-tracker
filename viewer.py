@@ -161,6 +161,38 @@ def _compose_grid(tiles: list[np.ndarray], tile_size: tuple[int, int],
     return canvas
 
 
+def _compose_cam_row(tiles: list[np.ndarray], focus_idx: int) -> np.ndarray:
+    """Pack camera tiles into a single horizontal row of equal-size tiles.
+
+    Tiles are assumed to share the same shape (the caller derives one
+    `tile_size` per render). The focus camera gets a yellow outline drawn
+    inside its tile so it is visible against the dark canvas background."""
+    if not tiles:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    th, tw = tiles[0].shape[:2]
+    canvas = np.zeros((th, tw * len(tiles), 3), dtype=np.uint8)
+    for i, tile in enumerate(tiles):
+        if i == focus_idx:
+            tile = tile.copy()
+            cv2.rectangle(tile, (1, 1), (tw - 2, th - 2), _C_FOCUS, 2)
+        canvas[:, i * tw:(i + 1) * tw] = tile
+    return canvas
+
+
+def _render_placeholder_tile(tile_size: tuple[int, int], label: str) -> np.ndarray:
+    """Empty tile shown for cam slots reserved by the layout but not yet
+    connected. Keeps cam0 and cam1 at the same size whether one or both
+    cameras are active."""
+    tw, th = tile_size
+    tile = np.full((th, tw, 3), 30, dtype=np.uint8)
+    cv2.rectangle(tile, (1, 1), (tw - 2, th - 2), (60, 60, 60), 1)
+    msg = f"{label}  (slot reserved)"
+    (mw, mh), _ = cv2.getTextSize(msg, _FONT, 0.6, 1)
+    cv2.putText(tile, msg, ((tw - mw) // 2, (th + mh) // 2),
+                _FONT, 0.6, _C_PANEL_DIM, 1, cv2.LINE_AA)
+    return tile
+
+
 def _draw_dotted_rect(img: np.ndarray, p0: tuple[int, int], p1: tuple[int, int],
                       color: tuple[int, int, int], dash: int = 3) -> None:
     x0, y0 = p0
@@ -199,6 +231,7 @@ def _render_uv_canvas(
     projections: dict[str, Projection],
     edit_target: Optional[tuple[int, str, str]] = None,
     overlaps_by_proj: Optional[dict[str, list[str]]] = None,
+    target_width: Optional[int] = None,
 ) -> Optional[np.ndarray]:
     """Render a top-down panel per projection.
 
@@ -207,6 +240,8 @@ def _render_uv_canvas(
     highlight so the operator can see what their nudge keys are moving.
     `overlaps_by_proj` maps projection_id to a list of human-readable overlap
     descriptions; entries are drawn as red lines at the bottom of each panel.
+    `target_width`, when set, forces panel width so callers can stack the UV
+    canvas under (or beside) other panels of a known size.
     """
     if not projections:
         return None
@@ -215,8 +250,8 @@ def _render_uv_canvas(
     for proj_id, proj in projections.items():
         aspect = (proj.pixel_size[0] / float(proj.pixel_size[1])
                   if proj.pixel_size and proj.pixel_size[1] else 1.0)
-        cw = 800
-        ch = max(80, min(int(round(800 / aspect)) if aspect > 0 else 800, 1600))
+        cw = target_width if target_width else 800
+        ch = max(80, min(int(round(cw / aspect)) if aspect > 0 else cw, 1600))
         panel = np.full((ch, cw, 3), 24, dtype=np.uint8)
         cv2.rectangle(panel, (0, 0), (cw - 1, ch - 1), (90, 90, 90), 1)
         cv2.putText(panel, proj_id, (8, 18), _FONT, 0.5,
@@ -343,13 +378,15 @@ def _render_region_panel(
     focused_region_idx: int,
     dirty: bool,
     overlap_count: int,
+    edit_status: str = "",
 ) -> np.ndarray:
-    """Per-camera region list sidebar.
+    """Right-side info panel.
 
-    Each camera is shown as a header (camera name + dispatch coverage hint),
-    followed by its regions with the focused entry highlighted. The top of
-    the panel surfaces the dirty/saved state and overlap count so operators
-    notice unsaved edits or dispatch conflicts at a glance.
+    Top section surfaces the dirty/saved state, overlap count, and (when
+    active) the current slice-edit target so operators don't have to look
+    away from the cameras to see what their next keystroke will do.
+    Each camera then gets a header line with fps + OSC rate, followed by
+    its region list with the focused entry highlighted.
     """
     panel = np.full((height, width, 3), _C_PANEL_BG[0], dtype=np.uint8)
     cv2.rectangle(panel, (0, 0), (width - 1, height - 1), (90, 90, 90), 1)
@@ -369,6 +406,11 @@ def _render_region_panel(
                     _FONT, 0.45, _C_WARN, 1, cv2.LINE_AA)
         y += line_h
 
+    if edit_status:
+        cv2.putText(panel, edit_status, (pad, y),
+                    _FONT, 0.4, _C_REGION_FOCUS, 1, cv2.LINE_AA)
+        y += line_h
+
     cv2.line(panel, (pad, y - 6), (width - pad, y - 6),
              (70, 70, 70), 1, cv2.LINE_AA)
     y += 4
@@ -384,6 +426,10 @@ def _render_region_panel(
         header = f"{marker} [{ci + 1}] {cam.name}  ({len(cam.regions)})"
         cv2.putText(panel, header, (pad, y), _FONT, 0.5,
                     cam_color, 1 if not is_focus_cam else 2, cv2.LINE_AA)
+        y += line_h
+        stats = f"   {cam.fps:.1f}fps  {cam.osc_rate:.0f}/s  rc={cam.reconnects}"
+        cv2.putText(panel, stats, (pad, y), _FONT, 0.4,
+                    _C_PANEL_DIM, 1, cv2.LINE_AA)
         y += line_h
         if not cam.regions:
             cv2.putText(panel, "   (no regions)", (pad, y), _FONT, 0.4,
@@ -416,11 +462,13 @@ class Viewer:
         self,
         projections: dict[str, Projection],
         tile_size: tuple[int, int] = (640, 360),
+        initial_window_size: tuple[int, int] = (1280, 720),
         on_regions_changed: Optional[Callable[[int, list[Region]], None]] = None,
         on_save: Optional[Callable[[], None]] = None,
     ):
         self.projections = projections
         self.tile_size = tile_size
+        self.initial_window_size = initial_window_size
         self.on_regions_changed = on_regions_changed
         self.on_save = on_save
         self.show_hud = True
@@ -442,9 +490,13 @@ class Viewer:
             "h/u/p toggles | 1-9 focus | q quit"
         )
         self._last_cams: Sequence[CamFrame] = []
+        self._rendered_tile_size: tuple[int, int] = tile_size
         self._window_created = False
         self._window_failed = False
         self._topmost_pumped = False
+        self._info_panel_width = 280
+        self._target_canvas_width = max(initial_window_size[0], 800)
+        self._min_cam_slots = 2
 
     def _ensure_window(self) -> bool:
         """Create the cv2 window once. Returns False if cv2 GUI is unavailable
@@ -461,6 +513,12 @@ class Viewer:
             gui_normal = getattr(cv2, "WINDOW_GUI_NORMAL", 0)
             cv2.namedWindow(WINDOW_NAME, flags | gui_normal)
             cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
+            # Open at a sensible size; WINDOW_NORMAL lets the operator drag-resize.
+            try:
+                iw, ih = self.initial_window_size
+                cv2.resizeWindow(WINDOW_NAME, int(iw), int(ih))
+            except cv2.error:
+                pass
             # Pull the window to the front once at startup; we clear the
             # topmost flag again right after the first imshow so the operator
             # can stack other apps on top later if they want.
@@ -505,11 +563,11 @@ class Viewer:
         cam = self._last_cams[self.focus_idx]
         if cam.frame is None:
             return None
-        tw, th = self.tile_size
-        _rows, cols = _grid_shape(len(self._last_cams))
-        row, col = divmod(self.focus_idx, cols)
-        tile_x = x - col * tw
-        tile_y = y - row * th
+        tw, th = self._rendered_tile_size
+        # Cameras are packed into a single row at the top-left of the canvas
+        # (info panel sits to their right, UV sits below — neither is a hit).
+        tile_x = x - self.focus_idx * tw
+        tile_y = y
         if not (0 <= tile_x < tw and 0 <= tile_y < th):
             return None
         src_h, src_w = cam.frame.shape[:2]
@@ -714,10 +772,9 @@ class Viewer:
         cam = self._last_cams[self.focus_idx]
         if cam.frame is None:
             return
-        tw, th = self.tile_size
-        _rows, cols = _grid_shape(len(self._last_cams))
-        row, col = divmod(self.focus_idx, cols)
-        origin_x, origin_y = col * tw, row * th
+        tw, th = self._rendered_tile_size
+        # Cam tiles share one row, packed left-to-right starting at x=0.
+        origin_x, origin_y = self.focus_idx * tw, 0
         src_h, src_w = cam.frame.shape[:2]
         pts: list[tuple[int, int]] = []
         for px, py in self.draft_points:
@@ -793,38 +850,69 @@ class Viewer:
                 print(f"[viewer] imshow failed: {ex}", file=sys.stderr, flush=True)
                 return True
         else:
+            # Layout: cameras packed left-to-right in the top row, info panel
+            # to their right, UV canvas full-width below. Status bar is drawn
+            # on top of the bottom edge as a single overlay.
+            info_w = self._info_panel_width if self.show_panel else 0
+            cam_row_w = max(self._target_canvas_width - info_w, 320)
+            # Reserve at least `min_cam_slots` tiles so cam0 and cam1 stay the
+            # same size when only one camera is currently connected; the empty
+            # slots render as dim placeholders rather than reflowing the row.
+            slots = max(len(cams), self._min_cam_slots)
+            tile_w = cam_row_w // slots
+            tile_h = max(80, int(round(tile_w * 9 / 16)))  # 16:9 cam aspect
+            self._rendered_tile_size = (tile_w, tile_h)
             tiles = [
                 _render_tile(
                     c,
-                    self.tile_size,
+                    self._rendered_tile_size,
                     self.show_hud,
                     self.focused_region_idx if i == self.focus_idx else -1,
                 )
                 for i, c in enumerate(cams)
             ]
-            canvas = _compose_grid(tiles, self.tile_size, self.focus_idx)
-            self._draw_draft(canvas)
+            for i in range(len(tiles), slots):
+                tiles.append(_render_placeholder_tile(
+                    self._rendered_tile_size, f"cam{i}"
+                ))
+            cam_row = _compose_cam_row(tiles, self.focus_idx)
+
             overlaps = _compute_dispatch_overlaps(cams)
             overlap_count = sum(len(v) for v in overlaps.values())
-            if self.show_uv:
-                edit_target = None
-                if self.edit_region_id is not None and self._focused_region() is not None:
-                    edit_target = (self.focus_idx, self.edit_region_id, self.edit_kind)
-                uv = _render_uv_canvas(cams, self.projections, edit_target, overlaps)
-                if uv is not None:
-                    canvas = _hstack_match_height(canvas, uv)
+
             if self.show_panel:
-                panel_w = 280
+                edit_status_text = self._edit_status() if self.edit_region_id is not None else ""
                 panel = _render_region_panel(
                     cams,
-                    panel_w,
-                    canvas.shape[0],
+                    info_w,
+                    cam_row.shape[0],
                     self.focus_idx,
                     self.focused_region_idx,
                     self.dirty,
                     overlap_count,
+                    edit_status_text,
                 )
-                canvas = np.hstack([panel, canvas])
+                top_row = np.hstack([cam_row, panel])
+            else:
+                top_row = cam_row
+
+            self._draw_draft(top_row)
+
+            if self.show_uv:
+                edit_target = None
+                if self.edit_region_id is not None and self._focused_region() is not None:
+                    edit_target = (self.focus_idx, self.edit_region_id, self.edit_kind)
+                uv = _render_uv_canvas(
+                    cams, self.projections, edit_target, overlaps,
+                    target_width=top_row.shape[1],
+                )
+                if uv is not None:
+                    canvas = np.vstack([top_row, uv])
+                else:
+                    canvas = top_row
+            else:
+                canvas = top_row
+
             overlap_summary = ""
             if overlap_count > 0:
                 first_proj = next(iter(overlaps))
@@ -834,6 +922,15 @@ class Viewer:
                     + (f" (+{overlap_count - 1} more)" if overlap_count > 1 else "")
                 )
             self._draw_status(canvas, overlap_summary)
+
+            # Resize the cv2 window to match the canvas's natural aspect on
+            # first paint, so we don't squish the UV strip vertically.
+            if not self._topmost_pumped:
+                try:
+                    cv2.resizeWindow(WINDOW_NAME, canvas.shape[1], canvas.shape[0])
+                except cv2.error:
+                    pass
+
             try:
                 cv2.imshow(WINDOW_NAME, canvas)
             except cv2.error as ex:
