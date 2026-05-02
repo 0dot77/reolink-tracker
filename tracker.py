@@ -158,9 +158,12 @@ class CamWorker:
         # last_ids per region_id; legacy uses the empty-string key.
         self.last_ids: dict[str, set[int]] = {r.id: set() for r in cam.regions}
         self.last_ids[""] = set()  # legacy bucket
-        # last_dispatch_tids tracks which track_ids dispatched at least one
-        # frame; a tid that drops out of this set produces a fusion lost_source.
-        self.last_dispatch_tids: set[int] = set()
+        # last_projection_tids: track_ids whose foot fell into at least one
+        # region's projection_uv last frame. A tid that drops out of this set
+        # is a fusion lost_source — i.e., the camera no longer has anything
+        # useful to say about that source. Crossing the dispatch_uv boundary
+        # alone is *not* a loss (the gid stays alive, it just goes silent).
+        self.last_projection_tids: set[int] = set()
         self.fps_count = 0
         self.osc_count = 0
 
@@ -169,7 +172,7 @@ class CamWorker:
         self.cam.regions = regions
         self.last_ids = {r.id: set() for r in regions}
         self.last_ids[""] = set()
-        self.last_dispatch_tids = set()
+        self.last_projection_tids = set()
 
     def step(
         self,
@@ -185,9 +188,13 @@ class CamWorker:
         Returns `(overlays, regions, person_events, lost_sources)`. Person
         events represent every dispatching track this frame (one entry per
         (track_id, region) hit that fell inside `dispatch_uv`). Lost sources
-        are `(cam_name, track_id)` tuples whose tracks dispatched on the
-        previous frame but no longer dispatch this frame — caller passes
-        them to the fusion layer to drive hand-off matching.
+        are `(cam_name, track_id)` tuples whose tracks had a foot inside
+        any region's `projection_uv` last frame and no longer do — i.e.,
+        the camera has nothing useful to say about that source anymore.
+        Tracks that merely cross the dispatch boundary (still inside
+        projection but no longer dispatching) are *not* reported as lost,
+        so the fusion layer keeps their gid alive across boundary jitter
+        and only stops broadcasting `/person/<gid>` for that frame.
 
         Raw per-cam OSC is emitted inline only when `raw_per_cam=True`.
         Person-level OSC is emitted by the caller, not here, because it
@@ -211,7 +218,7 @@ class CamWorker:
         active: dict[str, list[int]] = {reg.id: [] for reg in self.cam.regions}
         legacy_active: list[int] = []
         person_events: list[PersonEvent] = []
-        dispatch_tids: set[int] = set()
+        projection_tids: set[int] = set()
 
         if r.boxes is not None and r.boxes.id is not None:
             ids = r.boxes.id.cpu().numpy().astype(int)
@@ -225,6 +232,7 @@ class CamWorker:
                 foot_y = y2
 
                 region_hits: list[tuple[str, float, float, bool]] = []
+                in_projection = False
                 for reg in self.cam.regions:
                     if reg.H is None:
                         continue
@@ -234,6 +242,7 @@ class CamWorker:
                     u, v = project((foot_x, foot_y), reg.H)
                     if not is_inside_uv((u, v), reg.projection_uv):
                         continue
+                    in_projection = True
                     in_dispatch = is_inside_uv((u, v), reg.dispatch_uv)
                     region_hits.append((reg.id, u, v, in_dispatch))
                     if in_dispatch:
@@ -246,7 +255,6 @@ class CamWorker:
                             conf=float(c),
                             t=now,
                         ))
-                        dispatch_tids.add(int(tid))
                         if self.raw_per_cam:
                             proj = self.projections.get(reg.projection_id)
                             addr = f"/proj/{reg.projection_id}/cam/{self.cam.name}/track/{int(tid)}"
@@ -257,6 +265,9 @@ class CamWorker:
                             self.osc.send_message(addr, args)
                             self.osc_count += 1
                         active[reg.id].append(int(tid))
+
+                if in_projection:
+                    projection_tids.add(int(tid))
 
                 # Legacy image-space dispatch (independent of regions).
                 if self.legacy_image_space:
@@ -313,12 +324,14 @@ class CamWorker:
                 )
                 self.osc_count += 1
 
-        # Fusion lost_sources: any tid that dispatched last frame but does
-        # not dispatch this frame. The fusion layer holds these in pending
-        # and either revives or terminates them.
+        # Fusion lost_sources: any tid that had a foot in projection_uv last
+        # frame and no longer does (track left projection or YOLO dropped it).
+        # Crossing the dispatch_uv boundary alone is *not* a loss — those
+        # tracks just go silent for the broadcast layer until they re-enter
+        # dispatch, so the gid stays stable across boundary jitter.
         lost_sources = [(self.cam.name, tid)
-                        for tid in self.last_dispatch_tids - dispatch_tids]
-        self.last_dispatch_tids = dispatch_tids
+                        for tid in self.last_projection_tids - projection_tids]
+        self.last_projection_tids = projection_tids
 
         self.fps_count += 1
         return overlays, self.cam.regions, person_events, lost_sources
@@ -560,7 +573,20 @@ def main() -> int:
     )
     print(f"projections: {sorted(projections.keys()) or '(none — only legacy or no-op)'}")
 
-    person_tracker = PersonTracker() if person_level else None
+    fusion_cfg = cfg.get("fusion", {}) or {}
+    if person_level:
+        person_tracker = PersonTracker(
+            hand_off_window_s=float(fusion_cfg.get("hand_off_window_s", 1.0)),
+            match_uv_radius=float(fusion_cfg.get("match_uv_radius", 0.05)),
+            velocity_alpha=float(fusion_cfg.get("velocity_alpha", 0.3)),
+        )
+        print(
+            f"fusion: hand_off_window_s={person_tracker.hand_off_window_s} "
+            f"match_uv_radius={person_tracker.match_uv_radius} "
+            f"velocity_alpha={person_tracker.velocity_alpha}"
+        )
+    else:
+        person_tracker = None
 
     model_path = args.model or cfg.get("model", "yolo26n.pt")
     device = args.device or cfg.get("device") or ("mps" if sys.platform == "darwin" else "cpu")

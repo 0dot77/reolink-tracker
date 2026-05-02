@@ -73,7 +73,7 @@ class PersonTracker:
 
     def __init__(
         self,
-        hand_off_window_s: float = 0.4,
+        hand_off_window_s: float = 1.0,
         match_uv_radius: float = 0.05,
         velocity_alpha: float = 0.3,
         velocity_max_dt_s: float = 1.0,
@@ -97,15 +97,23 @@ class PersonTracker:
     ) -> list[Person]:
         """Ingest one frame.
 
-        `events` are this frame's active observations from all cameras.
-        `lost_sources` are `(cam_name, track_id)` tuples whose tracks ended
-        between the previous and current frame.
-        Returns the list of currently active fused persons.
+        `events` are this frame's active observations from all cameras —
+        only tracks that fell inside `dispatch_uv` are emitted by the
+        caller, so the size of `events` equals the broadcast count.
+        `lost_sources` are `(cam_name, track_id)` tuples whose tracks
+        truly disappeared (left projection_uv or YOLO dropped them) —
+        not tracks that merely exited dispatch.
+
+        Returns the list of persons that received a fresh event this
+        frame ("broadcasting" persons). Sources that are still tracked
+        but didn't produce an event this frame stay alive silently and
+        keep their gid; they don't appear in the returned list and the
+        caller therefore won't emit a `/person/<gid>` OSC for them.
         """
-        # Step 1: any source that just disappeared moves out of the active
-        # set into pending. Pending persons are *not* returned by update()
-        # because their position is stale — they are only kept around so the
-        # next observation from another camera can revive the gid.
+        # Step 1: any source that truly disappeared moves out of the active
+        # set into pending. Pending persons are *not* returned because
+        # their position is stale — they are kept around so the next
+        # observation from another camera can revive the gid.
         for src in lost_sources:
             gid = self._source_to_gid.pop(src, None)
             if gid is None:
@@ -118,12 +126,14 @@ class PersonTracker:
         # Step 2: ingest active events. A single pending gid can only be
         # claimed once per frame; if multiple sources contend, the closer
         # one wins.
+        fresh: set[int] = set()
         claimed_pending: set[int] = set()
         for ev in events:
             src = (ev.cam_name, ev.track_id)
             gid = self._source_to_gid.get(src)
             if gid is not None:
                 self._update_person(gid, ev, now)
+                fresh.add(gid)
                 continue
             gid = self._best_pending_match(ev, claimed_pending)
             if gid is not None:
@@ -133,8 +143,10 @@ class PersonTracker:
                 self._source_to_gid[src] = gid
                 self._persons[gid].source = src
                 self._update_person(gid, ev, now)
+                fresh.add(gid)
                 continue
-            self._spawn_person(src, ev, now)
+            new_gid = self._spawn_person(src, ev, now)
+            fresh.add(new_gid)
 
         # Step 3: evict pending entries that exceeded hand-off window. Each
         # eviction emits one terminal `/lost` for the caller via drain.
@@ -146,7 +158,7 @@ class PersonTracker:
             self._pending.pop(gid, None)
             self._just_lost.append(gid)
 
-        return list(self._persons.values())
+        return [self._persons[gid] for gid in fresh if gid in self._persons]
 
     def drain_lost_gids(self) -> list[int]:
         """Return gids that transitioned to permanently-lost since the last
@@ -180,7 +192,7 @@ class PersonTracker:
         src: tuple[str, int],
         ev: PersonEvent,
         now: float,
-    ) -> None:
+    ) -> int:
         gid = self._next_gid
         self._next_gid += 1
         self._persons[gid] = Person(
@@ -195,6 +207,7 @@ class PersonTracker:
             source=src,
         )
         self._source_to_gid[src] = gid
+        return gid
 
     def _update_person(self, gid: int, ev: PersonEvent, now: float) -> None:
         p = self._persons.get(gid)
@@ -327,6 +340,50 @@ if __name__ == "__main__":
         len({p.gid for p in persons}) == 1
         and persons[0].projection_id == "lobby",
         f"persons={[(p.gid, p.projection_id) for p in persons]}",
+    )
+
+    # (f) Dispatch boundary jitter: a track that exits dispatch but is still
+    # tracked produces no lost_source from CamWorker, so the same gid is
+    # kept across silent gaps without spawning a new one.
+    pt = PersonTracker(hand_off_window_s=1.0, match_uv_radius=0.05)
+    t = 0.0
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.49, 0.5, 0.9, t)], [], t)
+    t += 0.05
+    # Frame 1: out of dispatch, no event, no lost (caller knows track still alive).
+    silent_active = pt.update([], [], t)
+    t += 0.05
+    # Frame 2: back in dispatch, same source.
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 5, 0.49, 0.5, 0.9, t)],
+        [],
+        t,
+    )
+    _check(
+        "(f) boundary jitter keeps same gid; silent gap empties active list",
+        len(silent_active) == 0
+        and pt._next_gid == 2
+        and {p.gid for p in persons} == {1},
+        f"silent={silent_active}, next_gid={pt._next_gid}, "
+        f"persons={[p.gid for p in persons]}",
+    )
+
+    # (g) Same camera ID swap stitches via pending: track 5 ends, track 8
+    # appears at the same spot within window — gid is preserved.
+    pt = PersonTracker(hand_off_window_s=1.0, match_uv_radius=0.05)
+    t = 0.0
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.30, 0.5, 0.9, t)], [], t)
+    t += 0.05
+    pt.update([], [("cam0", 5)], t)  # YOLO drops tid=5
+    t += 0.10
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 8, 0.31, 0.5, 0.85, t)],
+        [],
+        t,
+    )
+    _check(
+        "(g) same-camera ID swap inherits gid",
+        {p.gid for p in persons} == {1} and pt._next_gid == 2,
+        f"persons={[p.gid for p in persons]}, next_gid={pt._next_gid}",
     )
 
     sys.exit(1 if failed else 0)
