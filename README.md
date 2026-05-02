@@ -132,3 +132,13 @@ cameras:
 - **`h264Preview_01_main`이 디코딩되지 않음**: 많은 Reolink 모델은 main이 H.265, sub가 H.264입니다. `_sub`를 사용합니다.
 - **MPS `not implemented` warning**: ultralytics를 업그레이드하거나 `config.yaml`에서 `device: cpu`로 설정합니다.
 - **Track ID가 자주 튐**: `bytetrack.yaml`은 더 빠르지만 덜 부드럽습니다. 기본값은 `botsort.yaml`입니다. 가림이 심하면 StrongSORT 같은 별도 대안을 검토합니다.
+
+### `--show` 미리보기 창이 안 보일 때
+
+`python tracker.py --show`를 실행했는데 카메라 처리 로그(`fps=...`)는 정상이지만 viewer 창이 보이지 않을 때 macOS에서는 아래 순서로 확인합니다.
+
+1. 터미널 stdout에 `[viewer] window 'reolink-tracker' opened (use q or Esc to quit)` 라인이 나왔는지 확인합니다. 이 라인이 있으면 cv2 window는 이미 떠 있는 상태입니다.
+2. Mission Control(F3) 또는 Dock의 Python/터미널 아이콘에서 `reolink-tracker` 창을 찾습니다. 다른 풀스크린 앱 뒤로 넘어갔을 수 있습니다.
+3. `[viewer] failed to open cv2 window`나 `imshow failed` 같은 stderr 메시지가 있으면 cv2 GUI 빌드 문제입니다. `python -c "import cv2; print(cv2.getBuildInformation())" | grep -i gui`로 GUI 항목을 확인합니다. `opencv-python-headless`가 깔려 있으면 `pip uninstall opencv-python-headless && pip install opencv-python`으로 교체합니다.
+4. SSH 세션이나 nohup 같은 터미널 분리 환경에서는 macOS 그래픽 세션과 연결되지 않을 수 있습니다. 로컬 Terminal.app 또는 iTerm 세션에서 직접 실행합니다.
+5. `q`나 `Esc`를 눌러도 종료되지 않으면 cv2 창에 포커스가 가지 않은 상태입니다. 창을 한 번 클릭해 포커스를 준 뒤 다시 누르거나, 터미널에서 `Ctrl+C`로 SIGINT를 보냅니다.
