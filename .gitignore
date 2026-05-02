@@ -10,6 +10,7 @@ runs/
 config.yaml
 .omx/
 .omc/
+.claude/
 
 # Keep a sanitized config in git.
 !config.example.yaml
