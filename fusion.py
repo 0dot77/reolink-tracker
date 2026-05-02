@@ -77,11 +77,17 @@ class PersonTracker:
         match_uv_radius: float = 0.05,
         velocity_alpha: float = 0.3,
         velocity_max_dt_s: float = 1.0,
+        velocity_predict_max_dt_s: float = 1.0,
     ):
         self.hand_off_window_s = hand_off_window_s
         self.match_uv_radius = match_uv_radius
         self.velocity_alpha = velocity_alpha
         self.velocity_max_dt_s = velocity_max_dt_s
+        # Cap how far we extrapolate the lost-position with the last (vx, vy)
+        # when looking for a hand-off match. After this, the predicted point
+        # freezes at the last seen UV — the longer the gap, the less we trust
+        # the stored velocity, so we fall back to "match where we last saw it".
+        self.velocity_predict_max_dt_s = velocity_predict_max_dt_s
 
         self._next_gid = 1
         self._persons: dict[int, Person] = {}
@@ -172,6 +178,12 @@ class PersonTracker:
         ev: PersonEvent,
         already_claimed: set[int],
     ) -> Optional[int]:
+        # Match against a constant-velocity prediction of the lost position.
+        # For a person standing still (vx, vy ≈ 0) this collapses to the last
+        # UV — same as before. For a moving person, the candidate disc rides
+        # along their direction of travel, so a Z-occluded walker that
+        # reappears slightly ahead (or a tid-swap mid-stride) still matches
+        # without a churn-prone larger radius.
         best_gid: Optional[int] = None
         best_dist = self.match_uv_radius
         for gid, p in self._pending.items():
@@ -179,8 +191,11 @@ class PersonTracker:
                 continue
             if p.person.projection_id != ev.projection_id:
                 continue
-            du = ev.u - p.person.u
-            dv = ev.v - p.person.v
+            dt = max(0.0, min(ev.t - p.lost_t, self.velocity_predict_max_dt_s))
+            pu = p.person.u + p.person.vx * dt
+            pv = p.person.v + p.person.vy * dt
+            du = ev.u - pu
+            dv = ev.v - pv
             dist = (du * du + dv * dv) ** 0.5
             if dist <= best_dist:
                 best_dist = dist
@@ -432,6 +447,85 @@ if __name__ == "__main__":
         "(i) long drop -> hand-off window stitches new tid",
         {p.gid for p in persons} == {1} and lost == [] and pt._next_gid == 2,
         f"persons={[p.gid for p in persons]}, lost={lost}, next_gid={pt._next_gid}",
+    )
+
+    # (j) Static occlusion regression: a person standing still (vx, vy ≈ 0)
+    # vanishes for 1.5 s and reappears within match_uv_radius — velocity prior
+    # must not push the prediction off the last seen UV, so the gid is kept.
+    pt = PersonTracker(hand_off_window_s=2.5, match_uv_radius=0.05)
+    t = 0.0
+    # Two stationary frames so velocity EMA settles to ~0.
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.50, 0.50, 0.9, t)], [], t)
+    t += 0.05
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.50, 0.50, 0.9, t)], [], t)
+    t += 0.05
+    pt.update([], [("cam0", 5)], t)
+    t += 1.50  # well inside hand_off_window_s
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 9, 0.54, 0.50, 0.85, t)],  # +0.04 < 0.05
+        [],
+        t,
+    )
+    lost = pt.drain_lost_gids()
+    _check(
+        "(j) static occlusion: still person reappears nearby -> same gid",
+        {p.gid for p in persons} == {1} and lost == [] and pt._next_gid == 2,
+        f"persons={[p.gid for p in persons]}, lost={lost}, next_gid={pt._next_gid}",
+    )
+
+    # (k) Moving occlusion: a person walking at vx=0.3/s gets Z-occluded for
+    # 1.0 s and reappears at the predicted forward position (~+0.30 in u).
+    # Pure last-UV matching would miss this because 0.30 ≫ match_uv_radius;
+    # velocity prior pulls the candidate disc with them so gid is preserved.
+    # Ten frames so the EMA (alpha=0.3, starting from 0) converges close to
+    # the true 0.3 — after 9 EMA updates vx ≈ 0.288, leaving ~0.012 residual
+    # vs. the 0.30 advance over 1 s, well inside the 0.05 match radius.
+    pt = PersonTracker(hand_off_window_s=2.5, match_uv_radius=0.05)
+    t = 0.0
+    u = 0.20
+    for _ in range(10):
+        pt.update([PersonEvent("corridor", "cam0", 5, u, 0.50, 0.9, t)], [], t)
+        t += 0.05
+        u += 0.015
+    pt.update([], [("cam0", 5)], t)
+    t += 1.0  # 1 s of occlusion -> predicted advance = ~0.288, true = 0.30
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 9, u + 0.30, 0.50, 0.85, t)],
+        [],
+        t,
+    )
+    lost = pt.drain_lost_gids()
+    _check(
+        "(k) moving occlusion: predicted-position match keeps gid",
+        {p.gid for p in persons} == {1} and lost == [] and pt._next_gid == 2,
+        f"persons={[p.gid for p in persons]}, lost={lost}, next_gid={pt._next_gid}",
+    )
+
+    # (l) Prediction guard: after velocity_predict_max_dt_s the predicted
+    # position freezes at the last UV, so a moving person who reappears far
+    # ahead after a long gap does NOT erroneously claim the old gid.
+    pt = PersonTracker(
+        hand_off_window_s=2.5,
+        match_uv_radius=0.05,
+        velocity_predict_max_dt_s=1.0,
+    )
+    t = 0.0
+    u = 0.20
+    for _ in range(5):
+        pt.update([PersonEvent("corridor", "cam0", 5, u, 0.50, 0.9, t)], [], t)
+        t += 0.05
+        u += 0.015
+    pt.update([], [("cam0", 5)], t)
+    t += 2.0  # 2 s gap, well past predict cap; 0.3*2=0.60 would over-extrapolate
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 9, u + 0.60, 0.50, 0.85, t)],
+        [],
+        t,
+    )
+    _check(
+        "(l) prediction guard prevents stale-velocity over-extrapolation",
+        {p.gid for p in persons} == {2} and pt._next_gid == 3,
+        f"persons={[p.gid for p in persons]}, next_gid={pt._next_gid}",
     )
 
     sys.exit(1 if failed else 0)
