@@ -5,6 +5,7 @@ and an optional top-down projection UV canvas. In show mode, focused-camera
 regions can be sketched with 4 mouse clicks and written back to config.yaml.
 """
 
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Sequence, Optional
@@ -251,12 +252,49 @@ class Viewer:
         )
         self._last_cams: Sequence[CamFrame] = []
         self._window_created = False
+        self._window_failed = False
+        self._topmost_pumped = False
 
-    def _ensure_window(self) -> None:
-        if not self._window_created:
-            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    def _ensure_window(self) -> bool:
+        """Create the cv2 window once. Returns False if cv2 GUI is unavailable
+        (e.g. opencv-python-headless build). Subsequent calls become no-ops.
+        """
+        if self._window_created:
+            return True
+        if self._window_failed:
+            return False
+        try:
+            # WINDOW_GUI_NORMAL avoids the Cocoa toolbar overlay on macOS and
+            # keeps imshow event handling consistent across platforms.
+            flags = cv2.WINDOW_NORMAL
+            gui_normal = getattr(cv2, "WINDOW_GUI_NORMAL", 0)
+            cv2.namedWindow(WINDOW_NAME, flags | gui_normal)
             cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
+            # Pull the window to the front once at startup; we clear the
+            # topmost flag again right after the first imshow so the operator
+            # can stack other apps on top later if they want.
+            try:
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
+            except cv2.error:
+                # Some cv2 builds lack TOPMOST; non-fatal.
+                pass
             self._window_created = True
+            print(
+                f"[viewer] window '{WINDOW_NAME}' opened "
+                "(use q or Esc to quit)",
+                flush=True,
+            )
+            return True
+        except cv2.error as ex:
+            self._window_failed = True
+            print(
+                f"[viewer] failed to open cv2 window: {ex}. "
+                "If you installed opencv-python-headless, replace it with "
+                "opencv-python; otherwise check that a display is available.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
 
     def _on_mouse(self, event: int, x: int, y: int, _flags: int, _param: object) -> None:
         if event != cv2.EVENT_LBUTTONDOWN or not self.draw_mode:
@@ -379,14 +417,24 @@ class Viewer:
 
     def render(self, cams: Sequence[CamFrame]) -> bool:
         """Compose + show. Returns False to request shutdown (q/Esc pressed)."""
-        self._ensure_window()
+        if not self._ensure_window():
+            # No GUI available; keep the OSC pipeline running but don't burn
+            # a tight loop in the caller.
+            self._last_cams = cams
+            time.sleep(0.05)
+            return True
         self._last_cams = cams
         if not cams:
             blank = np.zeros((self.tile_size[1], self.tile_size[0], 3), dtype=np.uint8)
             cv2.putText(blank, "no cameras", (20, 40),
                         _FONT, 0.7, (200, 200, 200), 2)
             self._draw_status(blank)
-            cv2.imshow(WINDOW_NAME, blank)
+            try:
+                cv2.imshow(WINDOW_NAME, blank)
+            except cv2.error as ex:
+                self._window_failed = True
+                print(f"[viewer] imshow failed: {ex}", file=sys.stderr, flush=True)
+                return True
         else:
             tiles = [_render_tile(c, self.tile_size, self.show_hud) for c in cams]
             canvas = _compose_grid(tiles, self.tile_size, self.focus_idx)
@@ -396,7 +444,23 @@ class Viewer:
                 if uv is not None:
                     canvas = _hstack_match_height(canvas, uv)
             self._draw_status(canvas)
-            cv2.imshow(WINDOW_NAME, canvas)
+            try:
+                cv2.imshow(WINDOW_NAME, canvas)
+            except cv2.error as ex:
+                self._window_failed = True
+                print(f"[viewer] imshow failed: {ex}", file=sys.stderr, flush=True)
+                return True
+
+        # Pump the event queue once after the first imshow so macOS actually
+        # paints the window, then release the topmost flag so the operator
+        # can stack other apps over the viewer if they choose.
+        if not self._topmost_pumped:
+            cv2.waitKey(1)
+            try:
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 0)
+            except cv2.error:
+                pass
+            self._topmost_pumped = True
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27 and self.draw_mode:
@@ -437,9 +501,15 @@ class Viewer:
         if self._window_created:
             try:
                 cv2.destroyWindow(WINDOW_NAME)
+                # macOS keeps the window in the Cocoa run loop until the
+                # event queue is pumped a couple of times after destroyWindow.
+                for _ in range(2):
+                    cv2.waitKey(1)
             except cv2.error:
                 pass
             self._window_created = False
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 
 if __name__ == "__main__":
