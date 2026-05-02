@@ -21,12 +21,16 @@ osc:
 fusion:
   # 같은 사람이 cam0 dispatch에서 cam1 dispatch로 넘어갈 때 gid를 유지하는 시간 윈도우.
   # 길수록 occlusion이나 짧은 detection drop에 강하지만, 두 사람이 같은 자리를 빠르게 교차할
-  # 때 ID가 섞일 가능성도 커짐.
-  hand_off_window_s: 1.0
+  # 때 ID가 섞일 가능성도 커짐. 기본 2.5 s는 BoT-SORT track_buffer + miss_buffer + 여유.
+  hand_off_window_s: 2.5
   # hand-off 후보를 같은 위치로 인정할 UV 거리(0~1). 0.05는 40m 복도에서 약 2 m.
   match_uv_radius: 0.05
   # 속도 EMA 가중치. 1.0이면 매 프레임 즉시 반영, 0에 가까우면 매우 부드러움.
   velocity_alpha: 0.3
+  # CamWorker가 하나의 tid를 lost_source로 fusion에 알리기 전까지 견디는 연속 결손 프레임 수.
+  # 짧은 YOLO/BoT-SORT detection drop이 매번 새 gid를 만들지 않도록 흡수한다.
+  # 0이면 결손 즉시 lost (legacy). 기본 8은 ≈ 400 ms @ 20 fps.
+  miss_buffer_frames: 8
 
 projections:
   - id: corridor

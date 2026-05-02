@@ -73,7 +73,7 @@ class PersonTracker:
 
     def __init__(
         self,
-        hand_off_window_s: float = 1.0,
+        hand_off_window_s: float = 2.5,
         match_uv_radius: float = 0.05,
         velocity_alpha: float = 0.3,
         velocity_max_dt_s: float = 1.0,
@@ -384,6 +384,54 @@ if __name__ == "__main__":
         "(g) same-camera ID swap inherits gid",
         {p.gid for p in persons} == {1} and pt._next_gid == 2,
         f"persons={[p.gid for p in persons]}, next_gid={pt._next_gid}",
+    )
+
+    # (h) Short detection drop swallowed by CamWorker's miss buffer: caller
+    # never emits lost_source, so the gid stays alive and no /lost fires
+    # when the same tid returns a few frames later.
+    pt = PersonTracker(hand_off_window_s=2.5, match_uv_radius=0.05)
+    t = 0.0
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.30, 0.5, 0.9, t)], [], t)
+    for _ in range(5):
+        t += 0.05
+        pt.update([], [], t)  # silent — under miss_buffer threshold
+    t += 0.05
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 5, 0.31, 0.5, 0.9, t)],
+        [],
+        t,
+    )
+    lost = pt.drain_lost_gids()
+    _check(
+        "(h) short silent drop keeps gid; no /lost",
+        {p.gid for p in persons} == {1} and lost == [] and pt._next_gid == 2,
+        f"persons={[p.gid for p in persons]}, lost={lost}, next_gid={pt._next_gid}",
+    )
+
+    # (i) Longer drop: CamWorker's miss buffer expires and fires lost_source,
+    # but a new tid appearing within the (now larger) hand-off window at the
+    # same UV stitches back into the original gid.
+    pt = PersonTracker(hand_off_window_s=2.5, match_uv_radius=0.05)
+    t = 0.0
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.30, 0.5, 0.9, t)], [], t)
+    # Simulate ~8-frame silent stretch before CamWorker emits the loss.
+    for _ in range(8):
+        t += 0.05
+        pt.update([], [], t)
+    pt.update([], [("cam0", 5)], t)
+    # Stay quiet for another ~1.5 s (well past the legacy 1.0 s window) and
+    # then a new tid appears at the same place.
+    t += 1.50
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 9, 0.31, 0.5, 0.85, t)],
+        [],
+        t,
+    )
+    lost = pt.drain_lost_gids()
+    _check(
+        "(i) long drop -> hand-off window stitches new tid",
+        {p.gid for p in persons} == {1} and lost == [] and pt._next_gid == 2,
+        f"persons={[p.gid for p in persons]}, lost={lost}, next_gid={pt._next_gid}",
     )
 
     sys.exit(1 if failed else 0)

@@ -147,6 +147,7 @@ class CamWorker:
         projections: dict[str, Projection],
         legacy_image_space: bool,
         raw_per_cam: bool = True,
+        miss_buffer_frames: int = 8,
     ):
         self.cam = cam
         self.osc = osc
@@ -164,6 +165,13 @@ class CamWorker:
         # useful to say about that source. Crossing the dispatch_uv boundary
         # alone is *not* a loss (the gid stays alive, it just goes silent).
         self.last_projection_tids: set[int] = set()
+        # _tid_miss buffers short detection drops so YOLO/BoT-SORT hiccups of
+        # a few frames don't churn fusion gids. Each entry is (cam-local tid →
+        # consecutive frames absent from projection_uv). Once the count
+        # reaches miss_buffer_frames we emit lost_source; if the tid returns
+        # before that, the entry is cleared and no loss is reported.
+        self.miss_buffer_frames = max(int(miss_buffer_frames), 0)
+        self._tid_miss: dict[int, int] = {}
         self.fps_count = 0
         self.osc_count = 0
 
@@ -173,6 +181,7 @@ class CamWorker:
         self.last_ids = {r.id: set() for r in regions}
         self.last_ids[""] = set()
         self.last_projection_tids = set()
+        self._tid_miss = {}
 
     def step(
         self,
@@ -329,8 +338,24 @@ class CamWorker:
         # Crossing the dispatch_uv boundary alone is *not* a loss — those
         # tracks just go silent for the broadcast layer until they re-enter
         # dispatch, so the gid stays stable across boundary jitter.
-        lost_sources = [(self.cam.name, tid)
-                        for tid in self.last_projection_tids - projection_tids]
+        #
+        # A miss buffer absorbs short YOLO/BoT-SORT detection drops: a tid
+        # only counts as lost after `miss_buffer_frames` consecutive absent
+        # frames. If it returns before that, the counter resets silently.
+        for tid in projection_tids:
+            self._tid_miss.pop(tid, None)
+        for tid in self.last_projection_tids - projection_tids:
+            self._tid_miss[tid] = 1
+        for tid in list(self._tid_miss.keys()):
+            if tid in projection_tids or tid in self.last_projection_tids:
+                continue
+            self._tid_miss[tid] += 1
+        threshold = max(self.miss_buffer_frames, 1)
+        lost_sources: list[tuple[str, int]] = []
+        for tid in list(self._tid_miss.keys()):
+            if self._tid_miss[tid] >= threshold:
+                lost_sources.append((self.cam.name, tid))
+                del self._tid_miss[tid]
         self.last_projection_tids = projection_tids
 
         self.fps_count += 1
@@ -574,16 +599,18 @@ def main() -> int:
     print(f"projections: {sorted(projections.keys()) or '(none — only legacy or no-op)'}")
 
     fusion_cfg = cfg.get("fusion", {}) or {}
+    miss_buffer_frames = max(int(fusion_cfg.get("miss_buffer_frames", 8)), 0)
     if person_level:
         person_tracker = PersonTracker(
-            hand_off_window_s=float(fusion_cfg.get("hand_off_window_s", 1.0)),
+            hand_off_window_s=float(fusion_cfg.get("hand_off_window_s", 2.5)),
             match_uv_radius=float(fusion_cfg.get("match_uv_radius", 0.05)),
             velocity_alpha=float(fusion_cfg.get("velocity_alpha", 0.3)),
         )
         print(
             f"fusion: hand_off_window_s={person_tracker.hand_off_window_s} "
             f"match_uv_radius={person_tracker.match_uv_radius} "
-            f"velocity_alpha={person_tracker.velocity_alpha}"
+            f"velocity_alpha={person_tracker.velocity_alpha} "
+            f"miss_buffer_frames={miss_buffer_frames}"
         )
     else:
         person_tracker = None
@@ -603,7 +630,7 @@ def main() -> int:
 
     workers = [
         CamWorker(c, model_path, device, osc, projections, legacy_image_space,
-                  raw_per_cam=raw_per_cam)
+                  raw_per_cam=raw_per_cam, miss_buffer_frames=miss_buffer_frames)
         for c in cams
     ]
 
