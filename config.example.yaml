@@ -18,6 +18,16 @@ osc:
   raw_per_cam: true
   legacy_image_space: false
 
+fusion:
+  # 같은 사람이 cam0 dispatch에서 cam1 dispatch로 넘어갈 때 gid를 유지하는 시간 윈도우.
+  # 길수록 occlusion이나 짧은 detection drop에 강하지만, 두 사람이 같은 자리를 빠르게 교차할
+  # 때 ID가 섞일 가능성도 커짐.
+  hand_off_window_s: 1.0
+  # hand-off 후보를 같은 위치로 인정할 UV 거리(0~1). 0.05는 40m 복도에서 약 2 m.
+  match_uv_radius: 0.05
+  # 속도 EMA 가중치. 1.0이면 매 프레임 즉시 반영, 0에 가까우면 매우 부드러움.
+  velocity_alpha: 0.3
+
 projections:
   - id: corridor
     pixel_size: [9600, 1080]
