@@ -5,10 +5,15 @@ Usage:
     python tracker.py --show         # operator viewer (cv2 window)
     python tracker.py --config foo.yaml
 
-OSC schema (primary, when regions are configured):
+Person-keyed OSC schema (primary, when osc.person_level: true):
+    /proj/<projection_id>/person/<gid>          [u, v, vx, vy, conf, (u_px, v_px)?]
+    /proj/<projection_id>/person/<gid>/lost     []
+    /proj/<projection_id>/persons               [gid, gid, ...]
+    /proj/<projection_id>/persons/count         int
+
+Raw per-cam OSC schema (when osc.raw_per_cam: true):
     /proj/<projection_id>/cam/<cam>/track/<id>      [u, v, conf, (u_px, v_px)?]
     /proj/<projection_id>/cam/<cam>/track/<id>/lost []
-    /proj/<projection_id>/count                     int
     /proj/<projection_id>/cam/<cam>/count           int
     /proj/<projection_id>/cam/<cam>/active          [id, id, ...]
 
@@ -42,6 +47,7 @@ import yaml
 from pythonosc.udp_client import SimpleUDPClient
 from ultralytics import YOLO
 
+from fusion import PersonEvent, PersonTracker
 from region import (
     Projection,
     Region,
@@ -140,6 +146,7 @@ class CamWorker:
         osc: SimpleUDPClient,
         projections: dict[str, Projection],
         legacy_image_space: bool,
+        raw_per_cam: bool = True,
     ):
         self.cam = cam
         self.osc = osc
@@ -147,9 +154,13 @@ class CamWorker:
         self.device = device
         self.projections = projections
         self.legacy_image_space = legacy_image_space
+        self.raw_per_cam = raw_per_cam
         # last_ids per region_id; legacy uses the empty-string key.
         self.last_ids: dict[str, set[int]] = {r.id: set() for r in cam.regions}
         self.last_ids[""] = set()  # legacy bucket
+        # last_dispatch_tids tracks which track_ids dispatched at least one
+        # frame; a tid that drops out of this set produces a fusion lost_source.
+        self.last_dispatch_tids: set[int] = set()
         self.fps_count = 0
         self.osc_count = 0
 
@@ -158,6 +169,7 @@ class CamWorker:
         self.cam.regions = regions
         self.last_ids = {r.id: set() for r in regions}
         self.last_ids[""] = set()
+        self.last_dispatch_tids = set()
 
     def step(
         self,
@@ -166,9 +178,20 @@ class CamWorker:
         conf: float,
         iou: float,
         tracker: str,
-    ) -> tuple[list, list[Region]]:
-        """Run one detection+track step. Emits OSC. Returns the per-track overlay list
-        (for viewer rendering) and the active regions."""
+        now: float,
+    ) -> tuple[list, list[Region], list[PersonEvent], list[tuple[str, int]]]:
+        """Run one detection+track step.
+
+        Returns `(overlays, regions, person_events, lost_sources)`. Person
+        events represent every dispatching track this frame (one entry per
+        (track_id, region) hit that fell inside `dispatch_uv`). Lost sources
+        are `(cam_name, track_id)` tuples whose tracks dispatched on the
+        previous frame but no longer dispatch this frame — caller passes
+        them to the fusion layer to drive hand-off matching.
+
+        Raw per-cam OSC is emitted inline only when `raw_per_cam=True`.
+        Person-level OSC is emitted by the caller, not here, because it
+        spans cameras."""
         results = self.model.track(
             frame,
             imgsz=imgsz,
@@ -187,6 +210,8 @@ class CamWorker:
         # Per-region active ids this frame.
         active: dict[str, list[int]] = {reg.id: [] for reg in self.cam.regions}
         legacy_active: list[int] = []
+        person_events: list[PersonEvent] = []
+        dispatch_tids: set[int] = set()
 
         if r.boxes is not None and r.boxes.id is not None:
             ids = r.boxes.id.cpu().numpy().astype(int)
@@ -212,14 +237,25 @@ class CamWorker:
                     in_dispatch = is_inside_uv((u, v), reg.dispatch_uv)
                     region_hits.append((reg.id, u, v, in_dispatch))
                     if in_dispatch:
-                        proj = self.projections.get(reg.projection_id)
-                        addr = f"/proj/{reg.projection_id}/cam/{self.cam.name}/track/{int(tid)}"
-                        args = [u, v, float(c)]
-                        if proj is not None and proj.pixel_size is not None:
-                            pw, ph = proj.pixel_size
-                            args.extend([u * pw, v * ph])
-                        self.osc.send_message(addr, args)
-                        self.osc_count += 1
+                        person_events.append(PersonEvent(
+                            projection_id=reg.projection_id,
+                            cam_name=self.cam.name,
+                            track_id=int(tid),
+                            u=u,
+                            v=v,
+                            conf=float(c),
+                            t=now,
+                        ))
+                        dispatch_tids.add(int(tid))
+                        if self.raw_per_cam:
+                            proj = self.projections.get(reg.projection_id)
+                            addr = f"/proj/{reg.projection_id}/cam/{self.cam.name}/track/{int(tid)}"
+                            args = [u, v, float(c)]
+                            if proj is not None and proj.pixel_size is not None:
+                                pw, ph = proj.pixel_size
+                                args.extend([u * pw, v * ph])
+                            self.osc.send_message(addr, args)
+                            self.osc_count += 1
                         active[reg.id].append(int(tid))
 
                 # Legacy image-space dispatch (independent of regions).
@@ -240,24 +276,25 @@ class CamWorker:
         # Region-level lost events + per-region count/active.
         for reg in self.cam.regions:
             cur = set(active[reg.id])
-            for lost_id in self.last_ids.get(reg.id, set()) - cur:
+            if self.raw_per_cam:
+                for lost_id in self.last_ids.get(reg.id, set()) - cur:
+                    self.osc.send_message(
+                        f"/proj/{reg.projection_id}/cam/{self.cam.name}/track/{lost_id}/lost",
+                        [],
+                    )
+                    self.osc_count += 1
                 self.osc.send_message(
-                    f"/proj/{reg.projection_id}/cam/{self.cam.name}/track/{lost_id}/lost",
-                    [],
+                    f"/proj/{reg.projection_id}/cam/{self.cam.name}/count",
+                    len(cur),
                 )
                 self.osc_count += 1
+                if cur:
+                    self.osc.send_message(
+                        f"/proj/{reg.projection_id}/cam/{self.cam.name}/active",
+                        sorted(cur),
+                    )
+                    self.osc_count += 1
             self.last_ids[reg.id] = cur
-            self.osc.send_message(
-                f"/proj/{reg.projection_id}/cam/{self.cam.name}/count",
-                len(cur),
-            )
-            self.osc_count += 1
-            if cur:
-                self.osc.send_message(
-                    f"/proj/{reg.projection_id}/cam/{self.cam.name}/active",
-                    sorted(cur),
-                )
-                self.osc_count += 1
 
         # Legacy lost + count + active.
         if self.legacy_image_space:
@@ -276,8 +313,15 @@ class CamWorker:
                 )
                 self.osc_count += 1
 
+        # Fusion lost_sources: any tid that dispatched last frame but does
+        # not dispatch this frame. The fusion layer holds these in pending
+        # and either revives or terminates them.
+        lost_sources = [(self.cam.name, tid)
+                        for tid in self.last_dispatch_tids - dispatch_tids]
+        self.last_dispatch_tids = dispatch_tids
+
         self.fps_count += 1
-        return overlays, self.cam.regions
+        return overlays, self.cam.regions, person_events, lost_sources
 
 
 def _require_mapping(value: object, label: str) -> dict:
@@ -446,6 +490,47 @@ def save_cfg(path: Path, cfg: dict) -> None:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
 
+def _emit_person_osc(
+    osc: SimpleUDPClient,
+    projections: dict[str, Projection],
+    persons: list,
+    lost_gids: list[int],
+) -> int:
+    """Send person-keyed OSC for the current frame.
+
+    Each active person emits `/proj/<pid>/person/<gid>` with `[u, v, vx, vy,
+    conf]` (and `[u_px, v_px]` appended when the projection has `pixel_size`).
+    Each projection emits `/persons` (active gid list) and `/persons/count`
+    every frame so TouchDesigner sees a heartbeat. Lost gids each get one
+    terminal `/lost` message.
+    Returns the number of OSC messages sent.
+    """
+    sent = 0
+    by_proj: dict[str, list] = {pid: [] for pid in projections}
+    for p in persons:
+        by_proj.setdefault(p.projection_id, []).append(p)
+    for gid in lost_gids:
+        # We don't know which projection a fully-lost gid belonged to; broadcast
+        # to every projection so the receiver can clean up either way.
+        for pid in projections:
+            osc.send_message(f"/proj/{pid}/person/{gid}/lost", [])
+            sent += 1
+    for pid, plist in by_proj.items():
+        proj = projections.get(pid)
+        for p in plist:
+            args = [p.u, p.v, p.vx, p.vy, p.conf]
+            if proj is not None and proj.pixel_size is not None:
+                pw, ph = proj.pixel_size
+                args.extend([p.u * pw, p.v * ph])
+            osc.send_message(f"/proj/{pid}/person/{p.gid}", args)
+            sent += 1
+        gids = sorted(p.gid for p in plist)
+        osc.send_message(f"/proj/{pid}/persons", gids)
+        osc.send_message(f"/proj/{pid}/persons/count", len(gids))
+        sent += 2
+    return sent
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
@@ -466,11 +551,16 @@ def main() -> int:
     osc_cfg = cfg.get("osc", {}) or {}
     osc = SimpleUDPClient(osc_cfg.get("host", "127.0.0.1"), int(osc_cfg.get("port", 7000)))
     legacy_image_space = bool(osc_cfg.get("legacy_image_space", False))
+    person_level = bool(osc_cfg.get("person_level", True))
+    raw_per_cam = bool(osc_cfg.get("raw_per_cam", True))
     print(
         f"OSC -> {osc_cfg.get('host', '127.0.0.1')}:{osc_cfg.get('port', 7000)} "
-        f"(legacy_image_space={legacy_image_space})"
+        f"(person_level={person_level} raw_per_cam={raw_per_cam} "
+        f"legacy_image_space={legacy_image_space})"
     )
     print(f"projections: {sorted(projections.keys()) or '(none — only legacy or no-op)'}")
+
+    person_tracker = PersonTracker() if person_level else None
 
     model_path = args.model or cfg.get("model", "yolo26n.pt")
     device = args.device or cfg.get("device") or ("mps" if sys.platform == "darwin" else "cpu")
@@ -486,7 +576,8 @@ def main() -> int:
         g.start()
 
     workers = [
-        CamWorker(c, model_path, device, osc, projections, legacy_image_space)
+        CamWorker(c, model_path, device, osc, projections, legacy_image_space,
+                  raw_per_cam=raw_per_cam)
         for c in cams
     ]
 
@@ -531,15 +622,33 @@ def main() -> int:
     try:
         while not stop_flag.is_set():
             any_new = False
+            frame_events: list[PersonEvent] = []
+            frame_lost_sources: list[tuple[str, int]] = []
+            now_mono = time.monotonic()
             for grab, worker in zip(grabbers, workers):
                 frame, fidx, _ = grab.get()
                 if frame is None or fidx == last_idx[grab.cam.name]:
                     continue
                 last_idx[grab.cam.name] = fidx
                 any_new = True
-                overlays, _regions = worker.step(frame, imgsz, conf, iou, tracker)
+                overlays, _regions, events, lost_sources = worker.step(
+                    frame, imgsz, conf, iou, tracker, now_mono
+                )
                 last_frame[grab.cam.name] = frame
                 last_overlays[grab.cam.name] = overlays
+                frame_events.extend(events)
+                frame_lost_sources.extend(lost_sources)
+
+            if person_tracker is not None and (any_new or frame_lost_sources):
+                persons = person_tracker.update(
+                    frame_events, frame_lost_sources, now_mono
+                )
+                lost_gids = person_tracker.drain_lost_gids()
+                emitted = _emit_person_osc(osc, projections, persons, lost_gids)
+                # OSC accounting goes onto the first worker so the printed
+                # rate still shows non-zero even when raw_per_cam is off.
+                if workers and emitted:
+                    workers[0].osc_count += emitted
 
             if viewer is not None:
                 from viewer import CamFrame, TrackOverlay  # type: ignore

@@ -73,23 +73,58 @@ python tracker.py --show
 
 좌표는 `projection_id`로 식별되는 **공유 projection UV 공간**으로 송신됩니다. 같은 실제 바닥 프로젝션을 보는 카메라 2대는 같은 `projection_id`를 공유하며, 각 카메라가 내보내는 `(u, v)` 값은 서로 비교할 수 있습니다.
 
+### Person-keyed (권장, 기본 ON)
+
+`gid`는 cross-camera fusion이 만드는 global person ID입니다. 한 사람이 cam0 dispatch 슬라이스에서 cam1 dispatch 슬라이스로 넘어가도 같은 `gid`가 유지되도록 fusion 레이어가 hand-off를 stitch 합니다 (UV 거리 + 시간 윈도우 기반).
+
 | 주소 | 인자 | 송신 시점 |
 |---|---|---|
-| `/proj/<projection_id>/cam/<cam_name>/track/<id>` | `u, v, conf` (`pixel_size`가 있으면 `u_px, v_px` 추가) | 트랙의 발 위치가 카메라 region polygon 안이고 `dispatch_uv` slice 안일 때 매 프레임 |
+| `/proj/<projection_id>/person/<gid>` | `u, v, vx, vy, conf` (`pixel_size`가 있으면 `u_px, v_px` 추가) | 활성 person마다 매 프레임 |
+| `/proj/<projection_id>/person/<gid>/lost` | 없음 | hand-off 윈도우(기본 0.4 s) 안에 다른 카메라가 받지 못하면 한 번 |
+| `/proj/<projection_id>/persons` | `[gid, ...]` | 활성 gid 목록, 매 프레임 |
+| `/proj/<projection_id>/persons/count` | int | 매 프레임 |
+
+`(vx, vy)`는 fusion이 EMA로 산출한 UV 단위/초 속도입니다. 정지 상태에서는 0에 수렴.
+
+### Raw per-cam (호환/디버깅)
+
+`osc.raw_per_cam: true` (기본값)이면 카메라별 트랙도 함께 나갑니다. `id`는 카메라 안에서만 안정적이라 cross-camera 인터랙션에는 person-keyed 채널을 권장합니다.
+
+| 주소 | 인자 | 송신 시점 |
+|---|---|---|
+| `/proj/<projection_id>/cam/<cam_name>/track/<id>` | `u, v, conf` (`pixel_size`가 있으면 `u_px, v_px` 추가) | 발 위치가 region polygon 안이고 `dispatch_uv` 안일 때 매 프레임 |
 | `/proj/<projection_id>/cam/<cam_name>/track/<id>/lost` | 없음 | ID가 사라지거나 dispatch 영역을 벗어났을 때 한 번 |
-| `/proj/<projection_id>/count` | int | 카메라 전체 합산 count, 매 프레임 |
 | `/proj/<projection_id>/cam/<cam_name>/count` | int | 카메라별 count, 매 프레임 |
 | `/proj/<projection_id>/cam/<cam_name>/active` | id 목록 | 활성 ID가 있을 때 매 프레임 |
 
-`(u=0, v=0)`은 projection의 좌상단, `(u=1, v=1)`은 우하단입니다. `id`는 카메라별로 트랙이 유지되는 동안 안정적입니다. v1에서는 카메라 간 ID fusion을 하지 않으므로 서로 다른 카메라의 ID는 독립적입니다.
+`(u=0, v=0)`은 projection의 좌상단, `(u=1, v=1)`은 우하단입니다.
 
 `osc.legacy_image_space: true`를 `config.yaml`에 설정하면 예전 image-space 메시지(`<cam_prefix>/track/<id>`와 `cx, cy, w, h, conf`)도 함께 송신합니다. 기본값은 꺼져 있습니다.
 
 ## TouchDesigner 수신
 
-- **OSC In DAT** 또는 숫자 스트림용 **OSC In CHOP**를 추가합니다.
+- **OSC In DAT**(주소 라우팅) 또는 숫자 스트림용 **OSC In CHOP**를 추가합니다.
 - Network Port는 `config.yaml`의 포트와 맞춥니다. 기본값은 `7000`입니다.
-- 주소 패턴은 `/proj/corridor/cam/*/track/*`처럼 wildcard를 써서 특정 projection의 모든 카메라와 트랙을 받을 수 있습니다.
+
+### 권장: person 스트림 패턴
+
+```
+OSC In DAT
+  → onReceiveOSC: address가 /proj/corridor/person/*/lost면 active 테이블에서 gid 제거
+                  /proj/corridor/person/<gid>면 [u, v, vx, vy, conf]를 테이블에 업서트
+  → Table DAT (gid, u, v, vx, vy, conf)
+  → DAT to CHOP, 또는 Lookup CHOP로 인터랙션 슬롯에 매핑
+```
+
+`/persons/count`로 인원 수를 그대로 받고, `/persons` 배열로 현재 살아있는 gid 목록을 동기화합니다. gid는 재사용되지 않으므로 슬롯 할당은 단순 modulo (`slot = gid % N`) 또는 first-free-slot 정책으로 충분합니다.
+
+### Raw per-cam wildcard (디버깅용)
+
+```
+/proj/corridor/cam/*/track/*
+```
+
+각 카메라가 보고 있는 raw 트랙을 보고 싶을 때 씁니다. cross-camera 경계에서 ID가 끊기는 게 정상입니다.
 
 ## 캘리브레이션 / region 설정
 

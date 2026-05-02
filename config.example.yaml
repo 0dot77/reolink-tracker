@@ -12,6 +12,10 @@ tracker: botsort.yaml
 osc:
   host: 127.0.0.1
   port: 7000
+  # person_level: cross-camera fused stream (/proj/<id>/person/<gid>). 추천.
+  person_level: true
+  # raw_per_cam: 카메라별 raw 트랙 (/proj/<id>/cam/<cam>/track/<id>). 디버깅/호환용.
+  raw_per_cam: true
   legacy_image_space: false
 
 projections:
