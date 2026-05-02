@@ -13,7 +13,7 @@ from typing import Callable, Sequence, Optional
 import numpy as np
 import cv2
 
-from region import Region, Projection, build_homography, validate_dispatch
+from region import Region, Projection, build_homography, dispatches_overlap, validate_dispatch
 
 WINDOW_NAME = "reolink-tracker"
 
@@ -26,10 +26,17 @@ _C_DISPATCH = (0, 255, 0)
 _C_REGION_ONLY = (0, 200, 255)
 _C_NO_HIT = (160, 160, 160)
 _C_REGION_POLY = (0, 200, 0)
+_C_REGION_FOCUS = (0, 255, 255)
 _C_FOCUS = (0, 255, 255)
 _C_DRAFT = (0, 220, 255)
 _C_EDIT_PROJ = (255, 255, 255)
 _C_EDIT_DISPATCH = (0, 255, 255)
+_C_WARN = (60, 60, 240)
+_C_PANEL_BG = (28, 28, 28)
+_C_PANEL_TEXT = (220, 220, 220)
+_C_PANEL_DIM = (140, 140, 140)
+_C_DIRTY = (60, 180, 255)
+_C_CLEAN = (140, 200, 140)
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 _EDIT_EDGES = ("u0", "v0", "u1", "v1")
@@ -80,7 +87,12 @@ def _draw_hud(tile: np.ndarray, cam: CamFrame) -> None:
                 _FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def _render_tile(cam: CamFrame, tile_size: tuple[int, int], show_hud: bool) -> np.ndarray:
+def _render_tile(
+    cam: CamFrame,
+    tile_size: tuple[int, int],
+    show_hud: bool,
+    focused_region_idx: int = -1,
+) -> np.ndarray:
     tw, th = tile_size
     if cam.frame is None:
         tile = np.full((th, tw, 3), 40, dtype=np.uint8)
@@ -96,15 +108,20 @@ def _render_tile(cam: CamFrame, tile_size: tuple[int, int], show_hud: bool) -> n
     tile = cv2.resize(cam.frame, (tw, th), interpolation=cv2.INTER_AREA)
     sx, sy = tw / float(src_w), th / float(src_h)
 
-    for reg in cam.regions:
+    for ri, reg in enumerate(cam.regions):
         pts = np.array([(int(round(x * sx)), int(round(y * sy)))
                         for (x, y) in reg.image_points], dtype=np.int32)
-        cv2.polylines(tile, [pts], True, _C_REGION_POLY, 1, cv2.LINE_AA)
+        is_focus = ri == focused_region_idx
+        color = _C_REGION_FOCUS if is_focus else _C_REGION_POLY
+        thickness = 2 if is_focus else 1
+        cv2.polylines(tile, [pts], True, color, thickness, cv2.LINE_AA)
         u0, v0, u1, v1 = reg.projection_uv
         label = f"{reg.id} [{u0:.2f},{v0:.2f}->{u1:.2f},{v1:.2f}]"
+        if is_focus:
+            label = "* " + label
         tlx, tly = int(pts[:, 0].min()), int(pts[:, 1].min())
         cv2.putText(tile, label, (tlx + 2, max(12, tly - 4)),
-                    _FONT, 0.4, _C_REGION_POLY, 1, cv2.LINE_AA)
+                    _FONT, 0.4, color, 1, cv2.LINE_AA)
 
     for t in cam.tracks:
         if any(hit[3] for hit in t.region_hits):
@@ -177,18 +194,23 @@ def _uv_to_panel_rect(uv: tuple[float, float, float, float],
     return x0, y0, x1, y1
 
 
-def _render_uv_canvas(cams: Sequence[CamFrame],
-                      projections: dict[str, Projection],
-                      edit_target: Optional[tuple[int, str, str]] = None
-                      ) -> Optional[np.ndarray]:
+def _render_uv_canvas(
+    cams: Sequence[CamFrame],
+    projections: dict[str, Projection],
+    edit_target: Optional[tuple[int, str, str]] = None,
+    overlaps_by_proj: Optional[dict[str, list[str]]] = None,
+) -> Optional[np.ndarray]:
     """Render a top-down panel per projection.
 
     `edit_target`, when set, is `(cam_idx, region_id, kind)` where kind is
     "projection" or "dispatch". The targeted slice gets a thick yellow
     highlight so the operator can see what their nudge keys are moving.
+    `overlaps_by_proj` maps projection_id to a list of human-readable overlap
+    descriptions; entries are drawn as red lines at the bottom of each panel.
     """
     if not projections:
         return None
+    overlaps_by_proj = overlaps_by_proj or {}
     panels: list[np.ndarray] = []
     for proj_id, proj in projections.items():
         aspect = (proj.pixel_size[0] / float(proj.pixel_size[1])
@@ -249,6 +271,16 @@ def _render_uv_canvas(cams: Sequence[CamFrame],
                     cv2.circle(panel, (px, py), 5, color, -1, cv2.LINE_AA)
                     cv2.putText(panel, letter, (px + 6, py + 4),
                                 _FONT, 0.4, color, 1, cv2.LINE_AA)
+
+        warnings = overlaps_by_proj.get(proj_id, [])
+        if warnings:
+            wy = ch - 8 - 16 * len(warnings)
+            wy = max(wy, 36)
+            cv2.putText(panel, "dispatch overlap:", (8, wy),
+                        _FONT, 0.45, _C_WARN, 1, cv2.LINE_AA)
+            for i, line in enumerate(warnings):
+                cv2.putText(panel, line, (8, wy + 16 * (i + 1)),
+                            _FONT, 0.45, _C_WARN, 1, cv2.LINE_AA)
         panels.append(panel)
 
     if not panels:
@@ -267,6 +299,116 @@ def _hstack_match_height(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return np.hstack([left, right])
 
 
+def _compute_dispatch_overlaps(
+    cams: Sequence[CamFrame],
+) -> dict[str, list[str]]:
+    """Find dispatch_uv overlaps within each shared projection.
+
+    Returns a dict mapping `projection_id` -> list of human-readable lines like
+    `"cam0:near_half <-> cam1:far_half"`. Pairs are deduplicated and ordered.
+    Cross-projection pairs are intentionally ignored — overlap only matters
+    when two cameras claim the same shared projection.
+    """
+    by_proj: dict[str, list[tuple[str, str, tuple[float, float, float, float]]]] = {}
+    for cam in cams:
+        for reg in cam.regions:
+            by_proj.setdefault(reg.projection_id, []).append(
+                (cam.name, reg.id, reg.dispatch_uv)
+            )
+    out: dict[str, list[str]] = {}
+    for proj_id, items in by_proj.items():
+        warnings: list[str] = []
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a_cam, a_rid, a_rect = items[i]
+                b_cam, b_rid, b_rect = items[j]
+                if a_cam == b_cam:
+                    # Two regions on the same camera typically describe two
+                    # disjoint physical lanes; we still warn because OSC dispatch
+                    # would double-emit, but skip pairs that exactly share id.
+                    if a_rid == b_rid:
+                        continue
+                if dispatches_overlap(a_rect, b_rect):
+                    warnings.append(f"{a_cam}:{a_rid} <-> {b_cam}:{b_rid}")
+        if warnings:
+            out[proj_id] = warnings
+    return out
+
+
+def _render_region_panel(
+    cams: Sequence[CamFrame],
+    width: int,
+    height: int,
+    focus_idx: int,
+    focused_region_idx: int,
+    dirty: bool,
+    overlap_count: int,
+) -> np.ndarray:
+    """Per-camera region list sidebar.
+
+    Each camera is shown as a header (camera name + dispatch coverage hint),
+    followed by its regions with the focused entry highlighted. The top of
+    the panel surfaces the dirty/saved state and overlap count so operators
+    notice unsaved edits or dispatch conflicts at a glance.
+    """
+    panel = np.full((height, width, 3), _C_PANEL_BG[0], dtype=np.uint8)
+    cv2.rectangle(panel, (0, 0), (width - 1, height - 1), (90, 90, 90), 1)
+
+    pad = 8
+    line_h = 16
+    y = pad + line_h
+
+    state_text = "[unsaved]" if dirty else "[saved]"
+    state_color = _C_DIRTY if dirty else _C_CLEAN
+    cv2.putText(panel, state_text, (pad, y), _FONT, 0.5,
+                state_color, 1, cv2.LINE_AA)
+    y += line_h
+
+    if overlap_count > 0:
+        cv2.putText(panel, f"overlap: {overlap_count}", (pad, y),
+                    _FONT, 0.45, _C_WARN, 1, cv2.LINE_AA)
+        y += line_h
+
+    cv2.line(panel, (pad, y - 6), (width - pad, y - 6),
+             (70, 70, 70), 1, cv2.LINE_AA)
+    y += 4
+
+    for ci, cam in enumerate(cams):
+        if y > height - line_h * 2:
+            cv2.putText(panel, "...", (pad, y), _FONT, 0.45,
+                        _C_PANEL_DIM, 1, cv2.LINE_AA)
+            break
+        cam_color = _CAM_COLORS[ci % len(_CAM_COLORS)]
+        is_focus_cam = ci == focus_idx
+        marker = ">" if is_focus_cam else " "
+        header = f"{marker} [{ci + 1}] {cam.name}  ({len(cam.regions)})"
+        cv2.putText(panel, header, (pad, y), _FONT, 0.5,
+                    cam_color, 1 if not is_focus_cam else 2, cv2.LINE_AA)
+        y += line_h
+        if not cam.regions:
+            cv2.putText(panel, "   (no regions)", (pad, y), _FONT, 0.4,
+                        _C_PANEL_DIM, 1, cv2.LINE_AA)
+            y += line_h
+            continue
+        for ri, reg in enumerate(cam.regions):
+            if y > height - line_h:
+                break
+            is_focus_reg = is_focus_cam and ri == focused_region_idx
+            prefix = "  *" if is_focus_reg else "   "
+            d = reg.dispatch_uv
+            text = (
+                f"{prefix} {reg.id} d=[{d[0]:.2f},{d[1]:.2f}->"
+                f"{d[2]:.2f},{d[3]:.2f}]"
+            )
+            text_color = _C_REGION_FOCUS if is_focus_reg else _C_PANEL_TEXT
+            cv2.putText(panel, text, (pad, y), _FONT, 0.4,
+                        text_color, 1, cv2.LINE_AA)
+            y += line_h
+        y += 2
+
+    return panel
+
+
 class Viewer:
     """Owns the cv2 window. Call render() each tick with the latest CamFrames."""
 
@@ -283,16 +425,21 @@ class Viewer:
         self.on_save = on_save
         self.show_hud = True
         self.show_uv = True
+        self.show_panel = True
         self.focus_idx = 0
+        self.focused_region_idx = -1  # -1 means "no region selected"
         self.draw_mode = False
         self.draft_points: list[tuple[float, float]] = []
         # UV slice editing state. `edit_region_id` is None when not editing.
         self.edit_region_id: Optional[str] = None
         self.edit_kind: str = "projection"          # "projection" | "dispatch"
         self.edit_edge_idx: int = 0                  # index into _EDIT_EDGES
+        # dirty=False: regions match the last on-disk save (initial load = clean).
+        # Flips True on every on_regions_changed and back to False after on_save.
+        self.dirty = False
         self.status = (
-            "d draw | x delete | e edit slices | w save | "
-            "h/u toggles | 1-9 focus | q quit"
+            "d draw | e edit slices | [ ] cycle/nudge | x delete | w save | "
+            "h/u/p toggles | 1-9 focus | q quit"
         )
         self._last_cams: Sequence[CamFrame] = []
         self._window_created = False
@@ -403,6 +550,8 @@ class Viewer:
         regions = [*cam.regions, region]
         if self.on_regions_changed is not None:
             self.on_regions_changed(self.focus_idx, regions)
+        self.dirty = True
+        self.focused_region_idx = len(regions) - 1
         self.draft_points = []
         self.draw_mode = False
         self.status = f"added {region.id}; press w to save config"
@@ -419,6 +568,9 @@ class Viewer:
             self._exit_edit_mode()
         if self.on_regions_changed is not None:
             self.on_regions_changed(self.focus_idx, list(cam.regions[:-1]))
+        self.dirty = True
+        if self.focused_region_idx >= len(cam.regions) - 1:
+            self.focused_region_idx = -1
         self.status = f"deleted {removed.id}; press w to save config"
 
     def _exit_edit_mode(self) -> None:
@@ -580,9 +732,18 @@ class Viewer:
             cv2.polylines(canvas, [np.array(pts, dtype=np.int32)], False,
                           _C_DRAFT, 2, cv2.LINE_AA)
 
-    def _draw_status(self, canvas: np.ndarray) -> None:
+    def _draw_status(
+        self,
+        canvas: np.ndarray,
+        overlap_summary: str = "",
+    ) -> None:
+        state_text = "[unsaved]" if self.dirty else "[saved]"
+        state_color = _C_DIRTY if self.dirty else _C_CLEAN
+        first_line = f"{state_text}  {self.status}"
+        if overlap_summary:
+            first_line += f"  | {overlap_summary}"
         lines = [
-            self.status,
+            first_line,
             "draw order: projection top-left -> top-right -> bottom-right -> bottom-left",
         ]
         pad = 8
@@ -592,8 +753,15 @@ class Viewer:
         cv2.rectangle(overlay, (0, max(0, y0)), (canvas.shape[1], canvas.shape[0]),
                       (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, dst=canvas)
-        for i, line in enumerate(lines):
-            cv2.putText(canvas, line, (pad, y0 + pad + line_h * (i + 1) - 5),
+        # State badge in its own colour, then the rest of the status text in white.
+        (sw, _sh), _ = cv2.getTextSize(state_text, _FONT, 0.5, 1)
+        cv2.putText(canvas, state_text, (pad, y0 + pad + line_h - 5),
+                    _FONT, 0.5, state_color, 1, cv2.LINE_AA)
+        rest = first_line[len(state_text):]
+        cv2.putText(canvas, rest, (pad + sw, y0 + pad + line_h - 5),
+                    _FONT, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+        for i, line in enumerate(lines[1:], start=2):
+            cv2.putText(canvas, line, (pad, y0 + pad + line_h * i - 5),
                         _FONT, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
 
     def render(self, cams: Sequence[CamFrame]) -> bool:
@@ -605,6 +773,14 @@ class Viewer:
             time.sleep(0.05)
             return True
         self._last_cams = cams
+        # Keep focused_region_idx within bounds whenever the focused camera's
+        # region list shrinks under us (e.g. external config reload).
+        if 0 <= self.focus_idx < len(cams):
+            n_regions = len(cams[self.focus_idx].regions)
+            if self.focused_region_idx >= n_regions:
+                self.focused_region_idx = n_regions - 1 if n_regions else -1
+        else:
+            self.focused_region_idx = -1
         if not cams:
             blank = np.zeros((self.tile_size[1], self.tile_size[0], 3), dtype=np.uint8)
             cv2.putText(blank, "no cameras", (20, 40),
@@ -617,17 +793,47 @@ class Viewer:
                 print(f"[viewer] imshow failed: {ex}", file=sys.stderr, flush=True)
                 return True
         else:
-            tiles = [_render_tile(c, self.tile_size, self.show_hud) for c in cams]
+            tiles = [
+                _render_tile(
+                    c,
+                    self.tile_size,
+                    self.show_hud,
+                    self.focused_region_idx if i == self.focus_idx else -1,
+                )
+                for i, c in enumerate(cams)
+            ]
             canvas = _compose_grid(tiles, self.tile_size, self.focus_idx)
             self._draw_draft(canvas)
+            overlaps = _compute_dispatch_overlaps(cams)
+            overlap_count = sum(len(v) for v in overlaps.values())
             if self.show_uv:
                 edit_target = None
                 if self.edit_region_id is not None and self._focused_region() is not None:
                     edit_target = (self.focus_idx, self.edit_region_id, self.edit_kind)
-                uv = _render_uv_canvas(cams, self.projections, edit_target)
+                uv = _render_uv_canvas(cams, self.projections, edit_target, overlaps)
                 if uv is not None:
                     canvas = _hstack_match_height(canvas, uv)
-            self._draw_status(canvas)
+            if self.show_panel:
+                panel_w = 280
+                panel = _render_region_panel(
+                    cams,
+                    panel_w,
+                    canvas.shape[0],
+                    self.focus_idx,
+                    self.focused_region_idx,
+                    self.dirty,
+                    overlap_count,
+                )
+                canvas = np.hstack([panel, canvas])
+            overlap_summary = ""
+            if overlap_count > 0:
+                first_proj = next(iter(overlaps))
+                first_pair = overlaps[first_proj][0]
+                overlap_summary = (
+                    f"overlap[{first_proj}]: {first_pair}"
+                    + (f" (+{overlap_count - 1} more)" if overlap_count > 1 else "")
+                )
+            self._draw_status(canvas, overlap_summary)
             try:
                 cv2.imshow(WINDOW_NAME, canvas)
             except cv2.error as ex:
@@ -662,6 +868,8 @@ class Viewer:
             self.show_hud = not self.show_hud
         elif key == ord("u"):
             self.show_uv = not self.show_uv
+        elif key == ord("p"):
+            self.show_panel = not self.show_panel
         elif key == ord("d"):
             self.draw_mode = True
             self.draft_points = []
@@ -676,6 +884,7 @@ class Viewer:
         elif key == ord("w"):
             if self.on_save is not None:
                 self.on_save()
+            self.dirty = False
             self.status = "config saved"
         elif key == ord("e"):
             self._toggle_edit_mode()
@@ -685,10 +894,16 @@ class Viewer:
             self._cycle_edit_edge()
         elif key == ord("r") and self.edit_region_id is not None:
             self._reset_edit_slice()
-        elif key == ord("[") and self.edit_region_id is not None:
-            self._nudge_slice(-_NUDGE_FINE)
-        elif key == ord("]") and self.edit_region_id is not None:
-            self._nudge_slice(+_NUDGE_FINE)
+        elif key == ord("["):
+            if self.edit_region_id is not None:
+                self._nudge_slice(-_NUDGE_FINE)
+            else:
+                self._cycle_focused_region(-1)
+        elif key == ord("]"):
+            if self.edit_region_id is not None:
+                self._nudge_slice(+_NUDGE_FINE)
+            else:
+                self._cycle_focused_region(+1)
         elif key == ord(",") and self.edit_region_id is not None:
             self._nudge_slice(-_NUDGE_COARSE)
         elif key == ord(".") and self.edit_region_id is not None:
@@ -697,11 +912,35 @@ class Viewer:
             idx = key - ord("1")
             if idx < len(cams):
                 self.focus_idx = idx
+                self.focused_region_idx = -1
                 self.draft_points = []
                 self.draw_mode = False
                 self._exit_edit_mode()
                 self.status = f"focused {cams[idx].name}"
         return True
+
+    def _cycle_focused_region(self, step: int) -> None:
+        if self.focus_idx >= len(self._last_cams):
+            return
+        cam = self._last_cams[self.focus_idx]
+        n = len(cam.regions)
+        if n == 0:
+            self.focused_region_idx = -1
+            self.status = f"{cam.name} has no regions"
+            return
+        # Cycle through n+1 slots (indices 0..n-1 plus -1 = 'no selection')
+        # so operators can step through every region and then return to none.
+        cur = self.focused_region_idx
+        nxt = cur + step
+        if nxt >= n:
+            nxt = -1
+        elif nxt < -1:
+            nxt = n - 1
+        self.focused_region_idx = nxt
+        if nxt == -1:
+            self.status = f"{cam.name} region: (none)"
+        else:
+            self.status = f"{cam.name} region: {cam.regions[nxt].id}"
 
     def close(self) -> None:
         if self._window_created:

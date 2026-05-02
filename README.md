@@ -42,7 +42,9 @@ python tracker.py --show
 - `q` 또는 `Esc`: 종료 (slice 편집 중에는 편집 모드만 빠져나옵니다)
 - `h`: HUD 표시 토글
 - `u`: projection UV canvas 표시 토글
+- `p`: 좌측 region 목록 패널 토글
 - `1`-`9`: focus camera 선택
+- `[` / `]`: 편집 모드에서는 선택한 모서리 ±0.01 nudge, 그 외에는 focus camera 안의 focused region 순환
 - `d`: focus camera에 region 그리기 시작
 - 마우스 왼쪽 클릭 4회: projection 기준 top-left -> top-right -> bottom-right -> bottom-left 순서로 image point 입력
 - `Backspace`: region 그리기 중 마지막 점 취소
@@ -50,10 +52,11 @@ python tracker.py --show
 - `e`: focus camera region의 `projection_uv` / `dispatch_uv` slice 편집 모드 시작 / 다음 region으로 순환 / 마지막 region 이후엔 종료
 - `t`: 편집 대상 토글 — `projection_uv` ↔ `dispatch_uv`
 - `g`: 편집할 모서리 순환 — `u0 → v0 → u1 → v1`
-- `[` / `]`: 선택한 모서리 -0.01 / +0.01 nudge
-- `,` / `.`: 선택한 모서리 -0.05 / +0.05 nudge
+- `,` / `.`: 선택한 모서리 -0.05 / +0.05 nudge (편집 모드 한정)
 - `r`: 편집 중인 slice 초기화 (`projection`은 `[0,0,1,1]`로, `dispatch`는 `projection_uv`와 같게)
-- `w`: 현재 region 편집 내용을 로컬 `config.yaml`에 저장
+- `w`: 현재 region 편집 내용을 로컬 `config.yaml`에 저장 (status bar의 `[unsaved]`가 `[saved]`로 바뀜)
+
+좌측 패널은 카메라별 region 목록과 각 region의 `dispatch_uv`를 보여줍니다. `>`는 focus camera, `*`는 focused region을 가리키고, 상단에 `[unsaved]`/`[saved]` 와 `overlap: N` 카운터가 같이 떠서 저장 누락이나 dispatch 충돌을 빠르게 알 수 있게 합니다. 충돌이 있으면 UV canvas 패널 좌하단에도 `cam0:near_half <-> cam1:far_half` 같은 줄이 빨간색으로 떠서 어떤 쌍이 겹치는지 알려줍니다.
 
 ## AI / GitHub 작업 방식
 
@@ -113,6 +116,19 @@ cameras:
         dispatch_uv: [0.0, 0.0, 0.50, 1.0]
         min_bbox_height_px: 24
 ```
+
+## 카메라 2대 캘리브레이션 절차
+
+복도 양쪽 끝에 카메라 2대를 두고 같은 바닥 projection을 분담하게 만드는 표준 순서입니다. 두 카메라가 같은 `projection_id`를 공유하고, `projection_uv`는 겹쳐도 되지만 `dispatch_uv`는 절대 겹치면 안 됩니다(같은 사람이 두 OSC stream으로 동시에 나갑니다).
+
+1. 먼저 `config.yaml`에 두 카메라가 모두 같은 `projection_id`를 쓰도록 항목을 만들어 둡니다 (`projections:` 아래에 `corridor` 같은 id를 한 번만 정의하고, 두 카메라 모두 그 id를 region에 씁니다).
+2. `python tracker.py --show`로 viewer를 띄우고 `1`로 cam0을 focus 합니다. 좌측 패널 상단이 `[saved]`인지 확인하고, `d` -> 카메라 화면에서 projection 기준으로 top-left -> top-right -> bottom-right -> bottom-left 순서로 4점을 클릭합니다. 이 카메라는 가까운 절반을 담당할 것이므로 4점은 카메라가 실제로 잘 보이는 가까운 영역만 둘러쌉니다.
+3. `w`로 일단 저장합니다. 새 region은 `projection_uv = [0.0, 0.0, 1.0, 1.0]`, `dispatch_uv`도 동일하게 만들어집니다. `[saved]`가 떠야 디스크에 반영된 상태입니다.
+4. 에디터에서 `config.yaml`의 cam0 region을 열어 분담 범위를 줄입니다. 예를 들어 cam0이 복도 왼쪽 절반이면 `projection_uv: [0.0, 0.0, 0.55, 1.0]`, `dispatch_uv: [0.0, 0.0, 0.50, 1.0]`로 바꿉니다. `projection_uv`는 살짝 더 넓게(0.55) 두고 `dispatch_uv`는 안전 마진(0.50)을 두면 카메라 끝부분 떨림이 송신에 영향을 덜 줍니다.
+5. cam1도 같은 방식으로 진행합니다. viewer에서 `2`로 focus를 옮긴 뒤 `d`로 region을 그립니다. 이 카메라는 마주 보는 방향이라 같은 바닥인데도 영상이 좌우 반전돼 보이지만, 4점 클릭 순서는 여전히 **projection-UV 기준** top-left -> top-right -> bottom-right -> bottom-left 입니다. cam0과 동일한 `projection_id`를 쓰도록 `config.yaml`을 정리합니다.
+6. cam1의 `projection_uv` / `dispatch_uv`는 cam0과 거울처럼 반대 슬라이스를 잡습니다. 예시 분할: cam0 `dispatch_uv [0.0, 0.0, 0.50, 1.0]`, cam1 `dispatch_uv [0.50, 0.0, 1.0, 1.0]`. 두 `dispatch_uv`의 u 경계가 정확히 같은 값이면 `dispatches_overlap`은 통과합니다(접하기만 하고 겹치지 않음).
+7. 저장 후 viewer를 다시 시작하면 좌측 패널에 두 카메라의 region 목록이 보이고, 상단 `overlap` 카운터가 `0`이어야 합니다. UV canvas 패널 좌하단에 빨간 경고가 뜨면 어떤 쌍의 `dispatch_uv`가 겹치는지 알려주므로 그 부분만 다시 분할 비율을 조정합니다.
+8. 마지막으로 사람이 한 명 복도 끝에서 끝까지 천천히 걸어가게 하고, TouchDesigner OSC In CHOP에서 `/proj/corridor/cam/cam0/track/*`와 `/proj/corridor/cam/cam1/track/*`가 서로 끊김 없이 이어지는지 확인합니다. 같은 사람이 양쪽에서 동시에 송신되는 구간이 있으면 `dispatch_uv`가 아직 겹치는 것이므로 4번~6번 단계로 돌아갑니다.
 
 ## 카메라 2대 네트워크 구성
 

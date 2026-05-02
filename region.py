@@ -131,6 +131,23 @@ def is_inside_uv(
     return (u0 <= u <= u1) and (v0 <= v <= v1)
 
 
+def dispatches_overlap(
+    rect_a: tuple[float, float, float, float],
+    rect_b: tuple[float, float, float, float],
+) -> bool:
+    """Return True if two UV rectangles share an open interior.
+
+    Each rect is `(u0, v0, u1, v1)` with u0<u1 and v0<v1. Touching edges
+    (e.g. one ends at u=0.5 and the other starts at u=0.5) are *not*
+    considered overlapping; only positive-area intersection counts. Used by
+    the viewer to warn operators when two cameras claim the same projection
+    slice for OSC dispatch.
+    """
+    a_u0, a_v0, a_u1, a_v1 = rect_a
+    b_u0, b_v0, b_u1, b_v1 = rect_b
+    return max(a_u0, b_u0) < min(a_u1, b_u1) and max(a_v0, b_v0) < min(a_v1, b_v1)
+
+
 def validate_dispatch(
     projection_uv: tuple[float, float, float, float],
     dispatch_uv: tuple[float, float, float, float],
