@@ -11,6 +11,13 @@ Person-keyed OSC schema (primary, when osc.person_level: true):
     /proj/<projection_id>/persons               [gid, gid, ...]
     /proj/<projection_id>/persons/count         int
 
+Interaction-zone OSC schema (when projection interaction_zones are configured):
+    /proj/<projection_id>/zone/<zone_id>/person/<gid>
+        [u, v, zone_u, zone_v, vx, vy, dwell_s, presence, state_code]
+    /proj/<projection_id>/zone/<zone_id>/person/<gid>/enter [zone_u, zone_v]
+    /proj/<projection_id>/zone/<zone_id>/person/<gid>/leave [reason_code, dwell_s]
+    /proj/<projection_id>/zone/<zone_id>/count int
+
 Raw per-cam OSC schema (when osc.raw_per_cam: true):
     /proj/<projection_id>/cam/<cam>/track/<id>      [u, v, conf, (u_px, v_px)?]
     /proj/<projection_id>/cam/<cam>/track/<id>/lost []
@@ -47,11 +54,13 @@ import yaml
 from pythonosc.udp_client import SimpleUDPClient
 from ultralytics import YOLO
 
-from fusion import PersonEvent, PersonTracker
+from fusion import InteractionZoneTracker, LostPerson, PersonEvent, PersonTracker, ZoneUpdate
 from region import (
+    InteractionZone,
     Projection,
     Region,
     build_homography,
+    dispatches_overlap,
     is_inside_uv,
     project,
     validate_dispatch,
@@ -75,12 +84,49 @@ def _redact_url(url: str) -> str:
     )
 
 
+def _network_target_from_camera(cam: "CamCfg") -> Optional[tuple[str, str, int, str]]:
+    parts = urlsplit(cam.url)
+    if not parts.hostname:
+        return None
+    return (cam.name, parts.hostname, int(parts.port or 554), "rtsp")
+
+
+def _network_target_from_osc(osc_cfg: dict) -> Optional[tuple[str, str, int, str]]:
+    host = str(osc_cfg.get("host", "127.0.0.1"))
+    if host in {"127.0.0.1", "::1", "localhost"}:
+        return None
+    return ("OSC receiver", host, int(osc_cfg.get("port", 7000)), "osc")
+
+
 @dataclass
 class CamCfg:
     name: str
     url: str
     osc_prefix: str
     regions: list[Region] = field(default_factory=list)
+
+
+@dataclass
+class DetectionFilterCfg:
+    """Post-YOLO hygiene before raw tracks become interaction actors."""
+
+    enabled: bool = True
+    min_confidence: float = 0.28
+    min_bbox_height_px: float = 42.0
+    min_bbox_area_px: float = 900.0
+    min_aspect_h_over_w: float = 1.15
+    max_aspect_h_over_w: float = 5.8
+    max_width_over_height: float = 1.05
+    projection_inner_margin_uv: float = 0.0
+    confirm_hits: int = 3
+    confirm_window_s: float = 0.8
+
+
+@dataclass
+class _PendingDetection:
+    first_t: float
+    last_t: float
+    hits: int = 1
 
 
 class FrameGrabber(threading.Thread):
@@ -148,6 +194,7 @@ class CamWorker:
         legacy_image_space: bool,
         raw_per_cam: bool = True,
         miss_buffer_frames: int = 8,
+        detection_filter: Optional[DetectionFilterCfg] = None,
     ):
         self.cam = cam
         self.osc = osc
@@ -156,6 +203,7 @@ class CamWorker:
         self.projections = projections
         self.legacy_image_space = legacy_image_space
         self.raw_per_cam = raw_per_cam
+        self.detection_filter = detection_filter or DetectionFilterCfg()
         # last_ids per region_id; legacy uses the empty-string key.
         self.last_ids: dict[str, set[int]] = {r.id: set() for r in cam.regions}
         self.last_ids[""] = set()  # legacy bucket
@@ -172,6 +220,11 @@ class CamWorker:
         # before that, the entry is cleared and no loss is reported.
         self.miss_buffer_frames = max(int(miss_buffer_frames), 0)
         self._tid_miss: dict[int, int] = {}
+        # Tracks must pass a short confirmation gate before they become
+        # interaction actors. This keeps one-frame bag/shadow/person-part
+        # detections from spawning OSC identities.
+        self._pending_detections: dict[int, _PendingDetection] = {}
+        self._confirmed_tids: set[int] = set()
         self.fps_count = 0
         self.osc_count = 0
 
@@ -182,6 +235,78 @@ class CamWorker:
         self.last_ids[""] = set()
         self.last_projection_tids = set()
         self._tid_miss = {}
+        self._pending_detections = {}
+        self._confirmed_tids = set()
+
+    def _classify_detection(self, box: np.ndarray, conf: float) -> tuple[bool, str]:
+        cfg = self.detection_filter
+        if not cfg.enabled:
+            return True, "accepted"
+        x1, y1, x2, y2 = (float(v) for v in box)
+        bw = x2 - x1
+        bh = y2 - y1
+        area = bw * bh
+        if conf < cfg.min_confidence:
+            return False, "low-conf"
+        if bh < cfg.min_bbox_height_px or area < cfg.min_bbox_area_px:
+            return False, "too-small"
+        if bw <= 1.0:
+            return False, "bad-width"
+        aspect_h_over_w = bh / bw
+        if aspect_h_over_w < cfg.min_aspect_h_over_w:
+            return False, "too-wide"
+        if aspect_h_over_w > cfg.max_aspect_h_over_w:
+            return False, "too-tall"
+        if (bw / bh) > cfg.max_width_over_height:
+            return False, "too-wide"
+        return True, "accepted"
+
+    def _passes_projection_margin(
+        self,
+        uv: tuple[float, float],
+        rect: tuple[float, float, float, float],
+    ) -> bool:
+        margin = self.detection_filter.projection_inner_margin_uv
+        if not self.detection_filter.enabled or margin <= 0:
+            return True
+        u, v = uv
+        u0, v0, u1, v1 = rect
+        lo_u, hi_u = sorted((u0, u1))
+        lo_v, hi_v = sorted((v0, v1))
+        return (
+            lo_u + margin <= u <= hi_u - margin
+            and lo_v + margin <= v <= hi_v - margin
+        )
+
+    def _is_confirmed_detection(self, tid: int, now: float) -> bool:
+        cfg = self.detection_filter
+        if not cfg.enabled or cfg.confirm_hits <= 1:
+            self._confirmed_tids.add(tid)
+            return True
+        if tid in self._confirmed_tids:
+            return True
+        pending = self._pending_detections.get(tid)
+        if pending is None or now - pending.last_t > cfg.confirm_window_s:
+            self._pending_detections[tid] = _PendingDetection(first_t=now, last_t=now)
+            return False
+        pending.hits += 1
+        pending.last_t = now
+        if pending.hits >= cfg.confirm_hits:
+            self._confirmed_tids.add(tid)
+            self._pending_detections.pop(tid, None)
+            return True
+        return False
+
+    def _prune_pending_detections(self, now: float) -> None:
+        cfg = self.detection_filter
+        if not cfg.enabled:
+            return
+        stale = [
+            tid for tid, pending in self._pending_detections.items()
+            if now - pending.last_t > cfg.confirm_window_s
+        ]
+        for tid in stale:
+            self._pending_detections.pop(tid, None)
 
     def step(
         self,
@@ -235,6 +360,11 @@ class CamWorker:
             confs = r.boxes.conf.cpu().numpy()
 
             for tid, box, c in zip(ids, xyxy, confs):
+                accepted, _reason = self._classify_detection(box, float(c))
+                if not accepted:
+                    continue
+                if not self._is_confirmed_detection(int(tid), now):
+                    continue
                 x1, y1, x2, y2 = (float(v) for v in box)
                 bbox_h = y2 - y1
                 foot_x = (x1 + x2) / 2.0
@@ -251,19 +381,22 @@ class CamWorker:
                     u, v = project((foot_x, foot_y), reg.H)
                     if not is_inside_uv((u, v), reg.projection_uv):
                         continue
+                    if not self._passes_projection_margin((u, v), reg.projection_uv):
+                        continue
                     in_projection = True
                     in_dispatch = is_inside_uv((u, v), reg.dispatch_uv)
                     region_hits.append((reg.id, u, v, in_dispatch))
+                    person_events.append(PersonEvent(
+                        projection_id=reg.projection_id,
+                        cam_name=self.cam.name,
+                        track_id=int(tid),
+                        u=u,
+                        v=v,
+                        conf=float(c),
+                        t=now,
+                        dispatching=in_dispatch,
+                    ))
                     if in_dispatch:
-                        person_events.append(PersonEvent(
-                            projection_id=reg.projection_id,
-                            cam_name=self.cam.name,
-                            track_id=int(tid),
-                            u=u,
-                            v=v,
-                            conf=float(c),
-                            t=now,
-                        ))
                         if self.raw_per_cam:
                             proj = self.projections.get(reg.projection_id)
                             addr = f"/proj/{reg.projection_id}/cam/{self.cam.name}/track/{int(tid)}"
@@ -356,7 +489,10 @@ class CamWorker:
             if self._tid_miss[tid] >= threshold:
                 lost_sources.append((self.cam.name, tid))
                 del self._tid_miss[tid]
+                self._confirmed_tids.discard(tid)
+                self._pending_detections.pop(tid, None)
         self.last_projection_tids = projection_tids
+        self._prune_pending_detections(now)
 
         self.fps_count += 1
         return overlays, self.cam.regions, person_events, lost_sources
@@ -423,8 +559,56 @@ def _parse_projections(cfg: dict) -> dict[str, Projection]:
             id=pid,
             pixel_size=tuple(ps) if ps else None,
             world_size_m=tuple(ws) if ws else None,
+            interaction_zones=_parse_interaction_zones(entry, pid, label),
         )
     return out
+
+
+def _parse_interaction_zones(
+    projection_entry: dict,
+    projection_id: str,
+    projection_label: str,
+) -> list[InteractionZone]:
+    zones: list[InteractionZone] = []
+    zone_entries = _require_sequence(
+        projection_entry.get("interaction_zones", []) or [],
+        f"{projection_label}.interaction_zones",
+    )
+    seen: set[str] = set()
+    for idx, entry in enumerate(zone_entries):
+        label = f"{projection_label}.interaction_zones[{idx}]"
+        entry = _require_mapping(entry, label)
+        zid = str(_require_field(entry, "id", label))
+        if zid in seen:
+            raise ConfigError(
+                f"{projection_label}.interaction_zones id {zid!r} is duplicated"
+            )
+        seen.add(zid)
+        uv_rect = _require_uv_rect(
+            entry.get("uv_rect"),
+            f"{label} {zid}.uv_rect",
+        )
+        _validate_unit_uv_rect(uv_rect, f"{label} {zid}.uv_rect")
+        zones.append(
+            InteractionZone(
+                projection_id=projection_id,
+                id=zid,
+                uv_rect=uv_rect,
+                release_after_s=max(float(entry.get("release_after_s", 0.6)), 0.0),
+            )
+        )
+    return zones
+
+
+def _validate_unit_uv_rect(
+    rect: tuple[float, float, float, float],
+    label: str,
+) -> None:
+    u0, v0, u1, v1 = rect
+    if not (0.0 <= u0 < u1 <= 1.0 and 0.0 <= v0 < v1 <= 1.0):
+        raise ConfigError(
+            f"{label} must satisfy 0 <= u0 < u1 <= 1 and 0 <= v0 < v1 <= 1, got {rect}"
+        )
 
 
 def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[Region]:
@@ -482,10 +666,14 @@ def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg
         raise ConfigError("config must define at least one camera in 'cameras'")
 
     cams: list[CamCfg] = []
+    seen_names: set[str] = set()
     for idx, entry in enumerate(camera_entries):
         label = f"cameras[{idx}]"
         entry = _require_mapping(entry, label)
         name = _require_field(entry, "name", label)
+        if name in seen_names:
+            raise ConfigError(f"camera name {name!r} is duplicated")
+        seen_names.add(name)
         url = _validate_camera_url(
             _require_field(entry, "url", label),
             f"camera {name}",
@@ -499,6 +687,46 @@ def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg
             )
         )
     return cams
+
+
+def _parse_detection_filter(cfg: dict) -> DetectionFilterCfg:
+    raw = cfg.get("detection_filter", {}) or {}
+    raw = _require_mapping(raw, "detection_filter")
+    return DetectionFilterCfg(
+        enabled=bool(raw.get("enabled", True)),
+        min_confidence=float(raw.get("min_confidence", 0.28)),
+        min_bbox_height_px=float(raw.get("min_bbox_height_px", 42.0)),
+        min_bbox_area_px=float(raw.get("min_bbox_area_px", 900.0)),
+        min_aspect_h_over_w=float(raw.get("min_aspect_h_over_w", 1.15)),
+        max_aspect_h_over_w=float(raw.get("max_aspect_h_over_w", 5.8)),
+        max_width_over_height=float(raw.get("max_width_over_height", 1.05)),
+        projection_inner_margin_uv=float(raw.get("projection_inner_margin_uv", 0.0)),
+        confirm_hits=max(int(raw.get("confirm_hits", 3)), 1),
+        confirm_window_s=max(float(raw.get("confirm_window_s", 0.8)), 0.0),
+    )
+
+
+def _validate_dispatch_overlaps(cams: list[CamCfg]) -> None:
+    by_proj: dict[str, list[tuple[str, str, tuple[float, float, float, float]]]] = {}
+    for cam in cams:
+        for reg in cam.regions:
+            by_proj.setdefault(reg.projection_id, []).append(
+                (cam.name, reg.id, reg.dispatch_uv)
+            )
+    for proj_id, entries in by_proj.items():
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                a_cam, a_rid, a_rect = entries[i]
+                b_cam, b_rid, b_rect = entries[j]
+                if a_cam == b_cam and a_rid == b_rid:
+                    continue
+                if dispatches_overlap(a_rect, b_rect):
+                    raise ConfigError(
+                        "dispatch_uv overlap in projection "
+                        f"{proj_id!r}: {a_cam}:{a_rid} overlaps {b_cam}:{b_rid}. "
+                        "Projection overlap is allowed for hand-off, but "
+                        "dispatch_uv slices must only touch edges or be disjoint."
+                    )
 
 
 def load_cfg(path: Path) -> dict:
@@ -523,6 +751,23 @@ def _region_to_cfg(region: Region) -> dict:
     return out
 
 
+def _zone_to_cfg(zone: InteractionZone) -> dict:
+    return {
+        "id": zone.id,
+        "uv_rect": [float(v) for v in zone.uv_rect],
+        "release_after_s": float(zone.release_after_s),
+    }
+
+
+def _all_interaction_zones(
+    projections: dict[str, Projection],
+) -> list[InteractionZone]:
+    zones: list[InteractionZone] = []
+    for projection in projections.values():
+        zones.extend(projection.interaction_zones)
+    return zones
+
+
 def save_cfg(path: Path, cfg: dict) -> None:
     with open(path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
@@ -532,7 +777,7 @@ def _emit_person_osc(
     osc: SimpleUDPClient,
     projections: dict[str, Projection],
     persons: list,
-    lost_gids: list[int],
+    lost_gids: list[LostPerson],
 ) -> int:
     """Send person-keyed OSC for the current frame.
 
@@ -547,12 +792,9 @@ def _emit_person_osc(
     by_proj: dict[str, list] = {pid: [] for pid in projections}
     for p in persons:
         by_proj.setdefault(p.projection_id, []).append(p)
-    for gid in lost_gids:
-        # We don't know which projection a fully-lost gid belonged to; broadcast
-        # to every projection so the receiver can clean up either way.
-        for pid in projections:
-            osc.send_message(f"/proj/{pid}/person/{gid}/lost", [])
-            sent += 1
+    for lost in lost_gids:
+        osc.send_message(f"/proj/{lost.projection_id}/person/{lost.gid}/lost", [])
+        sent += 1
     for pid, plist in by_proj.items():
         proj = projections.get(pid)
         for p in plist:
@@ -569,6 +811,43 @@ def _emit_person_osc(
     return sent
 
 
+def _emit_zone_osc(osc: SimpleUDPClient, update: ZoneUpdate) -> int:
+    """Send interaction-zone OSC for the current person heartbeat."""
+    sent = 0
+    for transition in update.transitions:
+        base = (
+            f"/proj/{transition.projection_id}/zone/{transition.zone_id}"
+            f"/person/{transition.gid}"
+        )
+        if transition.kind == "enter":
+            osc.send_message(f"{base}/enter", [transition.zone_u, transition.zone_v])
+        elif transition.kind == "leave":
+            osc.send_message(f"{base}/leave", [transition.reason_code, transition.dwell_s])
+        else:
+            continue
+        sent += 1
+    for person in update.persons:
+        osc.send_message(
+            f"/proj/{person.projection_id}/zone/{person.zone_id}/person/{person.gid}",
+            [
+                person.u,
+                person.v,
+                person.zone_u,
+                person.zone_v,
+                person.vx,
+                person.vy,
+                person.dwell_s,
+                person.presence,
+                person.state_code,
+            ],
+        )
+        sent += 1
+    for (pid, zid), count in sorted(update.counts.items()):
+        osc.send_message(f"/proj/{pid}/zone/{zid}/count", int(count))
+        sent += 1
+    return sent
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
@@ -582,6 +861,8 @@ def main() -> int:
         cfg = load_cfg(config_path)
         projections = _parse_projections(cfg)
         cams = _parse_cameras(cfg, projections)
+        detection_filter = _parse_detection_filter(cfg)
+        _validate_dispatch_overlaps(cams)
     except (OSError, yaml.YAMLError, ConfigError) as ex:
         print(f"config error: {ex}", file=sys.stderr)
         return 2
@@ -591,12 +872,17 @@ def main() -> int:
     legacy_image_space = bool(osc_cfg.get("legacy_image_space", False))
     person_level = bool(osc_cfg.get("person_level", True))
     raw_per_cam = bool(osc_cfg.get("raw_per_cam", True))
+    zone_level = bool(osc_cfg.get("zone_level", True))
+    heartbeat_interval_s = max(float(osc_cfg.get("heartbeat_interval_s", 0.1)), 0.02)
     print(
         f"OSC -> {osc_cfg.get('host', '127.0.0.1')}:{osc_cfg.get('port', 7000)} "
         f"(person_level={person_level} raw_per_cam={raw_per_cam} "
+        f"zone_level={zone_level} "
         f"legacy_image_space={legacy_image_space})"
     )
-    print(f"projections: {sorted(projections.keys()) or '(none — only legacy or no-op)'}")
+    print(
+        f"projections: {sorted(projections.keys()) or '(none — only legacy or no-op)'}"
+    )
 
     fusion_cfg = cfg.get("fusion", {}) or {}
     miss_buffer_frames = max(int(fusion_cfg.get("miss_buffer_frames", 8)), 0)
@@ -605,15 +891,19 @@ def main() -> int:
             hand_off_window_s=float(fusion_cfg.get("hand_off_window_s", 2.5)),
             match_uv_radius=float(fusion_cfg.get("match_uv_radius", 0.05)),
             velocity_alpha=float(fusion_cfg.get("velocity_alpha", 0.3)),
+            position_alpha=float(fusion_cfg.get("position_alpha", 0.45)),
         )
+        zone_tracker = InteractionZoneTracker()
         print(
             f"fusion: hand_off_window_s={person_tracker.hand_off_window_s} "
             f"match_uv_radius={person_tracker.match_uv_radius} "
             f"velocity_alpha={person_tracker.velocity_alpha} "
+            f"position_alpha={person_tracker.position_alpha} "
             f"miss_buffer_frames={miss_buffer_frames}"
         )
     else:
         person_tracker = None
+        zone_tracker = None
 
     model_path = args.model or cfg.get("model", "yolo26n.pt")
     device = args.device or cfg.get("device") or ("mps" if sys.platform == "darwin" else "cpu")
@@ -622,7 +912,18 @@ def main() -> int:
     iou = float(cfg.get("iou", 0.5))  # inert under YOLO26 but ultralytics tolerates it
     tracker = cfg.get("tracker", "botsort.yaml")
 
-    print(f"model={model_path} device={device} imgsz={imgsz} conf={conf} iou={iou} tracker={tracker}")
+    print(
+        f"model={model_path} device={device} imgsz={imgsz} conf={conf} iou={iou} tracker={tracker}"
+    )
+    print(
+        "detection_filter: "
+        f"enabled={detection_filter.enabled} "
+        f"min_confidence={detection_filter.min_confidence} "
+        f"min_bbox_height_px={detection_filter.min_bbox_height_px} "
+        f"min_bbox_area_px={detection_filter.min_bbox_area_px} "
+        f"aspect={detection_filter.min_aspect_h_over_w}..{detection_filter.max_aspect_h_over_w} "
+        f"confirm_hits={detection_filter.confirm_hits}/{detection_filter.confirm_window_s:.1f}s"
+    )
 
     grabbers = [FrameGrabber(c) for c in cams]
     for g in grabbers:
@@ -630,14 +931,21 @@ def main() -> int:
 
     workers = [
         CamWorker(c, model_path, device, osc, projections, legacy_image_space,
-                  raw_per_cam=raw_per_cam, miss_buffer_frames=miss_buffer_frames)
+                  raw_per_cam=raw_per_cam, miss_buffer_frames=miss_buffer_frames,
+                  detection_filter=detection_filter)
         for c in cams
     ]
 
     viewer = None
     if args.show:
         # Lazy-import so headless runs don't pay viewer's import cost.
-        from viewer import CamFrame, TrackOverlay, Viewer
+        from viewer import (
+            CamFrame,
+            FusedPersonFrame,
+            NetworkTargetFrame,
+            TrackOverlay,
+            Viewer,
+        )
 
         def _on_regions_changed(cam_idx: int, regions: list[Region]) -> None:
             workers[cam_idx].update_regions(regions)
@@ -645,19 +953,45 @@ def main() -> int:
                 _region_to_cfg(region) for region in regions
             ]
 
+        def _on_zones_changed(
+            projection_id: str,
+            zones: list[InteractionZone],
+        ) -> None:
+            projection = projections.get(projection_id)
+            if projection is not None:
+                projection.interaction_zones = zones
+            for entry in cfg.get("projections", []) or []:
+                if entry.get("id") == projection_id:
+                    entry["interaction_zones"] = [
+                        _zone_to_cfg(zone) for zone in zones
+                    ]
+                    break
+
         def _on_save() -> None:
             save_cfg(config_path, cfg)
             print(f"saved config: {config_path}")
 
+        network_targets = [
+            NetworkTargetFrame(name=name, host=host, port=port, kind=kind)
+            for item in (
+                [_network_target_from_camera(cam) for cam in cams]
+                + [_network_target_from_osc(osc_cfg)]
+            )
+            if item is not None
+            for name, host, port, kind in (item,)
+        ]
+
         viewer = Viewer(
             projections,
+            network_targets=network_targets,
             on_regions_changed=_on_regions_changed,
+            on_zones_changed=_on_zones_changed,
             on_save=_on_save,
         )
 
     stop_flag = threading.Event()
 
-    def _sig(*_):
+    def _sig(*_) -> None:
         print("\nstopping...")
         stop_flag.set()
 
@@ -668,9 +1002,12 @@ def main() -> int:
     last_idx = {c.name: -1 for c in cams}
     # Per-cam latest frame + overlay snapshot for viewer (sticky between detection ticks).
     last_frame: dict[str, Optional[np.ndarray]] = {c.name: None for c in cams}
+    last_frame_ts: dict[str, float] = {c.name: 0.0 for c in cams}
     last_overlays: dict[str, list] = {c.name: [] for c in cams}
     last_fps_per_cam: dict[str, float] = {c.name: 0.0 for c in cams}
     last_osc_per_cam: dict[str, float] = {c.name: 0.0 for c in cams}
+    last_fused_persons: list = []
+    last_person_osc_mono = 0.0
 
     try:
         while not stop_flag.is_set():
@@ -679,7 +1016,7 @@ def main() -> int:
             frame_lost_sources: list[tuple[str, int]] = []
             now_mono = time.monotonic()
             for grab, worker in zip(grabbers, workers):
-                frame, fidx, _ = grab.get()
+                frame, fidx, frame_ts = grab.get()
                 if frame is None or fidx == last_idx[grab.cam.name]:
                     continue
                 last_idx[grab.cam.name] = fidx
@@ -688,27 +1025,56 @@ def main() -> int:
                     frame, imgsz, conf, iou, tracker, now_mono
                 )
                 last_frame[grab.cam.name] = frame
+                last_frame_ts[grab.cam.name] = frame_ts
                 last_overlays[grab.cam.name] = overlays
                 frame_events.extend(events)
                 frame_lost_sources.extend(lost_sources)
 
-            if person_tracker is not None and (any_new or frame_lost_sources):
-                persons = person_tracker.update(
-                    frame_events, frame_lost_sources, now_mono
-                )
-                lost_gids = person_tracker.drain_lost_gids()
+            should_heartbeat = (
+                person_tracker is not None
+                and now_mono - last_person_osc_mono >= heartbeat_interval_s
+            )
+            if person_tracker is not None and (
+                any_new or frame_lost_sources or should_heartbeat
+            ):
+                lost_gids: list[LostPerson] = []
+                if any_new or frame_lost_sources:
+                    persons = person_tracker.update(
+                        frame_events, frame_lost_sources, now_mono
+                    )
+                    last_fused_persons = persons
+                    lost_gids = person_tracker.drain_lost_gids()
+                else:
+                    persons = person_tracker.update([], [], now_mono)
+                    last_fused_persons = persons
+                    lost_gids = person_tracker.drain_lost_gids()
                 emitted = _emit_person_osc(osc, projections, persons, lost_gids)
+                if zone_level and zone_tracker is not None:
+                    emitted += _emit_zone_osc(
+                        osc,
+                        zone_tracker.update(
+                            _all_interaction_zones(projections),
+                            persons,
+                            now_mono,
+                        ),
+                    )
+                last_person_osc_mono = now_mono
                 # OSC accounting goes onto the first worker so the printed
                 # rate still shows non-zero even when raw_per_cam is off.
                 if workers and emitted:
                     workers[0].osc_count += emitted
 
             if viewer is not None:
-                from viewer import CamFrame, TrackOverlay  # type: ignore
+                from viewer import CamFrame, FusedPersonFrame, TrackOverlay  # type: ignore
 
                 cam_frames = []
+                now_wall = time.time()
                 for grab, worker in zip(grabbers, workers):
                     name = grab.cam.name
+                    frame_age = (
+                        now_wall - last_frame_ts[name]
+                        if last_frame_ts[name] else 999.0
+                    )
                     tracks = [
                         TrackOverlay(tid, bbox, c, hits)
                         for (tid, bbox, c, hits) in last_overlays[name]
@@ -722,9 +1088,31 @@ def main() -> int:
                             fps=last_fps_per_cam[name],
                             osc_rate=last_osc_per_cam[name],
                             reconnects=grab.reconnects,
+                            frame_age_s=frame_age,
                         )
                     )
-                if not viewer.render(cam_frames):
+                fused_frames = [
+                    FusedPersonFrame(
+                        gid=p.gid,
+                        projection_id=p.projection_id,
+                        u=p.u,
+                        v=p.v,
+                        vx=p.vx,
+                        vy=p.vy,
+                        conf=p.conf,
+                        state=p.state,
+                        source=p.source,
+                    )
+                    for p in last_fused_persons
+                ]
+                stats = {}
+                if person_tracker is not None:
+                    stats = {
+                        "spawned": person_tracker.spawned_count,
+                        "handoff": person_tracker.handoff_count,
+                        "lost": person_tracker.lost_count,
+                    }
+                if not viewer.render(cam_frames, fused_frames, stats):
                     break
 
             if not any_new and viewer is None:

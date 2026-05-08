@@ -6,7 +6,8 @@
 model: yolo26n.pt
 device: mps
 imgsz: 640
-conf: 0.35
+# YOLO raw threshold는 낮게 두고 detection_filter에서 actor 승격을 보수적으로 거른다.
+conf: 0.22
 tracker: botsort.yaml
 
 osc:
@@ -16,6 +17,10 @@ osc:
   person_level: true
   # raw_per_cam: 카메라별 raw 트랙 (/proj/<id>/cam/<cam>/track/<id>). 디버깅/호환용.
   raw_per_cam: true
+  # zone_level: projection UV interaction_zones 안의 fused person stream.
+  zone_level: true
+  # frame 입력이 잠깐 멈춰도 person/zone count heartbeat를 유지하는 주기.
+  heartbeat_interval_s: 0.1
   legacy_image_space: false
 
 fusion:
@@ -27,15 +32,36 @@ fusion:
   match_uv_radius: 0.05
   # 속도 EMA 가중치. 1.0이면 매 프레임 즉시 반영, 0에 가까우면 매우 부드러움.
   velocity_alpha: 0.3
+  # 위치 EMA 가중치. 낮을수록 actor 위치가 부드럽지만 실제 움직임보다 늦게 따라온다.
+  # 0.45는 야간/원거리 검출 흔들림을 줄이기 위한 현장 기본값.
+  position_alpha: 0.45
   # CamWorker가 하나의 tid를 lost_source로 fusion에 알리기 전까지 견디는 연속 결손 프레임 수.
   # 짧은 YOLO/BoT-SORT detection drop이 매번 새 gid를 만들지 않도록 흡수한다.
   # 0이면 결손 즉시 lost (legacy). 기본 8은 ≈ 400 ms @ 20 fps.
   miss_buffer_frames: 8
 
+detection_filter:
+  # YOLO raw person box가 바로 인터랙션 actor가 되지 않도록 후처리한다.
+  # 가방/그림자/경계부 1프레임 오검출을 줄이기 위한 현장 기본값.
+  enabled: true
+  min_confidence: 0.28
+  min_bbox_height_px: 42
+  min_bbox_area_px: 900
+  min_aspect_h_over_w: 1.15
+  max_aspect_h_over_w: 5.8
+  max_width_over_height: 1.05
+  projection_inner_margin_uv: 0.0
+  confirm_hits: 3
+  confirm_window_s: 0.8
+
 projections:
   - id: corridor
     pixel_size: [9600, 1080]
     world_size_m: [40.0, 4.5]
+    interaction_zones:
+      - id: center
+        uv_rect: [0.35, 0.15, 0.65, 0.85]
+        release_after_s: 0.6
 
 cameras:
   - name: cam0

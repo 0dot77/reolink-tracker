@@ -23,6 +23,17 @@ class Projection:
     id: str
     pixel_size: Optional[tuple[int, int]] = None       # (w_px, h_px). None → no /px channel.
     world_size_m: Optional[tuple[float, float]] = None  # metadata only.
+    interaction_zones: list["InteractionZone"] = field(default_factory=list)
+
+
+@dataclass
+class InteractionZone:
+    """Rectangular interaction surface in a projection's UV coordinate space."""
+
+    projection_id: str
+    id: str
+    uv_rect: tuple[float, float, float, float]
+    release_after_s: float = 0.6
 
 
 @dataclass
