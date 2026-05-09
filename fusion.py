@@ -12,6 +12,7 @@ logic is intentionally simple (UV distance + time window). v2 candidates:
 appearance ReID, motion-direction priors, multi-hypothesis tracking.
 """
 
+import heapq
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -324,6 +325,7 @@ class PersonTracker:
         velocity_max_dt_s: float = 1.0,
         velocity_predict_max_dt_s: float = 1.0,
         hold_boundary_margin_uv: float = 0.0,
+        reuse_lost_gids: bool = True,
     ):
         self.hand_off_window_s = hand_off_window_s
         self.match_uv_radius = match_uv_radius
@@ -339,8 +341,15 @@ class PersonTracker:
         # the projection edge. Interior misses become immediate lost events so
         # downstream visuals do not show a ghost in the middle of the floor.
         self.hold_boundary_margin_uv = max(0.0, min(float(hold_boundary_margin_uv), 0.5))
+        # Reuse gids only after they are terminally lost. This keeps OSC
+        # address/key cardinality bounded by peak concurrent occupancy instead
+        # of total historical visitors.
+        self.reuse_lost_gids = bool(reuse_lost_gids)
 
         self._next_gid = 1
+        self._free_gids: list[int] = []
+        self._free_gid_set: set[int] = set()
+        self._spawned_total = 0
         self._persons: dict[int, Person] = {}
         self._source_to_gid: dict[tuple[str, int], int] = {}
         self._pending: dict[int, _Pending] = {}
@@ -379,6 +388,7 @@ class PersonTracker:
             person.state = "held"
             if not self._allows_held(person):
                 self._just_lost.append(LostPerson(person.projection_id, gid))
+                self._release_gid(gid)
                 self.lost_count += 1
                 continue
             self._pending[gid] = _Pending(person=person, lost_t=now)
@@ -443,6 +453,7 @@ class PersonTracker:
                 self._just_lost.append(
                     LostPerson(pending.person.projection_id, gid)
                 )
+                self._release_gid(gid)
             self.lost_count += 1
 
         active = list(self._persons.values())
@@ -451,7 +462,7 @@ class PersonTracker:
 
     @property
     def spawned_count(self) -> int:
-        return self._next_gid - 1
+        return self._spawned_total
 
     def _dedupe_events(self, events: list[PersonEvent]) -> list[PersonEvent]:
         """Keep one observation per camera-local source per frame.
@@ -553,8 +564,8 @@ class PersonTracker:
         ev: PersonEvent,
         now: float,
     ) -> int:
-        gid = self._next_gid
-        self._next_gid += 1
+        gid = self._claim_gid()
+        self._spawned_total += 1
         self._persons[gid] = Person(
             gid=gid,
             projection_id=ev.projection_id,
@@ -572,6 +583,23 @@ class PersonTracker:
         )
         self._source_to_gid[src] = gid
         return gid
+
+    def _claim_gid(self) -> int:
+        if self.reuse_lost_gids and self._free_gids:
+            gid = heapq.heappop(self._free_gids)
+            self._free_gid_set.discard(gid)
+            return gid
+        gid = self._next_gid
+        self._next_gid += 1
+        return gid
+
+    def _release_gid(self, gid: int) -> None:
+        if not self.reuse_lost_gids:
+            return
+        if gid in self._persons or gid in self._pending or gid in self._free_gid_set:
+            return
+        heapq.heappush(self._free_gids, gid)
+        self._free_gid_set.add(gid)
 
     def _update_person(self, gid: int, ev: PersonEvent, now: float) -> None:
         p = self._persons.get(gid)
@@ -715,6 +743,21 @@ if __name__ == "__main__":
     # (d) Drain is idempotent (second call returns empty).
     second = pt.drain_lost_gids()
     _check("(d) drain_lost_gids is idempotent", second == [])
+
+    # (d2) Once a gid is terminally lost, the next new person reuses the
+    # smallest free gid so OSC keys stay bounded by concurrent occupancy.
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 8, 0.4, 0.5, 0.9, t + 0.01)],
+        [],
+        t + 0.01,
+    )
+    _check(
+        "(d2) terminal lost gid is reused",
+        {p.gid for p in persons} == {1}
+        and pt._next_gid == 2
+        and pt.spawned_count == 2,
+        f"persons={[p.gid for p in persons]}, next_gid={pt._next_gid}, spawned={pt.spawned_count}",
+    )
 
     # (e) Cross-projection events do not stitch.
     pt = PersonTracker(hand_off_window_s=0.4, match_uv_radius=0.05)

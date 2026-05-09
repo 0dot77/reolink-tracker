@@ -104,6 +104,7 @@ struct RegionInfo {
     camera: String,
     id: String,
     projection_id: String,
+    image_points: Vec<Vec<f64>>,
     projection_uv: Vec<f64>,
     dispatch_uv: Vec<f64>,
     min_bbox_height_px: Option<f64>,
@@ -114,6 +115,14 @@ struct ProjectionSnapshot {
     projections: Vec<ProjectionInfo>,
     regions: Vec<RegionInfo>,
     camera_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CalibrationFrame {
+    camera: String,
+    path: String,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +136,21 @@ struct VideoTestRequest {
     video_path: String,
     camera_name: Option<String>,
     show_preview: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureCalibrationFrameRequest {
+    camera_name: Option<String>,
+    video_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveCalibrationPointsRequest {
+    camera_name: String,
+    region_id: Option<String>,
+    image_points: Vec<[f64; 2]>,
 }
 
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -402,6 +426,16 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
                             .and_then(|v| v.as_str())
                             .unwrap_or("projection")
                             .to_string(),
+                        image_points: region
+                            .get("image_points")
+                            .and_then(|v| v.as_sequence())
+                            .map(|points| {
+                                points
+                                    .iter()
+                                    .map(|point| yaml_number_vec(Some(point)))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         projection_uv: yaml_number_vec(region.get("projection_uv")),
                         dispatch_uv: yaml_number_vec(region.get("dispatch_uv")),
                         min_bbox_height_px: region
@@ -418,6 +452,210 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
         regions,
         camera_count,
     })
+}
+
+fn video_test_config_text(
+    config_text: &str,
+    video_path: &Path,
+    camera_name: Option<&str>,
+) -> Result<String, String> {
+    let mut config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
+        .map_err(|err| format!("YAML validation failed: {err}"))?;
+
+    let cameras = config_value
+        .get_mut("cameras")
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "config is missing cameras[]".to_string())?;
+    if cameras.is_empty() {
+        return Err("config cameras[] is empty".to_string());
+    }
+
+    let target_name = camera_name.unwrap_or("cam1");
+    let index = cameras
+        .iter()
+        .position(|camera| {
+            camera
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|name| name == target_name)
+                .unwrap_or(false)
+        })
+        .unwrap_or(0);
+
+    let camera = cameras[index]
+        .as_mapping_mut()
+        .ok_or_else(|| "target camera entry must be a YAML mapping".to_string())?;
+    camera.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String(target_name.to_string()),
+    );
+    camera.insert(
+        serde_yaml::Value::String("url".to_string()),
+        serde_yaml::Value::String(video_path.display().to_string()),
+    );
+
+    if !config_value
+        .get("osc")
+        .map(|value| value.is_mapping())
+        .unwrap_or(false)
+    {
+        if let Some(root) = config_value.as_mapping_mut() {
+            root.insert(
+                serde_yaml::Value::String("osc".to_string()),
+                serde_yaml::Value::Mapping(Default::default()),
+            );
+        }
+    }
+    let osc = config_value
+        .get_mut("osc")
+        .and_then(|value| value.as_mapping_mut())
+        .ok_or_else(|| "osc config must be a YAML mapping".to_string())?;
+    osc.insert(
+        serde_yaml::Value::String("td_minimal".to_string()),
+        serde_yaml::Value::Bool(true),
+    );
+    osc.insert(
+        serde_yaml::Value::String("raw_per_cam".to_string()),
+        serde_yaml::Value::Bool(false),
+    );
+    osc.insert(
+        serde_yaml::Value::String("zone_level".to_string()),
+        serde_yaml::Value::Bool(false),
+    );
+
+    serde_yaml::to_string(&config_value)
+        .map_err(|err| format!("failed to serialize video test config: {err}"))
+}
+
+fn first_projection_id(config_value: &serde_yaml::Value) -> String {
+    config_value
+        .get("projections")
+        .and_then(|value| value.as_sequence())
+        .and_then(|items| items.first())
+        .and_then(|projection| projection.get("id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("corridor")
+        .to_string()
+}
+
+fn camera_url_from_config(config_text: &str, camera_name: Option<&str>) -> Result<(String, String), String> {
+    let config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
+        .map_err(|err| format!("YAML validation failed: {err}"))?;
+    let cameras = config_value
+        .get("cameras")
+        .and_then(|value| value.as_sequence())
+        .ok_or_else(|| "config is missing cameras[]".to_string())?;
+    if cameras.is_empty() {
+        return Err("config cameras[] is empty".to_string());
+    }
+    let target_name = camera_name.unwrap_or("cam0");
+    let camera = cameras
+        .iter()
+        .find(|camera| {
+            camera
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|name| name == target_name)
+                .unwrap_or(false)
+        })
+        .unwrap_or(&cameras[0]);
+    let name = camera
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or(target_name)
+        .to_string();
+    let url = camera
+        .get("url")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("{name}.url is missing"))?;
+    Ok((name, url.to_string()))
+}
+
+fn calibration_config_text(
+    config_text: &str,
+    request: &SaveCalibrationPointsRequest,
+) -> Result<String, String> {
+    if request.image_points.len() != 4 {
+        return Err("image_points must contain exactly 4 points".to_string());
+    }
+    let mut config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
+        .map_err(|err| format!("YAML validation failed: {err}"))?;
+    let default_projection_id = first_projection_id(&config_value);
+    let cameras = config_value
+        .get_mut("cameras")
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "config is missing cameras[]".to_string())?;
+    let camera = cameras
+        .iter_mut()
+        .find(|camera| {
+            camera
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|name| name == request.camera_name)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("camera not found: {}", request.camera_name))?;
+    let camera_mapping = camera
+        .as_mapping_mut()
+        .ok_or_else(|| "target camera entry must be a YAML mapping".to_string())?;
+    let regions_key = serde_yaml::Value::String("regions".to_string());
+    if !camera_mapping.contains_key(&regions_key) {
+        camera_mapping.insert(regions_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+    let regions = camera_mapping
+        .get_mut(&regions_key)
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "camera regions must be a YAML sequence".to_string())?;
+    let target_region_id = request
+        .region_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or("app_calibration");
+    let index = regions
+        .iter()
+        .position(|region| {
+            region
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|id| id == target_region_id)
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| {
+            if regions.is_empty() {
+                let mut region = serde_yaml::Mapping::new();
+                region.insert(
+                    serde_yaml::Value::String("id".to_string()),
+                    serde_yaml::Value::String(target_region_id.to_string()),
+                );
+                region.insert(
+                    serde_yaml::Value::String("projection_id".to_string()),
+                    serde_yaml::Value::String(default_projection_id),
+                );
+                region.insert(
+                    serde_yaml::Value::String("projection_uv".to_string()),
+                    serde_yaml::to_value([0.0_f64, 0.0, 1.0, 1.0]).unwrap_or_default(),
+                );
+                region.insert(
+                    serde_yaml::Value::String("dispatch_uv".to_string()),
+                    serde_yaml::to_value([0.0_f64, 0.0, 1.0, 1.0]).unwrap_or_default(),
+                );
+                regions.push(serde_yaml::Value::Mapping(region));
+                regions.len() - 1
+            } else {
+                0
+            }
+        });
+    let region = regions[index]
+        .as_mapping_mut()
+        .ok_or_else(|| "target region entry must be a YAML mapping".to_string())?;
+    region.insert(
+        serde_yaml::Value::String("image_points".to_string()),
+        serde_yaml::to_value(&request.image_points)
+            .map_err(|err| format!("failed to serialize image points: {err}"))?,
+    );
+
+    serde_yaml::to_string(&config_value)
+        .map_err(|err| format!("failed to serialize calibration config: {err}"))
 }
 
 fn rtsp_host(url: &str) -> Option<String> {
@@ -650,6 +888,94 @@ cameras:
         assert_eq!(snapshot.regions[0].camera, "cam0");
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
     }
+
+    #[test]
+    fn video_test_config_retargets_one_camera_without_touching_saved_config() {
+        let config = r#"
+model: yolo26n.pt
+osc:
+  host: 127.0.0.1
+  port: 7000
+  raw_per_cam: true
+  zone_level: true
+cameras:
+  - name: cam0
+    url: rtsp://admin:%21pass@192.168.1.20:554/h264Preview_01_sub
+    regions: []
+  - name: cam1
+    url: rtsp://admin:%21pass@192.168.1.21:554/h264Preview_01_sub
+    regions: []
+"#;
+        let text = video_test_config_text(
+            config,
+            Path::new("/tmp/test-camera-1.mp4"),
+            Some("cam1"),
+        )
+        .expect("video test config should serialize");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let cameras = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .expect("cameras should remain a sequence");
+        assert_eq!(
+            cameras[0].get("url").and_then(|value| value.as_str()),
+            Some("rtsp://admin:%21pass@192.168.1.20:554/h264Preview_01_sub")
+        );
+        assert_eq!(
+            cameras[1].get("url").and_then(|value| value.as_str()),
+            Some("/tmp/test-camera-1.mp4")
+        );
+        let osc = parsed.get("osc").expect("osc should exist");
+        assert_eq!(
+            osc.get("td_minimal").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            osc.get("raw_per_cam").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            osc.get("zone_level").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn calibration_config_updates_existing_region_points() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam0
+    url: /tmp/test.mp4
+    regions:
+      - id: near
+        projection_id: corridor
+        image_points: [[0, 0], [1, 0], [1, 1], [0, 1]]
+        projection_uv: [0.0, 0.0, 0.5, 1.0]
+        dispatch_uv: [0.0, 0.0, 0.5, 1.0]
+"#;
+        let request = SaveCalibrationPointsRequest {
+            camera_name: "cam0".to_string(),
+            region_id: Some("near".to_string()),
+            image_points: vec![[10.0, 20.0], [30.0, 40.0], [50.0, 60.0], [70.0, 80.0]],
+        };
+        let text = calibration_config_text(config, &request).expect("calibration config should save");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let points = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .and_then(|cameras| cameras.first())
+            .and_then(|camera| camera.get("regions"))
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .and_then(|region| region.get("image_points"))
+            .and_then(|value| value.as_sequence())
+            .expect("image points should exist");
+        assert_eq!(points.len(), 4);
+        assert_eq!(yaml_number_vec(points.first()), vec![10.0, 20.0]);
+    }
 }
 
 #[tauri::command]
@@ -842,62 +1168,104 @@ fn start_video_test(
 
     let config_text = fs::read_to_string(config_path(&app)?)
         .map_err(|err| format!("failed to read runtime config: {err}"))?;
-    let mut config_value: serde_yaml::Value = serde_yaml::from_str(&config_text)
-        .map_err(|err| format!("YAML validation failed: {err}"))?;
-
-    let cameras = config_value
-        .get_mut("cameras")
-        .and_then(|value| value.as_sequence_mut())
-        .ok_or_else(|| "config is missing cameras[]".to_string())?;
-    if cameras.is_empty() {
-        return Err("config cameras[] is empty".to_string());
-    }
-
-    let target_name = request.camera_name.as_deref().unwrap_or("cam1");
-    let index = cameras
-        .iter()
-        .position(|camera| {
-            camera
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map(|name| name == target_name)
-                .unwrap_or(false)
-        })
-        .unwrap_or(0);
-
-    if let Some(camera) = cameras[index].as_mapping_mut() {
-        camera.insert(
-            serde_yaml::Value::String("name".to_string()),
-            serde_yaml::Value::String(target_name.to_string()),
-        );
-        camera.insert(
-            serde_yaml::Value::String("url".to_string()),
-            serde_yaml::Value::String(video_path.display().to_string()),
-        );
-    }
-
-    if let Some(osc) = config_value.get_mut("osc").and_then(|value| value.as_mapping_mut()) {
-        osc.insert(
-            serde_yaml::Value::String("td_minimal".to_string()),
-            serde_yaml::Value::Bool(true),
-        );
-        osc.insert(
-            serde_yaml::Value::String("raw_per_cam".to_string()),
-            serde_yaml::Value::Bool(false),
-        );
-        osc.insert(
-            serde_yaml::Value::String("zone_level".to_string()),
-            serde_yaml::Value::Bool(false),
-        );
-    }
 
     let test_config = runtime_dir(&app)?.join("video-test-config.yaml");
-    let test_config_text = serde_yaml::to_string(&config_value)
-        .map_err(|err| format!("failed to serialize video test config: {err}"))?;
+    let test_config_text =
+        video_test_config_text(&config_text, &video_path, request.camera_name.as_deref())?;
     fs::write(&test_config, test_config_text)
         .map_err(|err| format!("failed to write {}: {err}", test_config.display()))?;
 
     spawn_tracker_with_config(app, &state, test_config, request.show_preview)
+}
+
+#[tauri::command]
+fn capture_calibration_frame(
+    app: AppHandle,
+    request: CaptureCalibrationFrameRequest,
+) -> Result<CalibrationFrame, String> {
+    let config_text = fs::read_to_string(config_path(&app)?)
+        .map_err(|err| format!("failed to read runtime config: {err}"))?;
+    let (camera, config_url) = camera_url_from_config(&config_text, request.camera_name.as_deref())?;
+    let source = request
+        .video_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| local_path_from_input(value).display().to_string())
+        .unwrap_or(config_url);
+    if source.contains('<') || source.contains('>') {
+        return Err(format!("{camera}.url still contains placeholder values"));
+    }
+
+    let python = python_path(&app)?;
+    if !python.exists() {
+        return Err("Python runtime is not ready. Run setup first.".to_string());
+    }
+    let capture_dir = runtime_dir(&app)?.join("calibration");
+    fs::create_dir_all(&capture_dir)
+        .map_err(|err| format!("failed to create {}: {err}", capture_dir.display()))?;
+    let safe_camera = camera
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .collect::<String>();
+    let capture_ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("failed to read system time: {err}"))?
+        .as_millis();
+    let out_path = capture_dir.join(format!("{safe_camera}-{capture_ts_ms}.jpg"));
+    let script = r#"
+import cv2
+import sys
+
+source = sys.argv[1]
+out_path = sys.argv[2]
+cap = cv2.VideoCapture(source)
+ok, frame = cap.read()
+cap.release()
+if not ok or frame is None:
+    raise SystemExit("failed to read frame")
+height, width = frame.shape[:2]
+if not cv2.imwrite(out_path, frame):
+    raise SystemExit("failed to write frame")
+print(f"{width} {height}")
+"#;
+    let mut cmd = Command::new(&python);
+    cmd.arg("-c").arg(script).arg(&source).arg(&out_path);
+    let out = run_capture(cmd)?;
+    if !out.ok {
+        return Err(format!(
+            "failed to capture frame\nstdout:\n{}\nstderr:\n{}",
+            out.stdout, out.stderr
+        ));
+    }
+    let mut dims = out.stdout.split_whitespace();
+    let width = dims
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_default();
+    let height = dims
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_default();
+    Ok(CalibrationFrame {
+        camera,
+        path: out_path.display().to_string(),
+        width,
+        height,
+    })
+}
+
+#[tauri::command]
+fn save_calibration_points(
+    app: AppHandle,
+    request: SaveCalibrationPointsRequest,
+) -> Result<(), String> {
+    let config = config_path(&app)?;
+    let config_text = fs::read_to_string(&config)
+        .map_err(|err| format!("failed to read runtime config: {err}"))?;
+    let next_config = calibration_config_text(&config_text, &request)?;
+    fs::write(&config, next_config)
+        .map_err(|err| format!("failed to write {}: {err}", config.display()))
 }
 
 #[tauri::command]
@@ -1107,6 +1475,8 @@ pub fn run() {
             save_config,
             start_tracker,
             start_video_test,
+            capture_calibration_frame,
+            save_calibration_points,
             stop_tracker,
             tracker_status,
             collect_network_report,

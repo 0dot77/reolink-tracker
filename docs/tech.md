@@ -28,6 +28,7 @@
 - 같은 projection을 공유하는 카메라들의 `dispatch_uv` slice는 겹치지 않아야 합니다. 겹치면 count가 부풀 수 있습니다.
 - cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 중앙 hand-off나 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
 - `fusion.hold_boundary_margin_uv`가 0보다 크면 held gid는 projection 가장자리 근처에서만 active로 남습니다. 중앙에서 track을 놓친 경우에는 ghost actor가 남지 않도록 즉시 `/lost` 처리합니다.
+- `fusion.reuse_lost_gids` 기본값은 `true`입니다. 완전히 lost된 gid는 작은 번호부터 재사용해서 TouchDesigner OSC 채널/테이블이 총 방문자 수만큼 계속 커지지 않게 합니다.
 - `interaction_zones`는 projection별 UV rectangle입니다. fused person이 zone 안에 있으면 zone-local 좌표와 dwell/presence를 별도 OSC stream으로 내보내며, 카메라별 calibration `regions`와 섞지 않습니다.
 - `/person/<gid>/lost`는 gid가 마지막으로 속한 projection에만 송신합니다. cross-projection broadcast cleanup은 더 이상 하지 않습니다.
 - `tracker.py --show`는 operator preview이면서 검증 dashboard입니다. fused gid, trail, velocity, held 상태, 카메라 health를 함께 확인합니다.

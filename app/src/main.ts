@@ -1,4 +1,4 @@
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import "./style.css";
 
@@ -67,6 +67,7 @@ type RegionInfo = {
   camera: string;
   id: string;
   projection_id: string;
+  image_points: number[][];
   projection_uv: number[];
   dispatch_uv: number[];
   min_bbox_height_px: number | null;
@@ -91,6 +92,13 @@ type ProjectionRuntime = {
     state?: string;
     source?: string;
   }>;
+};
+
+type CalibrationFrame = {
+  camera: string;
+  path: string;
+  width: number;
+  height: number;
 };
 
 type SectionId =
@@ -131,6 +139,10 @@ const state: {
   fieldChecks: FieldCheckReport | null;
   projection: ProjectionSnapshot | null;
   videoPath: string;
+  calibrationCamera: string;
+  calibrationRegionId: string;
+  calibrationFrame: CalibrationFrame | null;
+  calibrationPoints: number[][];
   busy: string | null;
   error: string | null;
   saved: boolean;
@@ -145,6 +157,10 @@ const state: {
   fieldChecks: null,
   projection: null,
   videoPath: "/Users/taeyang/Desktop/VomReo01-01-211808-211942.mp4",
+  calibrationCamera: "cam0",
+  calibrationRegionId: "",
+  calibrationFrame: null,
+  calibrationPoints: [],
   busy: null,
   error: null,
   saved: true,
@@ -161,6 +177,20 @@ if (!app) {
 }
 
 const root = app;
+let deferredRender = false;
+
+function isConfigEditorActive(): boolean {
+  return state.section === "config" && document.activeElement?.id === "configEditor";
+}
+
+function requestRender(): void {
+  if (isConfigEditorActive()) {
+    deferredRender = true;
+    return;
+  }
+  deferredRender = false;
+  render();
+}
 
 function latestEvent(name: string): TrackerEvent | undefined {
   return [...state.events].reverse().find((event) => event.event === name);
@@ -249,7 +279,7 @@ function render(): void {
         <div class="nav-section">
           <div class="nav-label">Tools</div>
           ${navButton("calibration", "Calibration", "4pt")}
-          ${navButton("replay", "Replay", "future")}
+          ${navButton("replay", "Replay", "sidecar")}
           ${navButton("config", "Config", state.saved ? "saved" : "dirty")}
           ${navButton("logs", "Logs", String(state.logs.length))}
           ${navButton("setup", "Setup", setupReady ? "ready" : "todo")}
@@ -294,9 +324,41 @@ function render(): void {
     state.saved = false;
     root.querySelector<HTMLButtonElement>('button[data-action="save-config"]')?.removeAttribute("disabled");
   });
+  editor?.addEventListener("blur", () => {
+    if (deferredRender) {
+      window.setTimeout(requestRender, 0);
+    }
+  });
   const videoPath = root.querySelector<HTMLInputElement>("#videoPath");
   videoPath?.addEventListener("input", () => {
     state.videoPath = videoPath.value;
+  });
+  const calibrationCamera = root.querySelector<HTMLSelectElement>("#calibrationCamera");
+  calibrationCamera?.addEventListener("change", () => {
+    state.calibrationCamera = calibrationCamera.value;
+    state.calibrationRegionId = firstRegionIdForCamera(calibrationCamera.value);
+    state.calibrationFrame = null;
+    state.calibrationPoints = [];
+    render();
+  });
+  const calibrationRegion = root.querySelector<HTMLSelectElement>("#calibrationRegion");
+  calibrationRegion?.addEventListener("change", () => {
+    state.calibrationRegionId = calibrationRegion.value;
+    state.calibrationPoints = [];
+    render();
+  });
+  const calibrationFrame = root.querySelector<HTMLElement>("#calibrationFrame");
+  calibrationFrame?.addEventListener("click", (event) => {
+    if (!state.calibrationFrame) {
+      return;
+    }
+    const rect = calibrationFrame.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * state.calibrationFrame.width;
+    const y = ((event.clientY - rect.top) / rect.height) * state.calibrationFrame.height;
+    const next = state.calibrationPoints.length >= 4 ? [] : [...state.calibrationPoints];
+    next.push([Math.round(x), Math.round(y)]);
+    state.calibrationPoints = next;
+    render();
   });
 }
 
@@ -430,7 +492,7 @@ function projectionSection(): string {
       ${validationCard("projection config", projections.length ? `${projections.length}` : "none", projections.length ? "ok" : "warn", "read from config.yaml projections[]")}
       ${validationCard("calibrated regions", regions.length ? `${regions.length}` : "none", regions.length ? "ok" : "warn", "camera regions with projection_uv and dispatch_uv")}
       ${validationCard("interaction zones", zones.length ? `${zones.length}` : "none", zones.length ? "ok" : "warn", "read-only zone overlay from interaction_zones[]")}
-      ${validationCard("trails", "future", "warn", "5s trails require WebSocket frame state")}
+      ${validationCard("live actors", String(projectionRuntimeItems().reduce((count, projection) => count + projection.active.length, 0)), "ok", "latest fps_tick projection active ids")}
     </section>
     <section class="panel">
       <div class="panel-head"><h3>region config</h3><span class="sub">authoritative read-only config snapshot</span></div>
@@ -440,35 +502,60 @@ function projectionSection(): string {
 }
 
 function calibrationSection(): string {
+  const cameras = configuredCameraNames();
+  if (!cameras.includes(state.calibrationCamera)) {
+    state.calibrationCamera = cameras[0] ?? "cam0";
+  }
+  const regions = calibrationRegionsForCamera(state.calibrationCamera);
+  if (!state.calibrationRegionId) {
+    state.calibrationRegionId = regions[0]?.id ?? "app_calibration";
+  }
+  const selectedRegion = regions.find((region) => region.id === state.calibrationRegionId);
+  const points = state.calibrationPoints.length ? state.calibrationPoints : selectedRegion?.image_points ?? [];
+  const frame = state.calibrationFrame;
+  const frameSrc = frame && hasTauriRuntime ? convertFileSrc(frame.path) : "";
+  const frameStyle = frame
+    ? `aspect-ratio:${Math.max(1, frame.width)} / ${Math.max(1, frame.height)};min-height:0`
+    : "";
   return `
     <section class="calib-layout">
       <article class="panel">
         <div class="panel-head">
-          <h3>camera image · 4 point calibration</h3>
-          <span class="sub">projection order: tl -> tr -> br -> bl</span>
-          <div class="actions"><button class="btn" data-action="preview" ${buttonDisabled(!isSetupReady() || state.process.running)}>Open Preview</button></div>
+          <h3>4pt</h3>
+          <span class="sub">camera corners · tl/tr/br/bl</span>
+          <div class="actions">
+            <button class="btn" data-action="capture-calibration-frame" ${buttonDisabled(!isSetupReady())}>Capture</button>
+            <button class="btn" data-action="capture-video-calibration-frame" ${buttonDisabled(!isSetupReady())}>Use live video</button>
+          </div>
         </div>
-        <div class="calib-frame">
-          <div class="frame-grid"></div>
-          <span class="calib-point p1">1</span>
-          <span class="calib-point p2">2</span>
-          <span class="calib-point p3">3</span>
-          <span class="calib-point p4">4</span>
-          <div class="future-note">Interactive point editing remains in tracker --show until sidecar APIs exist.</div>
+        <div class="calib-toolbar">
+          <label>Camera ${selectHtml("calibrationCamera", cameras, state.calibrationCamera)}</label>
+          <label>Region ${selectHtml("calibrationRegion", regions.map((region) => region.id), state.calibrationRegionId || "app_calibration")}</label>
+          <button class="btn" data-action="clear-calibration-points" ${buttonDisabled(!points.length)}>Clear points</button>
+          <button class="btn primary" data-action="save-calibration-points" ${buttonDisabled(state.calibrationPoints.length !== 4)}>Save 4 points</button>
+        </div>
+        <div id="calibrationFrame" class="calib-frame ${frameSrc ? "has-image" : ""}" style="${frameStyle}">
+          ${frameSrc && frame ? `<img class="calib-image" src="${escapeAttr(frameSrc)}" alt="${escapeAttr(frame.camera)} calibration frame" draggable="false">` : `<div class="frame-grid"></div><div class="future-note">Capture a live camera frame, then click four projection corners in order.</div>`}
+          ${frame && points.length ? calibrationPointMarkers(points, frame).join("") : ""}
         </div>
       </article>
       <article class="panel">
-        <div class="panel-head"><h3>homography preview</h3><span class="sub">current Tauri-safe state</span></div>
+        <div class="panel-head"><h3>saved calibration</h3><span class="sub">runtime config.yaml snapshot</span></div>
         <div class="panel-body">
           <div class="checks">
             <span class="${isSetupReady() ? "ok" : "missing"}">runtime: ${isSetupReady() ? "ready" : "missing"}</span>
-            <span class="missing">preview api: future</span>
+            <span class="${points.length === 4 ? "ok" : "missing"}">image points: ${points.length}/4</span>
           </div>
           <div class="kv">
-            <div class="row"><span class="k">camera</span><span class="v">${escapeHtml(cameraNames()[0] ?? "cam0")}</span></div>
+            <div class="row"><span class="k">camera</span><span class="v">${escapeHtml(state.calibrationCamera)}</span></div>
+            <div class="row"><span class="k">region</span><span class="v">${escapeHtml(state.calibrationRegionId || "app_calibration")}</span></div>
+            <div class="row"><span class="k">points</span><span class="v">${escapeHtml(formatImagePoints(points))}</span></div>
+            <div class="row"><span class="k">projection uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.projection_uv ?? []))}</span></div>
+            <div class="row"><span class="k">dispatch uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.dispatch_uv ?? []))}</span></div>
             <div class="row"><span class="k">save path</span><span class="v">${escapeHtml(shortPath(state.runtime?.config_path))}</span></div>
-            <div class="row"><span class="k">current tool</span><span class="v">Show Preview</span></div>
+            <div class="row"><span class="k">frame</span><span class="v">${frame ? `${frame.width} x ${frame.height}` : "not captured"}</span></div>
           </div>
+          <p class="muted block-copy setup-copy">This saves camera image_points. Projection/dispatch UV slices are still edited from Config or Show Preview in this pass.</p>
         </div>
       </article>
     </section>
@@ -494,11 +581,11 @@ function oscSection(): string {
       </article>
     </section>
     <section class="panel">
-      <div class="panel-head"><h3>osc monitor roadmap</h3><span class="sub">requires sidecar ring buffer</span></div>
+      <div class="panel-head"><h3>osc monitor requirements</h3><span class="sub">kept outside tracker runtime</span></div>
       <div class="panel-body future-grid">
-        ${futureTile("client-side filters", "all / person / cam / zone / lost")}
-        ${futureTile("export", "download recent OSC log slices")}
-        ${futureTile("TD ack", "optional TouchDesigner reply handshake")}
+        ${statusTile("current stream", "active id list and packed projection x/y triples", "live")}
+        ${statusTile("log export", "requires sidecar ring buffer, not tracker process memory", "sidecar")}
+        ${statusTile("TD ack", "optional TouchDesigner reply handshake", "manual")}
       </div>
     </section>
   `;
@@ -544,7 +631,7 @@ function replaySection(): string {
     <section class="panel">
       <div class="panel-head">
         <h3>buffer replay</h3>
-        <span class="sub">future sidecar feature · current app is read-only shell</span>
+        <span class="sub">sidecar requirement map · current app is read-only</span>
         <div class="actions"><span class="pill warn">sidecar required</span></div>
       </div>
       <div class="timeline">
@@ -555,9 +642,9 @@ function replaySection(): string {
         <span class="playhead" style="left:55%"></span>
       </div>
       <div class="panel-body future-grid">
-        ${futureTile("frame ring", "5 fps downsampled frames, isolated from tracker")}
-        ${futureTile("OSC re-send", "replay selected time range to TouchDesigner")}
-        ${futureTile("clip export", "bounded zip export with auto-delete policy")}
+        ${statusTile("frame ring", "5 fps downsampled frames, isolated from tracker", "sidecar")}
+        ${statusTile("OSC re-send", "replay selected time range to TouchDesigner", "sidecar")}
+        ${statusTile("clip export", "bounded zip export with auto-delete policy", "sidecar")}
       </div>
     </section>
   `;
@@ -580,7 +667,7 @@ function mobileSection(): string {
         </div>
       </div>
       <article class="panel">
-        <div class="panel-head"><h3>mobile health endpoint</h3><span class="sub">future GET /api/health contract</span></div>
+        <div class="panel-head"><h3>mobile health mirror</h3><span class="sub">desktop state, read-only</span></div>
         <div class="panel-body">
           <p class="muted block-copy">This preview mirrors the current desktop state. Real phone polling should live in the sidecar so tracker latency is untouched.</p>
           ${pathPanel(state.runtime)}
@@ -771,9 +858,10 @@ function addressRate(address: string, rate: number, label: string): string {
   </div>`;
 }
 
-function futureTile(title: string, body: string): string {
+function statusTile(title: string, body: string, status: string): string {
+  const tone = status === "live" ? "ok" : status === "manual" ? "warn" : "";
   return `<div class="future-tile">
-    <span class="pill warn">future</span>
+    <span class="pill ${tone}">${escapeHtml(status)}</span>
     <b>${escapeHtml(title)}</b>
     <p>${escapeHtml(body)}</p>
   </div>`;
@@ -826,6 +914,47 @@ function trafficTile(title: string, tone: "ok" | "warn", value: string): string 
     <span>${escapeHtml(title)}</span>
     <b>${escapeHtml(value)}</b>
   </div>`;
+}
+
+function configuredCameraNames(): string[] {
+  const fromRegions = [...new Set((state.projection?.regions ?? []).map((region) => region.camera))].filter(Boolean);
+  const fromConfig = cameraNames();
+  const names = [...new Set([...fromRegions, ...fromConfig])].filter(Boolean);
+  return names.length ? names : ["cam0"];
+}
+
+function calibrationRegionsForCamera(camera: string): RegionInfo[] {
+  return (state.projection?.regions ?? []).filter((region) => region.camera === camera);
+}
+
+function firstRegionIdForCamera(camera: string): string {
+  return calibrationRegionsForCamera(camera)[0]?.id ?? "app_calibration";
+}
+
+function selectHtml(id: string, options: string[], selected: string): string {
+  const normalized = options.length ? options : [selected || "app_calibration"];
+  const withSelected = normalized.includes(selected) ? normalized : [selected, ...normalized].filter(Boolean);
+  return `<select id="${escapeAttr(id)}">${withSelected
+    .map((option) => `<option value="${escapeAttr(option)}" ${option === selected ? "selected" : ""}>${escapeHtml(option)}</option>`)
+    .join("")}</select>`;
+}
+
+function calibrationPointMarkers(points: number[][], frame: CalibrationFrame): string[] {
+  return points.slice(0, 4).map((point, index) => {
+    const left = clamp01(Number(point[0]) / Math.max(1, frame.width)) * 100;
+    const top = clamp01(Number(point[1]) / Math.max(1, frame.height)) * 100;
+    return `<span class="calib-point" style="left:${left}%;top:${top}%">${index + 1}</span>`;
+  });
+}
+
+function formatImagePoints(points: number[][]): string {
+  if (!points.length) {
+    return "-";
+  }
+  return points
+    .slice(0, 4)
+    .map((point) => `[${Math.round(Number(point[0]) || 0)}, ${Math.round(Number(point[1]) || 0)}]`)
+    .join(" ");
 }
 
 function cameraNames(): string[] {
@@ -906,7 +1035,10 @@ function setupSection(): string {
           <span class="sub">copy engine, prepare venv, warm model</span>
           <div class="actions"><button class="btn primary" data-action="prepare" ${buttonDisabled()}>Run setup</button></div>
         </div>
-        <div class="panel-body">${runtimePanel(state.runtime)}</div>
+        <div class="panel-body">
+          ${runtimePanel(state.runtime)}
+          <p class="muted block-copy setup-copy">Setup refreshes tracker.py, fusion.py, region.py, viewer.py, requirements.txt, and config.example.yaml from this repo. Existing runtime config.yaml is preserved.</p>
+        </div>
       </article>
       <article class="panel">
         <div class="panel-head"><h3>paths</h3><span class="sub">launcher-owned files</span></div>
@@ -943,6 +1075,17 @@ async function mockInvoke<T>(command: string): Promise<T> {
   }
   if (command === "start_video_test") {
     return { running: true, exit_code: null } as T;
+  }
+  if (command === "capture_calibration_frame") {
+    return {
+      camera: "cam0",
+      path: "",
+      width: 1280,
+      height: 720,
+    } as T;
+  }
+  if (command === "save_calibration_points") {
+    return undefined as T;
   }
   if (command === "read_config") {
     return `model: yolo26n.pt
@@ -1198,6 +1341,27 @@ async function handleAction(action: string): Promise<void> {
           showPreview: action === "preview-video-test",
         },
       });
+    } else if (action === "capture-calibration-frame" || action === "capture-video-calibration-frame") {
+      state.calibrationFrame = await invoke<CalibrationFrame>("capture_calibration_frame", {
+        request: {
+          cameraName: state.calibrationCamera,
+        },
+      });
+      state.calibrationCamera = state.calibrationFrame.camera;
+      state.calibrationPoints = [];
+    } else if (action === "save-calibration-points") {
+      await invoke("save_calibration_points", {
+        request: {
+          cameraName: state.calibrationCamera,
+          regionId: state.calibrationRegionId || "app_calibration",
+          imagePoints: state.calibrationPoints,
+        },
+      });
+      state.saved = true;
+      await refreshConfig();
+      await refreshProjection();
+    } else if (action === "clear-calibration-points") {
+      state.calibrationPoints = [];
     } else if (action === "stop") {
       state.process = await invoke<ProcessStatus>("stop_tracker");
     } else if (action === "network") {
@@ -1268,6 +1432,10 @@ function escapeHtml(value: string): string {
   });
 }
 
+function escapeAttr(value: string): string {
+  return escapeHtml(value).replace(/`/g, "&#096;");
+}
+
 function formatNumber(value: unknown): string {
   const number = Number(value);
   return Number.isFinite(number) ? number.toFixed(1) : "-";
@@ -1318,7 +1486,7 @@ if (hasTauriRuntime) {
     if (state.logs.length > 500) {
       state.logs.splice(0, state.logs.length - 500);
     }
-    render();
+    requestRender();
   });
 
   void tauriListen<TrackerEvent>("tracker-status", (event) => {
@@ -1326,7 +1494,7 @@ if (hasTauriRuntime) {
     if (state.events.length > 200) {
       state.events.splice(0, state.events.length - 200);
     }
-    render();
+    requestRender();
   });
 } else {
   state.logs.push({
@@ -1345,7 +1513,7 @@ setInterval(() => {
   void invoke<ProcessStatus>("tracker_status")
     .then((status) => {
       state.process = status;
-      render();
+      requestRender();
     })
     .catch(() => undefined);
 }, 2500);
