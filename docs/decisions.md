@@ -33,3 +33,13 @@ macOS app data runtime으로 복사해 실행합니다.
 
 결과: 앱 소스와 tracker engine 변경을 같은 PR/diff에서 검토할 수 있습니다. 실제 `config.yaml`은 저장소가 아니라
 앱 data runtime에 유지하므로 RTSP credential과 현장 private IP는 여전히 git에 들어가지 않습니다.
+
+## 2026-05-09: 계단 착석자는 별도 relaxed presence polygon으로 잡는다
+
+계단/착석자는 bbox가 세로형 사람 형태로 잡히지 않을 수 있지만, 계단은 바닥 projection
+평면과 다르므로 UV homography 기준점에 섞으면 좌표가 왜곡됩니다.
+
+결정: 기존 `image_points`는 바닥/projection UV 변환용 4점으로 유지하고, 같은 region에
+`relaxed_presence_points`를 추가해 그 polygon 안에서만 confidence/bbox 비율 기준을 완화합니다.
+OSC schema는 유지하고, 위치는 기존 homography에서 나온 `u`를 우선 쓰며 `v`만 projection
+범위 안으로 clamp합니다.

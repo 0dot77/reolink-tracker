@@ -915,6 +915,26 @@ textarea:focus {
   padding: 8px;
 }
 
+.dispatch.has-relaxed {
+  outline: 1px solid rgba(255, 71, 87, 0.55);
+  outline-offset: -3px;
+}
+
+.dispatch em {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  border: 1px solid rgba(255, 71, 87, 0.38);
+  border-radius: 3px;
+  background: rgba(255, 71, 87, 0.12);
+  color: var(--red);
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  padding: 2px 5px;
+  text-transform: uppercase;
+}
+
 .empty-projection {
   position: absolute;
   inset: 50% auto auto 50%;
@@ -1044,6 +1064,83 @@ textarea:focus {
   user-select: none;
 }
 
+.calib-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.calib-overlay polygon {
+  fill: transparent;
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.calib-overlay .floor-poly {
+  fill: rgba(255, 138, 61, 0.08);
+  stroke: var(--amber);
+}
+
+.calib-overlay polygon {
+  transition: opacity 120ms ease, stroke-width 120ms ease;
+}
+
+.calib-overlay polygon.active {
+  opacity: 1;
+  stroke-width: 4px;
+}
+
+.calib-overlay polygon.dim {
+  opacity: 0.22;
+  stroke-width: 1px;
+}
+
+.calib-overlay .body-poly {
+  fill: rgba(255, 80, 220, 0.06);
+  stroke: #ff50dc;
+  stroke-dasharray: 8 7;
+}
+
+.calib-overlay .relaxed-poly {
+  fill: rgba(255, 71, 87, 0.12);
+  stroke: var(--red);
+}
+
+.calib-legend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  pointer-events: none;
+}
+
+.calib-legend span {
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: rgba(8, 9, 11, 0.76);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  padding: 4px 7px;
+  text-transform: uppercase;
+}
+
+.calib-legend .floor {
+  color: var(--amber);
+}
+
+.calib-legend .body {
+  color: #ff50dc;
+}
+
+.calib-legend .relaxed {
+  color: var(--red);
+}
+
 .calib-toolbar {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1051,6 +1148,62 @@ textarea:focus {
   align-items: end;
   border-top: 1px solid var(--line);
   padding: 12px 14px;
+}
+
+.tool-switch {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.tool-switch .btn.active {
+  border-color: var(--amber);
+  background: rgba(255, 138, 61, 0.14);
+  color: var(--amber);
+}
+
+.tool-switch .btn.active.stair {
+  border-color: rgba(255, 71, 87, 0.55);
+  background: rgba(255, 71, 87, 0.14);
+  color: var(--red);
+}
+
+.tool-switch .btn.active.body {
+  border-color: rgba(255, 80, 220, 0.55);
+  background: rgba(255, 80, 220, 0.14);
+  color: #ff8ee8;
+}
+
+.mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.mapping-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.mapping-grid input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgba(12, 14, 18, 0.92);
+  color: var(--ink);
+  font: 12px var(--mono);
+  padding: 9px 10px;
+}
+
+.mapping-grid .btn {
+  align-self: end;
 }
 
 .calib-toolbar .btn {
@@ -1091,6 +1244,18 @@ textarea:focus {
   font-size: 11px;
   box-shadow: 0 0 12px rgba(255, 138, 61, 0.3);
   transform: translate(-50%, -50%);
+}
+
+.calib-point.stair {
+  border-color: var(--red);
+  background: rgba(255, 71, 87, 0.28);
+  box-shadow: 0 0 12px rgba(255, 71, 87, 0.36);
+}
+
+.calib-point.body {
+  border-color: #ff50dc;
+  background: rgba(255, 80, 220, 0.24);
+  box-shadow: 0 0 12px rgba(255, 80, 220, 0.34);
 }
 
 .calib-point.p1 {

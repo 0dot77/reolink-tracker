@@ -64,6 +64,7 @@ from region import (
     InteractionZone,
     Projection,
     Region,
+    bbox_intersects_polygon,
     build_homography,
     dispatches_overlap,
     is_inside_uv,
@@ -72,10 +73,61 @@ from region import (
 )
 
 PERSON_CLASS_ID = 0  # COCO
+TAURI_APP_IDENTIFIER = "com.taeyang.reolink-tracker"
 
 
 class ConfigError(ValueError):
     """Raised when config.yaml is structurally valid YAML but not runnable."""
+
+
+def repo_default_config_path() -> Path:
+    return Path(__file__).resolve().parent / "config.yaml"
+
+
+def tauri_app_config_path() -> Path:
+    return (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / TAURI_APP_IDENTIFIER
+        / "runtime"
+        / "config.yaml"
+    )
+
+
+def resolve_config_path(path: str | Path | None = None) -> Path:
+    """Resolve the runtime config, preferring the Tauri app's saved config.
+
+    The field app writes calibration edits to macOS app data, while older CLI
+    workflows default to the repo-local config.yaml. Treat the app runtime config
+    as authoritative whenever the caller asks for the default config. Explicit
+    non-default config paths are still honored for isolated tests.
+    """
+    env_path = os.environ.get("REOLINK_TRACKER_CONFIG")
+    if env_path:
+        return Path(env_path).expanduser()
+
+    default_path = repo_default_config_path()
+    requested = Path(path).expanduser() if path else default_path
+    requested_default_name = (
+        path is not None
+        and not requested.is_absolute()
+        and requested.name == "config.yaml"
+        and requested.parent in {Path("."), Path("")}
+    )
+    app_path = tauri_app_config_path()
+    if not app_path.exists():
+        return requested
+
+    try:
+        requested_resolved = requested.resolve(strict=False)
+        default_resolved = default_path.resolve(strict=False)
+    except OSError:
+        return requested
+
+    if requested_resolved == default_resolved or requested_default_name:
+        return app_path
+    return requested
 
 
 def _redact_url(url: str) -> str:
@@ -108,6 +160,52 @@ def _network_target_from_osc(osc_cfg: dict) -> Optional[tuple[str, str, int, str
     return ("OSC receiver", host, int(osc_cfg.get("port", 7000)), "osc")
 
 
+def _is_inside_expanded_uv(
+    uv: tuple[float, float],
+    rect: tuple[float, float, float, float],
+    margin: float,
+) -> bool:
+    u, v = uv
+    u0, v0, u1, v1 = rect
+    lo_u, hi_u = sorted((u0, u1))
+    lo_v, hi_v = sorted((v0, v1))
+    m = max(float(margin), 0.0)
+    return lo_u - m <= u <= hi_u + m and lo_v - m <= v <= hi_v + m
+
+
+def _clamp_uv_to_rect(
+    uv: tuple[float, float],
+    rect: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    u, v = uv
+    u0, v0, u1, v1 = rect
+    lo_u, hi_u = sorted((u0, u1))
+    lo_v, hi_v = sorted((v0, v1))
+    return (min(max(u, lo_u), hi_u), min(max(v, lo_v), hi_v))
+
+
+def _clamp_v_to_rect(
+    uv: tuple[float, float],
+    rect: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    u, v = uv
+    _u0, v0, _u1, v1 = rect
+    lo_v, hi_v = sorted((v0, v1))
+    return (u, min(max(v, lo_v), hi_v))
+
+
+def _is_inside_expanded_u(
+    uv: tuple[float, float],
+    rect: tuple[float, float, float, float],
+    margin: float = 0.0,
+) -> bool:
+    u, _v = uv
+    u0, _v0, u1, _v1 = rect
+    lo_u, hi_u = sorted((u0, u1))
+    m = max(float(margin), 0.0)
+    return lo_u - m <= u <= hi_u + m
+
+
 @dataclass
 class CamCfg:
     name: str
@@ -130,6 +228,12 @@ class DetectionFilterCfg:
     projection_inner_margin_uv: float = 0.0
     confirm_hits: int = 3
     confirm_window_s: float = 0.8
+    relaxed_min_confidence: float = 0.12
+    relaxed_min_bbox_height_px: float = 24.0
+    relaxed_min_bbox_area_px: float = 500.0
+    relaxed_min_aspect_h_over_w: float = 0.45
+    relaxed_max_aspect_h_over_w: float = 6.5
+    relaxed_max_width_over_height: float = 2.4
 
 
 @dataclass
@@ -264,8 +368,6 @@ class CamWorker:
         bw = x2 - x1
         bh = y2 - y1
         area = bw * bh
-        if conf < cfg.min_confidence:
-            return False, "low-conf"
         if bh < cfg.min_bbox_height_px or area < cfg.min_bbox_area_px:
             return False, "too-small"
         if bw <= 1.0:
@@ -277,7 +379,33 @@ class CamWorker:
             return False, "too-tall"
         if (bw / bh) > cfg.max_width_over_height:
             return False, "too-wide"
+        if conf < cfg.min_confidence:
+            return False, "low-conf"
         return True, "accepted"
+
+    def _classify_relaxed_presence(self, box: np.ndarray, conf: float) -> bool:
+        cfg = self.detection_filter
+        if not cfg.enabled:
+            return True
+        x1, y1, x2, y2 = (float(v) for v in box)
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 1.0 or bh <= 1.0:
+            return False
+        if conf < cfg.relaxed_min_confidence:
+            return False
+        if bh < cfg.relaxed_min_bbox_height_px:
+            return False
+        if bw * bh < cfg.relaxed_min_bbox_area_px:
+            return False
+        aspect_h_over_w = bh / bw
+        if aspect_h_over_w < cfg.relaxed_min_aspect_h_over_w:
+            return False
+        if aspect_h_over_w > cfg.relaxed_max_aspect_h_over_w:
+            return False
+        if (bw / bh) > cfg.relaxed_max_width_over_height:
+            return False
+        return True
 
     def _passes_projection_margin(
         self,
@@ -326,6 +454,46 @@ class CamWorker:
         for tid in stale:
             self._pending_detections.pop(tid, None)
 
+    def _body_catch_accepts(
+        self,
+        reg: Region,
+        box: np.ndarray,
+        uv: tuple[float, float],
+        conf: float,
+        accepted: bool,
+        reason: str,
+    ) -> bool:
+        if not reg.body_catch_points:
+            return False
+        if not accepted:
+            if reason != "low-conf":
+                return False
+            if reg.body_catch_min_confidence <= 0.0 or conf < reg.body_catch_min_confidence:
+                return False
+        if not bbox_intersects_polygon(tuple(float(v) for v in box), reg.body_catch_points):
+            return False
+        return _is_inside_expanded_uv(uv, reg.projection_uv, reg.body_catch_margin_uv)
+
+    def _relaxed_presence_accepts(
+        self,
+        reg: Region,
+        box: np.ndarray,
+        uv: tuple[float, float],
+        conf: float,
+    ) -> bool:
+        if not reg.relaxed_presence_points:
+            return False
+        if not self._classify_relaxed_presence(box, conf):
+            return False
+        if reg.relaxed_presence_min_confidence > 0.0 and conf < reg.relaxed_presence_min_confidence:
+            return False
+        if not bbox_intersects_polygon(
+            tuple(float(v) for v in box),
+            reg.relaxed_presence_points,
+        ):
+            return False
+        return _is_inside_expanded_u(uv, reg.projection_uv, reg.relaxed_presence_margin_uv)
+
     def step(
         self,
         frame: np.ndarray,
@@ -371,6 +539,9 @@ class CamWorker:
         legacy_active: list[int] = []
         person_events: list[PersonEvent] = []
         projection_tids: set[int] = set()
+        has_relaxed_regions = any(
+            reg.relaxed_presence_points for reg in self.cam.regions
+        )
 
         if r.boxes is not None and r.boxes.id is not None:
             ids = r.boxes.id.cpu().numpy().astype(int)
@@ -379,7 +550,7 @@ class CamWorker:
 
             for tid, box, c in zip(ids, xyxy, confs):
                 accepted, _reason = self._classify_detection(box, float(c))
-                if not accepted:
+                if not accepted and _reason != "low-conf" and not has_relaxed_regions:
                     continue
                 if not self._is_confirmed_detection(int(tid), now):
                     continue
@@ -393,16 +564,52 @@ class CamWorker:
                 for reg in self.cam.regions:
                     if reg.H is None:
                         continue
-                    if reg.min_bbox_height_px and bbox_h < reg.min_bbox_height_px:
-                        # too small — drop entirely (no hit, no dispatch)
-                        continue
                     u, v = project((foot_x, foot_y), reg.H)
-                    if not is_inside_uv((u, v), reg.projection_uv):
+                    relaxed = self._relaxed_presence_accepts(
+                        reg,
+                        box,
+                        (u, v),
+                        float(c),
+                    )
+                    caught = self._body_catch_accepts(
+                        reg,
+                        box,
+                        (u, v),
+                        float(c),
+                        accepted,
+                        _reason,
+                    )
+                    if (
+                        reg.min_bbox_height_px
+                        and bbox_h < reg.min_bbox_height_px
+                        and not relaxed
+                    ):
+                        # too small for the normal floor path.
                         continue
-                    if not self._passes_projection_margin((u, v), reg.projection_uv):
+                    inside_projection = is_inside_uv((u, v), reg.projection_uv)
+                    if not inside_projection and not caught and not relaxed:
+                        continue
+                    if not inside_projection and caught:
+                        u, v = _clamp_uv_to_rect((u, v), reg.projection_uv)
+                    elif relaxed:
+                        if reg.relaxed_presence_v is not None:
+                            v = reg.relaxed_presence_v
+                        else:
+                            u, v = _clamp_v_to_rect((u, v), reg.projection_uv)
+                    if (
+                        not caught
+                        and not relaxed
+                        and not self._passes_projection_margin((u, v), reg.projection_uv)
+                    ):
+                        continue
+                    if not accepted and not caught and not relaxed:
                         continue
                     in_projection = True
-                    in_dispatch = is_inside_uv((u, v), reg.dispatch_uv)
+                    in_dispatch = (
+                        _is_inside_expanded_u((u, v), reg.dispatch_uv)
+                        if relaxed
+                        else is_inside_uv((u, v), reg.dispatch_uv)
+                    )
                     region_hits.append((reg.id, u, v, in_dispatch))
                     person_events.append(PersonEvent(
                         projection_id=reg.projection_id,
@@ -413,6 +620,7 @@ class CamWorker:
                         conf=float(c),
                         t=now,
                         dispatching=in_dispatch,
+                        relaxed=relaxed,
                     ))
                     if in_dispatch:
                         if self.raw_per_cam:
@@ -536,6 +744,37 @@ def _require_uv_rect(value: object, label: str) -> tuple[float, float, float, fl
         return tuple(float(v) for v in rect)
     except (TypeError, ValueError) as ex:
         raise ConfigError(f"{label} must contain numeric values") from ex
+
+
+def _optional_points(value: object, label: str) -> list[tuple[float, float]]:
+    if value is None:
+        return []
+    points = _require_sequence(value, label)
+    if len(points) < 3:
+        raise ConfigError(f"{label} must contain at least 3 points")
+    out: list[tuple[float, float]] = []
+    for idx, point in enumerate(points):
+        if not isinstance(point, list) or len(point) != 2:
+            raise ConfigError(f"{label}[{idx}] must be [x, y]")
+        try:
+            out.append((float(point[0]), float(point[1])))
+        except (TypeError, ValueError) as ex:
+            raise ConfigError(f"{label}[{idx}] must contain numeric values") from ex
+    return out
+
+
+def _optional_alias_points(
+    entry: dict,
+    primary: str,
+    alias: str,
+    label: str,
+) -> list[tuple[float, float]]:
+    if primary in entry and alias in entry:
+        raise ConfigError(
+            f"{label} cannot define both {primary!r} and {alias!r}; use {primary!r}"
+        )
+    key = primary if primary in entry else alias
+    return _optional_points(entry.get(key), f"{label}.{key}")
 
 
 def _require_field(entry: dict, key: str, label: str) -> object:
@@ -669,6 +908,44 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
         else:
             disp_uv = proj_uv
         image_points = _require_sequence(r["image_points"], f"{label} {rid}.image_points")
+        body_catch_points = _optional_points(
+            r.get("body_catch_points"),
+            f"{label} {rid}.body_catch_points",
+        )
+        relaxed_presence_points = _optional_alias_points(
+            r,
+            "relaxed_presence_points",
+            "stair_catch_points",
+            f"{label} {rid}",
+        )
+        try:
+            body_catch_margin_uv = max(float(r.get("body_catch_margin_uv", 0.0)), 0.0)
+            body_catch_min_confidence = max(
+                float(r.get("body_catch_min_confidence", 0.0)),
+                0.0,
+            )
+            relaxed_presence_margin_uv = max(
+                float(r.get("relaxed_presence_margin_uv", 0.0)),
+                0.0,
+            )
+            relaxed_presence_min_confidence = max(
+                float(
+                    r.get(
+                        "relaxed_presence_min_confidence",
+                        r.get("stair_catch_min_confidence", 0.0),
+                    )
+                ),
+                0.0,
+            )
+            relaxed_presence_v = (
+                None
+                if r.get("relaxed_presence_v") in (None, "")
+                else min(max(float(r.get("relaxed_presence_v")), 0.0), 1.0)
+            )
+        except (TypeError, ValueError) as ex:
+            raise ConfigError(
+                f"{label} {rid} catch margins/confidence values must be numeric"
+            ) from ex
         try:
             validate_dispatch(proj_uv, disp_uv)
             H = build_homography([tuple(p) for p in image_points], proj_uv)
@@ -682,6 +959,13 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
                 projection_uv=proj_uv,
                 dispatch_uv=disp_uv,
                 min_bbox_height_px=int(r.get("min_bbox_height_px", 0)),
+                body_catch_points=body_catch_points,
+                body_catch_margin_uv=body_catch_margin_uv,
+                body_catch_min_confidence=body_catch_min_confidence,
+                relaxed_presence_points=relaxed_presence_points,
+                relaxed_presence_margin_uv=relaxed_presence_margin_uv,
+                relaxed_presence_min_confidence=relaxed_presence_min_confidence,
+                relaxed_presence_v=relaxed_presence_v,
                 H=H,
             )
         )
@@ -733,6 +1017,18 @@ def _parse_detection_filter(cfg: dict) -> DetectionFilterCfg:
         projection_inner_margin_uv=float(raw.get("projection_inner_margin_uv", 0.0)),
         confirm_hits=max(int(raw.get("confirm_hits", 3)), 1),
         confirm_window_s=max(float(raw.get("confirm_window_s", 0.8)), 0.0),
+        relaxed_min_confidence=float(raw.get("relaxed_min_confidence", 0.12)),
+        relaxed_min_bbox_height_px=float(raw.get("relaxed_min_bbox_height_px", 24.0)),
+        relaxed_min_bbox_area_px=float(raw.get("relaxed_min_bbox_area_px", 500.0)),
+        relaxed_min_aspect_h_over_w=float(
+            raw.get("relaxed_min_aspect_h_over_w", 0.45)
+        ),
+        relaxed_max_aspect_h_over_w=float(
+            raw.get("relaxed_max_aspect_h_over_w", 6.5)
+        ),
+        relaxed_max_width_over_height=float(
+            raw.get("relaxed_max_width_over_height", 2.4)
+        ),
     )
 
 
@@ -778,6 +1074,22 @@ def _region_to_cfg(region: Region) -> dict:
     }
     if region.min_bbox_height_px:
         out["min_bbox_height_px"] = int(region.min_bbox_height_px)
+    if region.body_catch_points:
+        out["body_catch_points"] = [[round(float(x), 1), round(float(y), 1)]
+                                    for x, y in region.body_catch_points]
+        out["body_catch_margin_uv"] = float(region.body_catch_margin_uv)
+        out["body_catch_min_confidence"] = float(region.body_catch_min_confidence)
+    if region.relaxed_presence_points:
+        out["relaxed_presence_points"] = [
+            [round(float(x), 1), round(float(y), 1)]
+            for x, y in region.relaxed_presence_points
+        ]
+        out["relaxed_presence_margin_uv"] = float(region.relaxed_presence_margin_uv)
+        out["relaxed_presence_min_confidence"] = float(
+            region.relaxed_presence_min_confidence
+        )
+        if region.relaxed_presence_v is not None:
+            out["relaxed_presence_v"] = float(region.relaxed_presence_v)
     return out
 
 
@@ -899,13 +1211,21 @@ def _emit_zone_osc(osc: SimpleUDPClient, update: ZoneUpdate) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
+    ap.add_argument(
+        "--config",
+        default=str(repo_default_config_path()),
+        help=(
+            "config path; the Tauri app runtime config is preferred when this "
+            "points at the repo-local default"
+        ),
+    )
     ap.add_argument("--show", action="store_true", help="open the operator viewer")
     ap.add_argument("--model", default=None, help="override model path")
     ap.add_argument("--device", default=None, help="override device (mps|cpu|cuda)")
     args = ap.parse_args()
 
-    config_path = Path(args.config)
+    requested_config_path = Path(args.config).expanduser()
+    config_path = resolve_config_path(requested_config_path)
     try:
         cfg = load_cfg(config_path)
         projections = _parse_projections(cfg)
@@ -915,6 +1235,9 @@ def main() -> int:
     except (OSError, yaml.YAMLError, ConfigError) as ex:
         print(f"config error: {ex}", file=sys.stderr)
         return 2
+
+    if config_path.resolve(strict=False) != requested_config_path.resolve(strict=False):
+        print(f"config: using Tauri app runtime config {config_path}")
 
     osc_cfg = cfg.get("osc", {}) or {}
     osc = SimpleUDPClient(osc_cfg.get("host", "127.0.0.1"), int(osc_cfg.get("port", 7000)))
@@ -945,6 +1268,7 @@ def main() -> int:
             position_alpha=float(fusion_cfg.get("position_alpha", 0.45)),
             hold_boundary_margin_uv=float(fusion_cfg.get("hold_boundary_margin_uv", 0.08)),
             max_update_jump_uv=float(fusion_cfg.get("max_update_jump_uv", 0.0)),
+            relaxed_hold_s=float(fusion_cfg.get("relaxed_hold_s", 3.0)),
             reuse_lost_gids=bool(fusion_cfg.get("reuse_lost_gids", True)),
         )
         zone_tracker = InteractionZoneTracker()
@@ -955,6 +1279,7 @@ def main() -> int:
             f"position_alpha={person_tracker.position_alpha} "
             f"hold_boundary_margin_uv={person_tracker.hold_boundary_margin_uv} "
             f"max_update_jump_uv={person_tracker.max_update_jump_uv} "
+            f"relaxed_hold_s={person_tracker.relaxed_hold_s} "
             f"reuse_lost_gids={person_tracker.reuse_lost_gids} "
             f"miss_buffer_frames={miss_buffer_frames}"
         )
@@ -979,6 +1304,8 @@ def main() -> int:
         f"min_bbox_height_px={detection_filter.min_bbox_height_px} "
         f"min_bbox_area_px={detection_filter.min_bbox_area_px} "
         f"aspect={detection_filter.min_aspect_h_over_w}..{detection_filter.max_aspect_h_over_w} "
+        f"relaxed_conf={detection_filter.relaxed_min_confidence} "
+        f"relaxed_aspect={detection_filter.relaxed_min_aspect_h_over_w}..{detection_filter.relaxed_max_aspect_h_over_w} "
         f"confirm_hits={detection_filter.confirm_hits}/{detection_filter.confirm_window_s:.1f}s"
     )
 

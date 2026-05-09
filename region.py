@@ -44,6 +44,13 @@ class Region:
     projection_uv: tuple[float, float, float, float]   # (u0, v0, u1, v1)
     dispatch_uv: tuple[float, float, float, float]     # subset of projection_uv
     min_bbox_height_px: int = 0
+    body_catch_points: list[tuple[float, float]] = field(default_factory=list)
+    body_catch_margin_uv: float = 0.0
+    body_catch_min_confidence: float = 0.0
+    relaxed_presence_points: list[tuple[float, float]] = field(default_factory=list)
+    relaxed_presence_margin_uv: float = 0.0
+    relaxed_presence_min_confidence: float = 0.0
+    relaxed_presence_v: Optional[float] = None
     H: np.ndarray = field(default=None, repr=False)    # 3x3, built at load time
 
 
@@ -142,6 +149,95 @@ def is_inside_uv(
     return (u0 <= u <= u1) and (v0 <= v <= v1)
 
 
+def _point_in_rect(
+    point: tuple[float, float],
+    rect: tuple[float, float, float, float],
+) -> bool:
+    x, y = point
+    x0, y0, x1, y1 = rect
+    lo_x, hi_x = sorted((x0, x1))
+    lo_y, hi_y = sorted((y0, y1))
+    return lo_x <= x <= hi_x and lo_y <= y <= hi_y
+
+
+def _segments_intersect(
+    a0: tuple[float, float],
+    a1: tuple[float, float],
+    b0: tuple[float, float],
+    b1: tuple[float, float],
+) -> bool:
+    def orient(
+        p: tuple[float, float],
+        q: tuple[float, float],
+        r: tuple[float, float],
+    ) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def on_segment(
+        p: tuple[float, float],
+        q: tuple[float, float],
+        r: tuple[float, float],
+    ) -> bool:
+        return (
+            min(p[0], r[0]) <= q[0] <= max(p[0], r[0])
+            and min(p[1], r[1]) <= q[1] <= max(p[1], r[1])
+        )
+
+    o1 = orient(a0, a1, b0)
+    o2 = orient(a0, a1, b1)
+    o3 = orient(b0, b1, a0)
+    o4 = orient(b0, b1, a1)
+    eps = 1e-9
+    if o1 * o2 < 0 and o3 * o4 < 0:
+        return True
+    if abs(o1) <= eps and on_segment(a0, b0, a1):
+        return True
+    if abs(o2) <= eps and on_segment(a0, b1, a1):
+        return True
+    if abs(o3) <= eps and on_segment(b0, a0, b1):
+        return True
+    if abs(o4) <= eps and on_segment(b0, a1, b1):
+        return True
+    return False
+
+
+def bbox_intersects_polygon(
+    bbox_xyxy: tuple[float, float, float, float],
+    polygon: Sequence[tuple[float, float]],
+) -> bool:
+    """Return True when an axis-aligned bbox touches or crosses a polygon.
+
+    Used for body-catch regions: bbox corner-in-polygon and polygon
+    vertex-in-bbox checks miss thin overlap cases where only edges cross, so
+    this also tests every bbox edge against every polygon edge.
+    """
+    if len(polygon) < 3:
+        return False
+    x0, y0, x1, y1 = bbox_xyxy
+    lo_x, hi_x = sorted((float(x0), float(x1)))
+    lo_y, hi_y = sorted((float(y0), float(y1)))
+    rect = (lo_x, lo_y, hi_x, hi_y)
+    bbox_pts = [
+        (lo_x, lo_y),
+        (hi_x, lo_y),
+        (hi_x, hi_y),
+        (lo_x, hi_y),
+    ]
+    poly = np.asarray([(float(x), float(y)) for x, y in polygon], dtype=np.float32)
+    if any(cv2.pointPolygonTest(poly, point, False) >= 0 for point in bbox_pts):
+        return True
+    poly_pts = [(float(x), float(y)) for x, y in polygon]
+    if any(_point_in_rect(point, rect) for point in poly_pts):
+        return True
+    bbox_edges = list(zip(bbox_pts, bbox_pts[1:] + bbox_pts[:1]))
+    poly_edges = list(zip(poly_pts, poly_pts[1:] + poly_pts[:1]))
+    return any(
+        _segments_intersect(a0, a1, b0, b1)
+        for a0, a1 in bbox_edges
+        for b0, b1 in poly_edges
+    )
+
+
 def dispatches_overlap(
     rect_a: tuple[float, float, float, float],
     rect_b: tuple[float, float, float, float],
@@ -233,5 +329,19 @@ if __name__ == "__main__":
         _check("(c) collinear rejected", True)
     except Exception as ex:
         _check("(c) collinear rejected", False, f"wrong exception {ex!r}")
+
+    # (d) Body-catch geometry catches edge-only overlaps. A thin polygon strip
+    # can cross a bbox without either shape containing the other's vertices.
+    try:
+        bbox = (10.0, 10.0, 20.0, 20.0)
+        strip = [(5.0, 14.0), (25.0, 14.0), (25.0, 16.0), (5.0, 16.0)]
+        far = [(30.0, 30.0), (40.0, 30.0), (40.0, 40.0), (30.0, 40.0)]
+        _check(
+            "(d) bbox/polygon intersection handles edge crossing",
+            bbox_intersects_polygon(bbox, strip)
+            and not bbox_intersects_polygon(bbox, far),
+        )
+    except Exception as ex:
+        _check("(d) bbox/polygon intersection handles edge crossing", False, f"raised {ex!r}")
 
     sys.exit(1 if failed else 0)

@@ -71,6 +71,11 @@ type RegionInfo = {
   projection_uv: number[];
   dispatch_uv: number[];
   min_bbox_height_px: number | null;
+  body_catch_points: number[][];
+  relaxed_presence_points: number[][];
+  relaxed_presence_margin_uv: number | null;
+  relaxed_presence_min_confidence: number | null;
+  relaxed_presence_v: number | null;
 };
 
 type ProjectionSnapshot = {
@@ -99,6 +104,16 @@ type CalibrationFrame = {
   path: string;
   width: number;
   height: number;
+};
+
+type CalibrationTool = "floor" | "body" | "stair";
+type CalibrationMappingDraft = {
+  key: string;
+  projectionVMin: string;
+  projectionVMax: string;
+  dispatchVMin: string;
+  dispatchVMax: string;
+  stairFixedV: string;
 };
 
 type SectionId =
@@ -141,9 +156,11 @@ const state: {
   videoPath: string;
   calibrationCamera: string;
   calibrationRegionId: string;
+  calibrationTool: CalibrationTool;
   calibrationFrame: CalibrationFrame | null;
   calibrationPoints: number[][];
   calibrationDraftActive: boolean;
+  calibrationMappingDraft: CalibrationMappingDraft | null;
   busy: string | null;
   error: string | null;
   saved: boolean;
@@ -160,9 +177,11 @@ const state: {
   videoPath: "/Users/taeyang/Desktop/VomReo01-01-211808-211942.mp4",
   calibrationCamera: "cam0",
   calibrationRegionId: "",
+  calibrationTool: "floor",
   calibrationFrame: null,
   calibrationPoints: [],
   calibrationDraftActive: false,
+  calibrationMappingDraft: null,
   busy: null,
   error: null,
   saved: true,
@@ -185,8 +204,21 @@ function isConfigEditorActive(): boolean {
   return state.section === "config" && document.activeElement?.id === "configEditor";
 }
 
+function isCalibrationMappingInputActive(): boolean {
+  if (state.section !== "calibration") {
+    return false;
+  }
+  return [
+    "projectionVMin",
+    "projectionVMax",
+    "dispatchVMin",
+    "dispatchVMax",
+    "stairFixedV",
+  ].includes(String(document.activeElement?.id ?? ""));
+}
+
 function requestRender(): void {
-  if (isConfigEditorActive()) {
+  if (isConfigEditorActive() || isCalibrationMappingInputActive()) {
     deferredRender = true;
     return;
   }
@@ -342,6 +374,7 @@ function render(): void {
     state.calibrationFrame = null;
     state.calibrationPoints = [];
     state.calibrationDraftActive = false;
+    state.calibrationMappingDraft = null;
     render();
   });
   const calibrationRegion = root.querySelector<HTMLSelectElement>("#calibrationRegion");
@@ -349,7 +382,17 @@ function render(): void {
     state.calibrationRegionId = calibrationRegion.value;
     state.calibrationPoints = [];
     state.calibrationDraftActive = false;
+    state.calibrationMappingDraft = null;
     render();
+  });
+  root.querySelectorAll<HTMLButtonElement>("button[data-calibration-tool]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const tool = button.dataset.calibrationTool;
+      state.calibrationTool = tool === "stair" || tool === "body" ? tool : "floor";
+      state.calibrationPoints = [];
+      state.calibrationDraftActive = false;
+      render();
+    });
   });
   const calibrationFrame = root.querySelector<HTMLElement>("#calibrationFrame");
   calibrationFrame?.addEventListener("click", (event) => {
@@ -362,6 +405,12 @@ function render(): void {
     state.calibrationPoints = nextCalibrationPoints([Math.round(x), Math.round(y)]);
     state.calibrationDraftActive = true;
     render();
+  });
+  root.querySelectorAll<HTMLInputElement>(".mapping-grid input").forEach((input) => {
+    input.addEventListener("input", () => {
+      updateCalibrationMappingDraft(input);
+      state.saved = false;
+    });
   });
 }
 
@@ -483,6 +532,7 @@ function projectionSection(): string {
         <span>pixels <b>${formatVector(projection?.pixel_size, "px")}</b></span>
         <span>cameras <b>${snapshot?.camera_count ?? cameraNames().length}</b></span>
         <span>regions <b>${regions.length}</b></span>
+        <span>stairs <b>${regions.filter((region) => region.relaxed_presence_points?.length).length}</b></span>
       </div>
       <div class="proj-canvas">
         ${regions.length ? regions.map(regionTile).join("") : `<div class="empty-projection">No calibrated regions in config.yaml yet.</div>`}
@@ -495,6 +545,7 @@ function projectionSection(): string {
       ${validationCard("projection config", projections.length ? `${projections.length}` : "none", projections.length ? "ok" : "warn", "read from config.yaml projections[]")}
       ${validationCard("calibrated regions", regions.length ? `${regions.length}` : "none", regions.length ? "ok" : "warn", "camera regions with projection_uv and dispatch_uv")}
       ${validationCard("interaction zones", zones.length ? `${zones.length}` : "none", zones.length ? "ok" : "warn", "read-only zone overlay from interaction_zones[]")}
+      ${validationCard("stair relaxed masks", regions.some((region) => region.relaxed_presence_points?.length) ? `${regions.filter((region) => region.relaxed_presence_points?.length).length}` : "none", regions.some((region) => region.relaxed_presence_points?.length) ? "ok" : "warn", "camera-image polygons used only for relaxed seated-person detection")}
       ${validationCard("live actors", String(projectionRuntimeItems().reduce((count, projection) => count + projection.active.length, 0)), "ok", "latest fps_tick projection active ids")}
     </section>
     <section class="panel">
@@ -515,8 +566,17 @@ function calibrationSection(): string {
     state.calibrationRegionId = firstRegionIdForCamera(state.calibrationCamera);
     selectedRegion = regions.find((region) => region.id === state.calibrationRegionId);
   }
-  const points = state.calibrationDraftActive ? state.calibrationPoints : selectedRegion?.image_points ?? [];
+  const points = state.calibrationDraftActive
+    ? state.calibrationPoints
+    : calibrationToolPoints(selectedRegion);
+  const toolLabel = calibrationToolLabel(state.calibrationTool);
+  const pointsLabel = calibrationToolPointsLabel(state.calibrationTool);
+  const saveDisabled = state.calibrationPoints.length !== 4 || (state.calibrationTool !== "floor" && !selectedRegion);
   const frame = state.calibrationFrame;
+  const projectionUv = normalizedUv(selectedRegion?.projection_uv, [0, 0, 1, 1]);
+  const dispatchUv = normalizedUv(selectedRegion?.dispatch_uv, projectionUv);
+  const stairV = selectedRegion?.relaxed_presence_v ?? null;
+  const mappingKey = calibrationMappingKey(state.calibrationCamera, selectedRegion?.id ?? state.calibrationRegionId);
   const frameSrc = frame && hasTauriRuntime ? convertFileSrc(frame.path) : "";
   const frameStyle = frame
     ? `aspect-ratio:${Math.max(1, frame.width)} / ${Math.max(1, frame.height)};min-height:0`
@@ -526,7 +586,7 @@ function calibrationSection(): string {
       <article class="panel">
         <div class="panel-head">
           <h3>4pt</h3>
-          <span class="sub">camera corners · tl/tr/br/bl</span>
+          <span class="sub">${toolLabel} · click four camera-image points</span>
           <div class="actions">
             <button class="btn" data-action="capture-calibration-frame" ${buttonDisabled(!isSetupReady())}>Capture</button>
             <button class="btn" data-action="capture-video-calibration-frame" ${buttonDisabled(!isSetupReady())}>Use live video</button>
@@ -535,31 +595,49 @@ function calibrationSection(): string {
         <div class="calib-toolbar">
           <label>Camera ${selectHtml("calibrationCamera", cameras, state.calibrationCamera)}</label>
           <label>Region ${selectHtml("calibrationRegion", regions.map((region) => region.id), state.calibrationRegionId)}</label>
+          <div class="tool-switch" role="group" aria-label="Calibration tool">
+            <button class="btn ${state.calibrationTool === "floor" ? "active" : ""}" data-calibration-tool="floor">Floor UV</button>
+            <button class="btn ${state.calibrationTool === "body" ? "active body" : ""}" data-calibration-tool="body">Body catch</button>
+            <button class="btn ${state.calibrationTool === "stair" ? "active stair" : ""}" data-calibration-tool="stair">Stair relaxed</button>
+          </div>
           <button class="btn" data-action="clear-calibration-points" ${buttonDisabled(!points.length)}>Clear points</button>
-          <button class="btn primary" data-action="save-calibration-points" ${buttonDisabled(state.calibrationPoints.length !== 4)}>Save 4 points</button>
+          <button class="btn primary" data-action="save-calibration-points" ${buttonDisabled(saveDisabled)}>Save ${toolLabel}</button>
         </div>
         <div id="calibrationFrame" class="calib-frame ${frameSrc ? "has-image" : ""}" style="${frameStyle}">
           ${frameSrc && frame ? `<img class="calib-image" src="${escapeAttr(frameSrc)}" alt="${escapeAttr(frame.camera)} calibration frame" draggable="false">` : `<div class="frame-grid"></div><div class="future-note">Capture a live camera frame, then click four projection corners in order.</div>`}
-          ${frame && points.length ? calibrationPointMarkers(points, frame).join("") : ""}
+          ${frame ? calibrationRegionOverlay(selectedRegion, frame, state.calibrationTool) : ""}
+          ${frame && points.length ? calibrationPointMarkers(points, frame, state.calibrationTool).join("") : ""}
         </div>
       </article>
       <article class="panel">
-        <div class="panel-head"><h3>saved calibration</h3><span class="sub">runtime config.yaml snapshot</span></div>
+        <div class="panel-head"><h3>mapping</h3><span class="sub">projection v range and stair fixed v</span></div>
         <div class="panel-body">
           <div class="checks">
             <span class="${isSetupReady() ? "ok" : "missing"}">runtime: ${isSetupReady() ? "ready" : "missing"}</span>
-            <span class="${points.length === 4 ? "ok" : "missing"}">image points: ${points.length}/4</span>
+            <span class="${points.length === 4 ? "ok" : "missing"}">${pointsLabel}: ${points.length}/4</span>
+          </div>
+          <div class="mapping-grid">
+            <label>Projection v min <input id="projectionVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "projectionVMin", formatUvNumber(projectionUv[1])))}"></label>
+            <label>Projection v max <input id="projectionVMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "projectionVMax", formatUvNumber(projectionUv[3])))}"></label>
+            <label>Dispatch v min <input id="dispatchVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchVMin", formatUvNumber(dispatchUv[1])))}"></label>
+            <label>Dispatch v max <input id="dispatchVMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchVMax", formatUvNumber(dispatchUv[3])))}"></label>
+            <label>Stair fixed v <input id="stairFixedV" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairFixedV", stairV == null ? "" : formatUvNumber(stairV)))}" placeholder="optional"></label>
+            <button class="btn primary" data-action="save-calibration-mapping" ${buttonDisabled(!selectedRegion)}>Save mapping</button>
           </div>
           <div class="kv">
             <div class="row"><span class="k">camera</span><span class="v">${escapeHtml(state.calibrationCamera)}</span></div>
             <div class="row"><span class="k">region</span><span class="v">${escapeHtml(state.calibrationRegionId)}</span></div>
+            <div class="row"><span class="k">tool</span><span class="v">${escapeHtml(toolLabel)}</span></div>
             <div class="row"><span class="k">points</span><span class="v">${escapeHtml(formatImagePoints(points))}</span></div>
             <div class="row"><span class="k">projection uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.projection_uv ?? []))}</span></div>
             <div class="row"><span class="k">dispatch uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.dispatch_uv ?? []))}</span></div>
+            <div class="row"><span class="k">body catch</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.body_catch_points ?? []))}</span></div>
+            <div class="row"><span class="k">stair mask</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.relaxed_presence_points ?? []))}</span></div>
+            <div class="row"><span class="k">stair fixed v</span><span class="v">${stairV == null ? "not set" : escapeHtml(formatUvNumber(stairV))}</span></div>
             <div class="row"><span class="k">save path</span><span class="v">${escapeHtml(shortPath(state.runtime?.config_path))}</span></div>
             <div class="row"><span class="k">frame</span><span class="v">${frame ? `${frame.width} x ${frame.height}` : "not captured"}</span></div>
           </div>
-          <p class="muted block-copy setup-copy">This saves camera image_points. Projection/dispatch UV slices are still edited from Config or Show Preview in this pass.</p>
+          <p class="muted block-copy setup-copy">${calibrationToolDescription(state.calibrationTool)}</p>
         </div>
       </article>
     </section>
@@ -794,9 +872,11 @@ function minimalAddressRows(): string {
 function regionTile(region: RegionInfo, index: number): string {
   const rect = uvRect(region.dispatch_uv.length === 4 ? region.dispatch_uv : region.projection_uv);
   const camClass = index % 2 === 0 ? "cam0" : "cam1";
-  return `<div class="dispatch ${camClass}" style="${rectStyle(rect)}">
+  const hasRelaxed = Boolean(region.relaxed_presence_points?.length);
+  return `<div class="dispatch ${camClass} ${hasRelaxed ? "has-relaxed" : ""}" style="${rectStyle(rect)}">
     <span>${escapeHtml(region.camera)} · ${escapeHtml(region.id)}</span>
     <b>${formatUvRange(region.dispatch_uv)}</b>
+    ${hasRelaxed ? `<em>stair</em>` : ""}
   </div>`;
 }
 
@@ -813,7 +893,7 @@ function projectionRegionRows(regions: RegionInfo[]): string {
     .map(
       (region) => `<div class="row">
         <span class="k">${escapeHtml(region.camera)} / ${escapeHtml(region.id)}</span>
-        <span class="v">${escapeHtml(region.projection_id)} · proj ${formatUvRange(region.projection_uv)} · dispatch ${formatUvRange(region.dispatch_uv)}</span>
+        <span class="v">${escapeHtml(region.projection_id)} · proj ${formatUvRange(region.projection_uv)} · dispatch ${formatUvRange(region.dispatch_uv)}${region.relaxed_presence_points?.length ? ` · stair ${region.relaxed_presence_points.length}pt conf ${formatOptionalNumber(region.relaxed_presence_min_confidence)}` : ""}</span>
       </div>`,
     )
     .join("")}</div>`;
@@ -952,19 +1032,149 @@ function selectHtml(id: string, options: string[], selected: string): string {
     .join("")}</select>`;
 }
 
-function calibrationPointMarkers(points: number[][], frame: CalibrationFrame): string[] {
+function calibrationPointMarkers(points: number[][], frame: CalibrationFrame, tool: CalibrationTool): string[] {
   return points.slice(0, 4).map((point, index) => {
     const left = clamp01(Number(point[0]) / Math.max(1, frame.width)) * 100;
     const top = clamp01(Number(point[1]) / Math.max(1, frame.height)) * 100;
-    return `<span class="calib-point" style="left:${left}%;top:${top}%">${index + 1}</span>`;
+    return `<span class="calib-point ${tool}" style="left:${left}%;top:${top}%">${index + 1}</span>`;
   });
+}
+
+function calibrationRegionOverlay(region: RegionInfo | undefined, frame: CalibrationFrame, activeTool: CalibrationTool): string {
+  if (!region) {
+    return "";
+  }
+  const floor = svgPolygonPoints(region.image_points);
+  const body = svgPolygonPoints(region.body_catch_points);
+  const relaxed = svgPolygonPoints(region.relaxed_presence_points);
+  if (!floor && !body && !relaxed) {
+    return "";
+  }
+  const stateClass = (tool: CalibrationTool) => tool === activeTool ? "active" : "dim";
+  return `<svg class="calib-overlay" viewBox="0 0 ${Math.max(1, frame.width)} ${Math.max(1, frame.height)}" aria-hidden="true">
+    ${floor ? `<polygon class="floor-poly ${stateClass("floor")}" points="${escapeAttr(floor)}"></polygon>` : ""}
+    ${body ? `<polygon class="body-poly ${stateClass("body")}" points="${escapeAttr(body)}"></polygon>` : ""}
+    ${relaxed ? `<polygon class="relaxed-poly ${stateClass("stair")}" points="${escapeAttr(relaxed)}"></polygon>` : ""}
+  </svg>
+  <div class="calib-legend">
+    ${floor ? `<span class="floor">floor uv</span>` : ""}
+    ${body ? `<span class="body">body catch</span>` : ""}
+    ${relaxed ? `<span class="relaxed">stair relaxed</span>` : ""}
+  </div>`;
+}
+
+function calibrationToolLabel(tool: CalibrationTool): string {
+  if (tool === "body") {
+    return "Body catch";
+  }
+  return tool === "stair" ? "Stair relaxed" : "Floor UV";
+}
+
+function calibrationToolPointsLabel(tool: CalibrationTool): string {
+  if (tool === "body") {
+    return "body points";
+  }
+  return tool === "stair" ? "stair points" : "image points";
+}
+
+function calibrationToolDescription(tool: CalibrationTool): string {
+  if (tool === "body") {
+    return "Body catch saves a wide bbox allowance polygon. It does not define the floor plane.";
+  }
+  if (tool === "stair") {
+    return "Stair relaxed saves a seated-person mask. Use Stair fixed v when the stair should land on a stable projection row.";
+  }
+  return "Floor UV defines the precise floor plane used for homography. Keep it on the real walking surface.";
+}
+
+function calibrationMappingKey(camera: string, regionId: string): string {
+  return `${camera}:${regionId}`;
+}
+
+function currentCalibrationMappingKey(): string {
+  const regionId = selectedCalibrationRegion()?.id ?? state.calibrationRegionId;
+  return calibrationMappingKey(state.calibrationCamera, regionId);
+}
+
+function defaultCalibrationMappingDraft(key = currentCalibrationMappingKey()): CalibrationMappingDraft {
+  const region = selectedCalibrationRegion();
+  const projectionUv = normalizedUv(region?.projection_uv, [0, 0, 1, 1]);
+  const dispatchUv = normalizedUv(region?.dispatch_uv, projectionUv);
+  return {
+    key,
+    projectionVMin: formatUvNumber(projectionUv[1]),
+    projectionVMax: formatUvNumber(projectionUv[3]),
+    dispatchVMin: formatUvNumber(dispatchUv[1]),
+    dispatchVMax: formatUvNumber(dispatchUv[3]),
+    stairFixedV: region?.relaxed_presence_v == null ? "" : formatUvNumber(region.relaxed_presence_v),
+  };
+}
+
+function mappingDraftValue(
+  key: string,
+  field: keyof Omit<CalibrationMappingDraft, "key">,
+  fallback: string,
+): string {
+  return state.calibrationMappingDraft?.key === key
+    ? state.calibrationMappingDraft[field]
+    : fallback;
+}
+
+function updateCalibrationMappingDraft(input: HTMLInputElement): void {
+  const key = currentCalibrationMappingKey();
+  const draft = state.calibrationMappingDraft?.key === key
+    ? state.calibrationMappingDraft
+    : defaultCalibrationMappingDraft(key);
+  if (input.id in draft) {
+    state.calibrationMappingDraft = {
+      ...draft,
+      [input.id]: input.value,
+    };
+  }
+}
+
+function normalizedUv(values: number[] | undefined, fallback: number[]): number[] {
+  if (!values || values.length < 4) {
+    return [...fallback];
+  }
+  return values.slice(0, 4).map((value, index) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? clamp01(n) : fallback[index] ?? 0;
+  });
+}
+
+function formatUvNumber(value: number): string {
+  return Number(value).toFixed(2);
+}
+
+function svgPolygonPoints(points: number[][] | undefined): string {
+  if (!points?.length) {
+    return "";
+  }
+  return points
+    .filter((point) => point.length >= 2)
+    .map((point) => `${Number(point[0]) || 0},${Number(point[1]) || 0}`)
+    .join(" ");
 }
 
 function currentCalibrationPoints(): number[][] {
   const source = state.calibrationDraftActive
     ? state.calibrationPoints
-    : selectedCalibrationRegion()?.image_points ?? [];
+    : calibrationToolPoints(selectedCalibrationRegion());
   return source.slice(0, 4).map((point) => [Math.round(Number(point[0]) || 0), Math.round(Number(point[1]) || 0)]);
+}
+
+function calibrationToolPoints(region: RegionInfo | undefined): number[][] {
+  if (!region) {
+    return [];
+  }
+  if (state.calibrationTool === "stair") {
+    return region.relaxed_presence_points ?? [];
+  }
+  if (state.calibrationTool === "body") {
+    return region.body_catch_points ?? [];
+  }
+  return region.image_points ?? [];
 }
 
 function nextCalibrationPoints(clickedPoint: number[]): number[][] {
@@ -1207,7 +1417,22 @@ cameras:
           zones: [{ id: "center", uv_rect: [0.35, 0.15, 0.65, 0.85] }],
         },
       ],
-      regions: [],
+      regions: [
+        {
+          camera: "cam0",
+          id: "cam0_region_1",
+          projection_id: "corridor",
+          image_points: [[120, 120], [740, 120], [780, 520], [90, 520]],
+          projection_uv: [0, 0, 0.55, 1],
+          dispatch_uv: [0, 0, 0.5, 1],
+          min_bbox_height_px: 24,
+          body_catch_points: [],
+          relaxed_presence_points: [[170, 110], [700, 110], [680, 230], [160, 240]],
+          relaxed_presence_margin_uv: 0.1,
+          relaxed_presence_min_confidence: 0.12,
+          relaxed_presence_v: 0.35,
+        },
+      ],
     } as T;
   }
   throw new Error(`${command} requires the Tauri desktop runtime.`);
@@ -1363,6 +1588,22 @@ function buttonDisabled(condition = false): string {
   return condition || Boolean(state.busy) ? "disabled" : "";
 }
 
+function readUnitInput(id: string, fallback: number): number {
+  const input = document.getElementById(id) as HTMLInputElement | null;
+  const parsed = Number(input?.value);
+  return Number.isFinite(parsed) ? clamp01(parsed) : fallback;
+}
+
+function readOptionalUnitInput(id: string): number | null {
+  const input = document.getElementById(id) as HTMLInputElement | null;
+  const value = input?.value.trim() ?? "";
+  if (!value) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? clamp01(parsed) : null;
+}
+
 async function handleAction(action: string): Promise<void> {
   try {
     state.error = null;
@@ -1401,12 +1642,46 @@ async function handleAction(action: string): Promise<void> {
           cameraName: state.calibrationCamera,
           regionId: state.calibrationRegionId || defaultCalibrationRegionId(state.calibrationCamera),
           imagePoints: state.calibrationPoints,
+          pointKind: state.calibrationTool,
         },
       });
       state.saved = true;
       await refreshConfig();
       await refreshProjection();
       state.calibrationDraftActive = false;
+    } else if (action === "save-calibration-mapping") {
+      const region = selectedCalibrationRegion();
+      if (!region) {
+        throw new Error("Select a calibration region first.");
+      }
+      const projectionUv = normalizedUv(region.projection_uv, [0, 0, 1, 1]);
+      const dispatchUv = normalizedUv(region.dispatch_uv, projectionUv);
+      projectionUv[1] = readUnitInput("projectionVMin", projectionUv[1]);
+      projectionUv[3] = readUnitInput("projectionVMax", projectionUv[3]);
+      dispatchUv[1] = readUnitInput("dispatchVMin", dispatchUv[1]);
+      dispatchUv[3] = readUnitInput("dispatchVMax", dispatchUv[3]);
+      if (projectionUv[1] >= projectionUv[3]) {
+        throw new Error("v min must be lower than v max.");
+      }
+      dispatchUv[1] = Math.max(projectionUv[1], dispatchUv[1]);
+      dispatchUv[3] = Math.min(projectionUv[3], dispatchUv[3]);
+      if (dispatchUv[1] >= dispatchUv[3]) {
+        dispatchUv[1] = projectionUv[1];
+        dispatchUv[3] = projectionUv[3];
+      }
+      await invoke("save_calibration_mapping", {
+        request: {
+          cameraName: state.calibrationCamera,
+          regionId: region.id,
+          projectionUv,
+          dispatchUv,
+          relaxedPresenceV: readOptionalUnitInput("stairFixedV"),
+        },
+      });
+      state.saved = true;
+      await refreshConfig();
+      await refreshProjection();
+      state.calibrationMappingDraft = null;
     } else if (action === "clear-calibration-points") {
       state.calibrationPoints = [];
       state.calibrationDraftActive = true;
@@ -1487,6 +1762,11 @@ function escapeAttr(value: string): string {
 function formatNumber(value: unknown): string {
   const number = Number(value);
   return Number.isFinite(number) ? number.toFixed(1) : "-";
+}
+
+function formatOptionalNumber(value: unknown): string {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(2) : "-";
 }
 
 function formatCoord(value: unknown): string {

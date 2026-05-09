@@ -43,6 +43,7 @@ _C_EDIT_PROJ = (255, 255, 255)
 _C_EDIT_DISPATCH = (0, 255, 255)
 _C_ZONE = (255, 80, 220)
 _C_ZONE_EDIT = (255, 255, 255)
+_C_RELAXED = (60, 60, 255)
 _C_WARN = (60, 60, 240)
 _C_PANEL_BG = (28, 28, 28)
 _C_PANEL_TEXT = (220, 220, 220)
@@ -550,6 +551,14 @@ def _render_tile(
         color = _C_REGION_FOCUS if is_focus else _C_REGION_POLY
         thickness = 2 if is_focus else 1
         cv2.polylines(tile, [pts], True, color, thickness, cv2.LINE_AA)
+        if reg.body_catch_points:
+            catch_pts = np.array([(int(round(x * sx)), int(round(y * sy)))
+                                  for (x, y) in reg.body_catch_points], dtype=np.int32)
+            cv2.polylines(tile, [catch_pts], True, _C_ZONE, 1, cv2.LINE_AA)
+        if reg.relaxed_presence_points:
+            relaxed_pts = np.array([(int(round(x * sx)), int(round(y * sy)))
+                                    for (x, y) in reg.relaxed_presence_points], dtype=np.int32)
+            cv2.polylines(tile, [relaxed_pts], True, _C_RELAXED, 2, cv2.LINE_AA)
         u0, v0, u1, v1 = reg.projection_uv
         label = f"{reg.id} [{u0:.2f},{v0:.2f}->{u1:.2f},{v1:.2f}]"
         if is_focus:
@@ -1320,6 +1329,8 @@ class Viewer:
         self.focused_region_idx = -1  # -1 means "no region selected"
         self.draw_mode = False
         self.draft_points: list[tuple[float, float]] = []
+        self.relaxed_draw_mode = False
+        self.draft_relaxed_points: list[tuple[float, float]] = []
         self.zone_draw_mode = False
         self.draft_zone_points: list[tuple[str, float, float]] = []
         # UV slice editing state. `edit_region_id` is None when not editing.
@@ -1332,7 +1343,7 @@ class Viewer:
         # Flips True on every on_regions_changed and back to False after on_save.
         self.dirty = False
         self.status = (
-            "d draw | z draw zone | e edit slices | v edit zone | [ ] cycle/nudge | x delete | w save | "
+            "d draw | s draw stairs | z draw zone | e edit slices | v edit zone | [ ] cycle/nudge | x delete | w save | "
             "h/u/p toggles | Tab panel | 1-9 focus | q quit"
         )
         self._last_cams: Sequence[CamFrame] = []
@@ -1422,10 +1433,16 @@ class Viewer:
         if mapped is None:
             self.status = "click inside the focused camera tile"
             return
-        self.draft_points.append(mapped)
-        self.status = f"point {len(self.draft_points)}/4 added"
-        if len(self.draft_points) == 4:
-            self._commit_draft_region()
+        if self.relaxed_draw_mode:
+            self.draft_relaxed_points.append(mapped)
+            self.status = f"stair point {len(self.draft_relaxed_points)}/4 added"
+            if len(self.draft_relaxed_points) == 4:
+                self._commit_draft_relaxed_presence()
+        else:
+            self.draft_points.append(mapped)
+            self.status = f"point {len(self.draft_points)}/4 added"
+            if len(self.draft_points) == 4:
+                self._commit_draft_region()
 
     def _mouse_to_uv_point(self, x: int, y: int) -> Optional[tuple[str, float, float]]:
         for pid, (x0, y0, w, h) in self._uv_panel_bounds.items():
@@ -1468,6 +1485,15 @@ class Viewer:
             idx += 1
         return f"{base}_{idx}"
 
+    def _relaxed_target_region(self, cam: CamFrame) -> Optional[Region]:
+        if not cam.regions:
+            return None
+        if 0 <= self.focused_region_idx < len(cam.regions):
+            return cam.regions[self.focused_region_idx]
+        if len(cam.regions) == 1:
+            return cam.regions[0]
+        return None
+
     def _commit_draft_region(self) -> None:
         if self.focus_idx >= len(self._last_cams) or not self.projections:
             self.draft_points = []
@@ -1500,6 +1526,38 @@ class Viewer:
         self.draft_points = []
         self.draw_mode = False
         self.status = f"added {region.id}; press w to save config"
+
+    def _commit_draft_relaxed_presence(self) -> None:
+        if self.focus_idx >= len(self._last_cams):
+            self.draft_relaxed_points = []
+            self.draw_mode = False
+            self.relaxed_draw_mode = False
+            self.status = "cannot create stair catch polygon without a focused camera"
+            return
+        cam = self._last_cams[self.focus_idx]
+        reg = self._relaxed_target_region(cam)
+        if reg is None:
+            self.draft_relaxed_points = []
+            self.draw_mode = False
+            self.relaxed_draw_mode = False
+            self.status = "select a region with [/] before drawing stairs"
+            return
+        updated = replace(
+            reg,
+            relaxed_presence_points=list(self.draft_relaxed_points),
+        )
+        regions = [updated if r.id == reg.id else r for r in cam.regions]
+        if self.on_regions_changed is not None:
+            self.on_regions_changed(self.focus_idx, regions)
+        self.dirty = True
+        self.focused_region_idx = next(
+            (idx for idx, item in enumerate(regions) if item.id == reg.id),
+            self.focused_region_idx,
+        )
+        self.draft_relaxed_points = []
+        self.draw_mode = False
+        self.relaxed_draw_mode = False
+        self.status = f"added stair catch polygon to {reg.id}; press w to save config"
 
     def _commit_draft_zone(self) -> None:
         if len(self.draft_zone_points) != 2:
@@ -1814,7 +1872,13 @@ class Viewer:
                             _FONT, 0.5, _C_ZONE, 1, cv2.LINE_AA)
             if len(pts) == 2:
                 _draw_dotted_rect(canvas, pts[0], pts[1], _C_ZONE)
-        if not self.draft_points or self.focus_idx >= len(self._last_cams):
+        frame_points = (
+            self.draft_relaxed_points
+            if self.relaxed_draw_mode
+            else self.draft_points
+        )
+        frame_color = _C_RELAXED if self.relaxed_draw_mode else _C_DRAFT
+        if not frame_points or self.focus_idx >= len(self._last_cams):
             return
         cam = self._last_cams[self.focus_idx]
         if cam.frame is None:
@@ -1824,17 +1888,17 @@ class Viewer:
         origin_x, origin_y = self.focus_idx * tw, 0
         src_h, src_w = cam.frame.shape[:2]
         pts: list[tuple[int, int]] = []
-        for px, py in self.draft_points:
+        for px, py in frame_points:
             tx = origin_x + int(round(px * tw / float(src_w)))
             ty = origin_y + int(round(py * th / float(src_h)))
             pts.append((tx, ty))
         for i, pt in enumerate(pts):
-            cv2.circle(canvas, pt, 5, _C_DRAFT, -1, cv2.LINE_AA)
+            cv2.circle(canvas, pt, 5, frame_color, -1, cv2.LINE_AA)
             cv2.putText(canvas, str(i + 1), (pt[0] + 7, pt[1] - 7),
-                        _FONT, 0.5, _C_DRAFT, 1, cv2.LINE_AA)
+                        _FONT, 0.5, frame_color, 1, cv2.LINE_AA)
         if len(pts) >= 2:
             cv2.polylines(canvas, [np.array(pts, dtype=np.int32)], False,
-                          _C_DRAFT, 2, cv2.LINE_AA)
+                          frame_color, 2, cv2.LINE_AA)
 
     def _draw_status(
         self,
@@ -1848,7 +1912,7 @@ class Viewer:
             first_line += f"  | {overlap_summary}"
         lines = [
             first_line,
-            "region draw: projection top-left -> top-right -> bottom-right -> bottom-left | zone draw: click two UV corners",
+            "region draw: projection top-left -> top-right -> bottom-right -> bottom-left | stair draw: 4 image points on selected region | zone draw: 2 UV corners",
         ]
         pad = 8
         line_h = 20
@@ -2088,6 +2152,12 @@ class Viewer:
             self._topmost_pumped = True
 
         key = cv2.waitKey(1) & 0xFF
+        if key == 27 and self.relaxed_draw_mode:
+            self.relaxed_draw_mode = False
+            self.draw_mode = False
+            self.draft_relaxed_points = []
+            self.status = "stair draw cancelled"
+            return True
         if key == 27 and self.zone_draw_mode:
             self.zone_draw_mode = False
             self.draft_zone_points = []
@@ -2121,17 +2191,36 @@ class Viewer:
             self.status = f"panel tab: {self.panel_tab}"
         elif key == ord("d"):
             self.draw_mode = True
+            self.relaxed_draw_mode = False
             self.draft_points = []
+            self.draft_relaxed_points = []
             self.zone_draw_mode = False
             self.draft_zone_points = []
             self._exit_edit_mode()
             self._exit_zone_edit_mode()
             self.status = "draw mode: click 4 focused-camera points"
+        elif key == ord("s"):
+            cam = self._focused_cam()
+            if cam is None or self._relaxed_target_region(cam) is None:
+                self.status = "select a floor region with [/] before drawing stairs"
+            else:
+                self.draw_mode = True
+                self.relaxed_draw_mode = True
+                self.draft_points = []
+                self.draft_relaxed_points = []
+                self.zone_draw_mode = False
+                self.draft_zone_points = []
+                self._exit_edit_mode()
+                self._exit_zone_edit_mode()
+                target = self._relaxed_target_region(cam)
+                self.status = f"stair draw mode for {target.id}: click 4 image points"
         elif key == ord("z"):
             self.zone_draw_mode = True
             self.draft_zone_points = []
             self.draw_mode = False
+            self.relaxed_draw_mode = False
             self.draft_points = []
+            self.draft_relaxed_points = []
             self._exit_edit_mode()
             self._exit_zone_edit_mode()
             self.status = "zone draw mode: click 2 corners on UV canvas"
@@ -2139,6 +2228,9 @@ class Viewer:
             if self.draft_zone_points:
                 self.draft_zone_points.pop()
                 self.status = f"zone corner removed; {len(self.draft_zone_points)}/2 remain"
+            elif self.draft_relaxed_points:
+                self.draft_relaxed_points.pop()
+                self.status = f"stair point removed; {len(self.draft_relaxed_points)}/4 remain"
             elif self.draft_points:
                 self.draft_points.pop()
                 self.status = f"point removed; {len(self.draft_points)}/4 remain"
@@ -2195,6 +2287,8 @@ class Viewer:
                 self.focused_region_idx = -1
                 self.draft_points = []
                 self.draw_mode = False
+                self.draft_relaxed_points = []
+                self.relaxed_draw_mode = False
                 self.draft_zone_points = []
                 self.zone_draw_mode = False
                 self._exit_edit_mode()

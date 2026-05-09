@@ -29,8 +29,20 @@
   멀리 튀는 경우 순간이동으로 보고 기존 gid를 lost 처리한 뒤 새 gid로 분리합니다.
   바닥 인터랙션에서 OSC actor가 프로젝션 면을 갑자기 가로지르는 것을 막기 위한
   안전장치입니다.
+- camera region의 `body_catch_points`는 발점 투영용 homography를 대체하지 않습니다.
+  bbox가 이 보조 polygon과 겹치고 foot UV가 projection rect 근처에 있으면 낮은
+  confidence/경계 밖 foot을 살려 projection rect로 clamp합니다. OSC 위치 계산은 계속
+  `image_points`의 바닥 homography를 사용합니다. 단, 낮은 confidence 완화는 bbox
+  크기/비율 필터와 confirm window를 통과한 detection에만 적용합니다.
+- camera region의 `relaxed_presence_points`는 계단/착석자용 별도 image polygon입니다.
+  `image_points`는 UV 변환용 기준 영역으로 유지하고, relaxed polygon은 그 안에서만
+  가로로 넓거나 짧은 bbox를 완화해 actor 후보로 승격합니다. 위치는 기존 homography의
+  `u`를 쓰고 `relaxed_presence_v`가 있으면 그 projection v를 고정값으로 씁니다.
+  값이 없으면 `v`만 projection rect 안으로 clamp하며, dispatch 판정도 `u` 중심으로만
+  수행합니다. `stair_catch_points`는 같은 의미의 입력 alias입니다.
 - 같은 projection을 공유하는 카메라들의 `dispatch_uv` slice는 겹치지 않아야 합니다. 겹치면 count가 부풀 수 있습니다.
 - cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 중앙 hand-off나 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
+- `fusion.relaxed_hold_s`가 0보다 크면 계단/착석자 relaxed polygon에서 생성된 actor만 detection drop 이후 더 오래 held로 남습니다. 일반 바닥 보행자 hold 정책은 그대로 둡니다.
 - `fusion.hold_boundary_margin_uv`가 0보다 크면 held gid는 projection 가장자리 근처에서만 active로 남습니다. 중앙에서 track을 놓친 경우에는 ghost actor가 남지 않도록 즉시 `/lost` 처리합니다.
 - `fusion.reuse_lost_gids` 기본값은 `true`입니다. 완전히 lost된 gid는 작은 번호부터 재사용해서 TouchDesigner OSC 채널/테이블이 총 방문자 수만큼 계속 커지지 않게 합니다.
 - `interaction_zones`는 projection별 UV rectangle입니다. fused person이 zone 안에 있으면 zone-local 좌표와 dwell/presence를 별도 OSC stream으로 내보내며, 카메라별 calibration `regions`와 섞지 않습니다.
@@ -46,6 +58,8 @@
 
 앱 runtime의 실제 설정은 저장소 root가 아니라 app data의 `runtime/config.yaml`에 둡니다.
 처음 Setup할 때 없으면 `runtime/engine/config.example.yaml`을 복사하고, 이후 Config 패널에서 읽고 저장합니다.
+repo에서 직접 실행하는 `tracker.py`와 repo-local `$sim`도 기본 `config.yaml` 실행일 때는
+앱 runtime config를 우선 resolve하므로, 앱에서 그린 캘리브레이션이 다음 CLI 검증에 바로 반영됩니다.
 tracker 실행 형태는 아래와 같습니다.
 
 ```bash

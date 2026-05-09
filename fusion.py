@@ -28,6 +28,7 @@ class PersonEvent:
     conf: float
     t: float  # monotonic seconds
     dispatching: bool = True
+    relaxed: bool = False
 
 
 @dataclass
@@ -46,6 +47,7 @@ class Person:
     last_seen_t: float = 0.0
     state: str = "fresh"  # "fresh" when coordinates updated this tick, else "held"
     source: tuple[str, int] = ("", -1)  # (cam_name, track_id) currently feeding this gid
+    relaxed: bool = False
 
 
 @dataclass
@@ -53,6 +55,7 @@ class _Pending:
     """A gid whose feeding source just disappeared. Held for hand-off."""
     person: Person
     lost_t: float
+    hold_s: float
 
 
 @dataclass(frozen=True)
@@ -326,6 +329,7 @@ class PersonTracker:
         velocity_predict_max_dt_s: float = 1.0,
         hold_boundary_margin_uv: float = 0.0,
         max_update_jump_uv: float = 0.0,
+        relaxed_hold_s: float = 0.0,
         reuse_lost_gids: bool = True,
     ):
         self.hand_off_window_s = hand_off_window_s
@@ -346,6 +350,7 @@ class PersonTracker:
         # move an existing gid farther than this UV distance is treated as a
         # new person instead of dragging the OSC actor across the floor.
         self.max_update_jump_uv = max(0.0, float(max_update_jump_uv))
+        self.relaxed_hold_s = max(0.0, float(relaxed_hold_s))
         # Reuse gids only after they are terminally lost. This keeps OSC
         # address/key cardinality bounded by peak concurrent occupancy instead
         # of total historical visitors.
@@ -398,7 +403,11 @@ class PersonTracker:
                 self._release_gid(gid)
                 self.lost_count += 1
                 continue
-            self._pending[gid] = _Pending(person=person, lost_t=now)
+            self._pending[gid] = _Pending(
+                person=person,
+                lost_t=now,
+                hold_s=self._pending_hold_s(person),
+            )
 
         fresh: set[int] = set()
         new_events: list[PersonEvent] = []
@@ -435,6 +444,7 @@ class PersonTracker:
                 self._source_to_gid.pop(old_src, None)
                 self._source_to_gid[src] = gid
                 self._persons[gid].source = src
+                self._persons[gid].relaxed = self._persons[gid].relaxed or ev.relaxed
                 self._update_person(gid, ev, now)
                 self.handoff_count += 1
                 claimed_active.add(gid)
@@ -447,6 +457,7 @@ class PersonTracker:
                 self._persons[gid] = pend.person
                 self._source_to_gid[src] = gid
                 self._persons[gid].source = src
+                self._persons[gid].relaxed = self._persons[gid].relaxed or ev.relaxed
                 self._update_person(gid, ev, now)
                 self.handoff_count += 1
                 fresh.add(gid)
@@ -456,7 +467,7 @@ class PersonTracker:
 
         evicted = [
             gid for gid, p in self._pending.items()
-            if now - p.lost_t > self.hand_off_window_s
+            if now - p.lost_t > p.hold_s
         ]
         for gid in evicted:
             pending = self._pending.pop(gid, None)
@@ -597,6 +608,7 @@ class PersonTracker:
             last_seen_t=now,
             state="fresh",
             source=src,
+            relaxed=ev.relaxed,
         )
         self._source_to_gid[src] = gid
         return gid
@@ -683,6 +695,7 @@ class PersonTracker:
         p.last_t = now
         p.last_seen_t = now
         p.state = "fresh"
+        p.relaxed = p.relaxed or ev.relaxed
 
     def _hold_person(self, gid: int, ev: PersonEvent, now: float) -> None:
         p = self._persons.get(gid)
@@ -693,6 +706,12 @@ class PersonTracker:
         p.vx *= 0.8
         p.vy *= 0.8
         p.state = "held"
+        p.relaxed = p.relaxed or ev.relaxed
+
+    def _pending_hold_s(self, person: Person) -> float:
+        if person.relaxed and self.relaxed_hold_s > 0.0:
+            return max(self.hand_off_window_s, self.relaxed_hold_s)
+        return self.hand_off_window_s
 
 
 if __name__ == "__main__":
@@ -1198,6 +1217,32 @@ if __name__ == "__main__":
         "(t) edge miss remains held inside hand-off window",
         len(persons) == 1 and persons[0].state == "held" and lost == [],
         f"persons={persons}, lost={lost}",
+    )
+
+    # (u) Relaxed/stair actors can linger longer than normal walk actors.
+    pt = PersonTracker(
+        hand_off_window_s=0.5,
+        hold_boundary_margin_uv=0.0,
+        relaxed_hold_s=2.0,
+    )
+    pt.update(
+        [PersonEvent("corridor", "cam0", 5, 0.50, 0.50, 0.9, 0.0, relaxed=True)],
+        [],
+        0.0,
+    )
+    persons = pt.update([], [("cam0", 5)], 0.1)
+    still_held = pt.update([], [], 1.0)
+    lost_mid = pt.drain_lost_gids()
+    gone = pt.update([], [], 2.2)
+    lost_end = pt.drain_lost_gids()
+    _check(
+        "(u) relaxed miss uses relaxed_hold_s before lost",
+        len(persons) == 1
+        and len(still_held) == 1
+        and lost_mid == []
+        and gone == []
+        and lost_end == [LostPerson("corridor", 1)],
+        f"persons={persons}, still_held={still_held}, lost_mid={lost_mid}, gone={gone}, lost_end={lost_end}",
     )
 
     sys.exit(1 if failed else 0)

@@ -108,6 +108,11 @@ struct RegionInfo {
     projection_uv: Vec<f64>,
     dispatch_uv: Vec<f64>,
     min_bbox_height_px: Option<f64>,
+    body_catch_points: Vec<Vec<f64>>,
+    relaxed_presence_points: Vec<Vec<f64>>,
+    relaxed_presence_margin_uv: Option<f64>,
+    relaxed_presence_min_confidence: Option<f64>,
+    relaxed_presence_v: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +156,17 @@ struct SaveCalibrationPointsRequest {
     camera_name: String,
     region_id: Option<String>,
     image_points: Vec<[f64; 2]>,
+    point_kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveCalibrationMappingRequest {
+    camera_name: String,
+    region_id: String,
+    projection_uv: Option<[f64; 4]>,
+    dispatch_uv: Option<[f64; 4]>,
+    relaxed_presence_v: Option<f64>,
 }
 
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -360,6 +376,22 @@ fn yaml_number_vec(value: Option<&serde_yaml::Value>) -> Vec<f64> {
         .unwrap_or_default()
 }
 
+fn yaml_points(value: Option<&serde_yaml::Value>) -> Vec<Vec<f64>> {
+    value
+        .and_then(|v| v.as_sequence())
+        .map(|points| {
+            points
+                .iter()
+                .map(|point| yaml_number_vec(Some(point)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn yaml_optional_f64(value: Option<&serde_yaml::Value>) -> Option<f64> {
+    value.and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+}
+
 fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String> {
     let parsed: serde_yaml::Value =
         serde_yaml::from_str(config).map_err(|err| format!("YAML validation failed: {err}"))?;
@@ -428,19 +460,26 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
                             .to_string(),
                         image_points: region
                             .get("image_points")
-                            .and_then(|v| v.as_sequence())
-                            .map(|points| {
-                                points
-                                    .iter()
-                                    .map(|point| yaml_number_vec(Some(point)))
-                                    .collect()
-                            })
+                            .map(|value| yaml_points(Some(value)))
                             .unwrap_or_default(),
                         projection_uv: yaml_number_vec(region.get("projection_uv")),
                         dispatch_uv: yaml_number_vec(region.get("dispatch_uv")),
-                        min_bbox_height_px: region
-                            .get("min_bbox_height_px")
-                            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64))),
+                        min_bbox_height_px: yaml_optional_f64(region.get("min_bbox_height_px")),
+                        body_catch_points: yaml_points(region.get("body_catch_points")),
+                        relaxed_presence_points: yaml_points(
+                            region
+                                .get("relaxed_presence_points")
+                                .or_else(|| region.get("stair_catch_points")),
+                        ),
+                        relaxed_presence_margin_uv: yaml_optional_f64(
+                            region.get("relaxed_presence_margin_uv"),
+                        ),
+                        relaxed_presence_min_confidence: yaml_optional_f64(
+                            region
+                                .get("relaxed_presence_min_confidence")
+                                .or_else(|| region.get("stair_catch_min_confidence")),
+                        ),
+                        relaxed_presence_v: yaml_optional_f64(region.get("relaxed_presence_v")),
                     });
                 }
             }
@@ -538,7 +577,10 @@ fn first_projection_id(config_value: &serde_yaml::Value) -> String {
         .to_string()
 }
 
-fn camera_url_from_config(config_text: &str, camera_name: Option<&str>) -> Result<(String, String), String> {
+fn camera_url_from_config(
+    config_text: &str,
+    camera_name: Option<&str>,
+) -> Result<(String, String), String> {
     let config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
         .map_err(|err| format!("YAML validation failed: {err}"))?;
     let cameras = config_value
@@ -578,6 +620,14 @@ fn calibration_config_text(
     if request.image_points.len() != 4 {
         return Err("image_points must contain exactly 4 points".to_string());
     }
+    let point_key = match request.point_kind.as_deref().unwrap_or("floor") {
+        "floor" | "image_points" => "image_points",
+        "body" | "body_catch" | "body_catch_points" => "body_catch_points",
+        "stair" | "relaxed" | "relaxed_presence_points" | "stair_catch_points" => {
+            "relaxed_presence_points"
+        }
+        other => return Err(format!("unsupported calibration point kind: {other}")),
+    };
     let mut config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
         .map_err(|err| format!("YAML validation failed: {err}"))?;
     let default_projection_id = first_projection_id(&config_value);
@@ -611,48 +661,127 @@ fn calibration_config_text(
         .as_deref()
         .filter(|id| !id.trim().is_empty())
         .unwrap_or("app_calibration");
-    let index = regions
-        .iter()
-        .position(|region| {
-            region
-                .get("id")
-                .and_then(|value| value.as_str())
-                .map(|id| id == target_region_id)
-                .unwrap_or(false)
-        })
-        .unwrap_or_else(|| {
-            if regions.is_empty() {
-                let mut region = serde_yaml::Mapping::new();
-                region.insert(
-                    serde_yaml::Value::String("id".to_string()),
-                    serde_yaml::Value::String(target_region_id.to_string()),
-                );
-                region.insert(
-                    serde_yaml::Value::String("projection_id".to_string()),
-                    serde_yaml::Value::String(default_projection_id),
-                );
-                region.insert(
-                    serde_yaml::Value::String("projection_uv".to_string()),
-                    serde_yaml::to_value([0.0_f64, 0.0, 1.0, 1.0]).unwrap_or_default(),
-                );
-                region.insert(
-                    serde_yaml::Value::String("dispatch_uv".to_string()),
-                    serde_yaml::to_value([0.0_f64, 0.0, 1.0, 1.0]).unwrap_or_default(),
-                );
-                regions.push(serde_yaml::Value::Mapping(region));
-                regions.len() - 1
-            } else {
-                0
-            }
-        });
+    let existing_index = regions.iter().position(|region| {
+        region
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(|id| id == target_region_id)
+            .unwrap_or(false)
+    });
+    let index = match existing_index {
+        Some(index) => index,
+        None if point_key == "image_points" && regions.is_empty() => {
+            let mut region = serde_yaml::Mapping::new();
+            region.insert(
+                serde_yaml::Value::String("id".to_string()),
+                serde_yaml::Value::String(target_region_id.to_string()),
+            );
+            region.insert(
+                serde_yaml::Value::String("projection_id".to_string()),
+                serde_yaml::Value::String(default_projection_id),
+            );
+            region.insert(
+                serde_yaml::Value::String("projection_uv".to_string()),
+                serde_yaml::to_value([0.0_f64, 0.0, 1.0, 1.0]).unwrap_or_default(),
+            );
+            region.insert(
+                serde_yaml::Value::String("dispatch_uv".to_string()),
+                serde_yaml::to_value([0.0_f64, 0.0, 1.0, 1.0]).unwrap_or_default(),
+            );
+            regions.push(serde_yaml::Value::Mapping(region));
+            regions.len() - 1
+        }
+        None if point_key == "image_points" => 0,
+        None => return Err("catch points must be attached to an existing floor region".to_string()),
+    };
     let region = regions[index]
         .as_mapping_mut()
         .ok_or_else(|| "target region entry must be a YAML mapping".to_string())?;
     region.insert(
-        serde_yaml::Value::String("image_points".to_string()),
+        serde_yaml::Value::String(point_key.to_string()),
         serde_yaml::to_value(&request.image_points)
             .map_err(|err| format!("failed to serialize image points: {err}"))?,
     );
+
+    serde_yaml::to_string(&config_value)
+        .map_err(|err| format!("failed to serialize calibration config: {err}"))
+}
+
+fn calibration_mapping_config_text(
+    config_text: &str,
+    request: &SaveCalibrationMappingRequest,
+) -> Result<String, String> {
+    let mut config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
+        .map_err(|err| format!("YAML validation failed: {err}"))?;
+    let cameras = config_value
+        .get_mut("cameras")
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "config is missing cameras[]".to_string())?;
+    let camera = cameras
+        .iter_mut()
+        .find(|camera| {
+            camera
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|name| name == request.camera_name)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("camera not found: {}", request.camera_name))?;
+    let regions = camera
+        .get_mut("regions")
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "camera regions must be a YAML sequence".to_string())?;
+    let region = regions
+        .iter_mut()
+        .find(|region| {
+            region
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|id| id == request.region_id)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("region not found: {}", request.region_id))?;
+    let region = region
+        .as_mapping_mut()
+        .ok_or_else(|| "target region entry must be a YAML mapping".to_string())?;
+
+    if let Some(projection_uv) = request.projection_uv {
+        if projection_uv[0] >= projection_uv[2] || projection_uv[1] >= projection_uv[3] {
+            return Err("projection_uv must satisfy min < max".to_string());
+        }
+        region.insert(
+            serde_yaml::Value::String("projection_uv".to_string()),
+            serde_yaml::to_value(projection_uv)
+                .map_err(|err| format!("failed to serialize projection_uv: {err}"))?,
+        );
+    }
+    if let Some(dispatch_uv) = request.dispatch_uv {
+        if dispatch_uv[0] >= dispatch_uv[2] || dispatch_uv[1] >= dispatch_uv[3] {
+            return Err("dispatch_uv must satisfy min < max".to_string());
+        }
+        if let Some(projection_uv) = request.projection_uv {
+            if dispatch_uv[0] < projection_uv[0]
+                || dispatch_uv[1] < projection_uv[1]
+                || dispatch_uv[2] > projection_uv[2]
+                || dispatch_uv[3] > projection_uv[3]
+            {
+                return Err("dispatch_uv must stay inside projection_uv".to_string());
+            }
+        }
+        region.insert(
+            serde_yaml::Value::String("dispatch_uv".to_string()),
+            serde_yaml::to_value(dispatch_uv)
+                .map_err(|err| format!("failed to serialize dispatch_uv: {err}"))?,
+        );
+    }
+    if let Some(relaxed_presence_v) = request.relaxed_presence_v {
+        let clamped = relaxed_presence_v.clamp(0.0, 1.0);
+        region.insert(
+            serde_yaml::Value::String("relaxed_presence_v".to_string()),
+            serde_yaml::to_value(clamped)
+                .map_err(|err| format!("failed to serialize relaxed_presence_v: {err}"))?,
+        );
+    }
 
     serde_yaml::to_string(&config_value)
         .map_err(|err| format!("failed to serialize calibration config: {err}"))
@@ -751,7 +880,11 @@ fn rtsp_port_probe(host: &str) -> FieldCheck {
     }
 }
 
-fn summarize_checks(generated_at: String, checks: Vec<FieldCheck>, target_count: usize) -> FieldCheckReport {
+fn summarize_checks(
+    generated_at: String,
+    checks: Vec<FieldCheck>,
+    target_count: usize,
+) -> FieldCheckReport {
     let ok_count = checks.iter().filter(|check| check.status == "ok").count();
     let warn_count = checks.iter().filter(|check| check.status == "warn").count();
     let fail_count = checks.iter().filter(|check| check.status == "fail").count();
@@ -880,6 +1013,9 @@ cameras:
         projection_uv: [0.0, 0.0, 0.55, 1.0]
         dispatch_uv: [0.0, 0.0, 0.5, 1.0]
         min_bbox_height_px: 24
+        relaxed_presence_points: [[100, 80], [320, 80], [300, 150], [120, 150]]
+        relaxed_presence_margin_uv: 0.1
+        relaxed_presence_min_confidence: 0.12
 "#;
         let snapshot = parse_projection_snapshot(config).expect("snapshot should parse");
         assert_eq!(snapshot.camera_count, 1);
@@ -887,6 +1023,11 @@ cameras:
         assert_eq!(snapshot.projections[0].zones[0].id, "center");
         assert_eq!(snapshot.regions[0].camera, "cam0");
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
+        assert_eq!(snapshot.regions[0].relaxed_presence_points.len(), 4);
+        assert_eq!(
+            snapshot.regions[0].relaxed_presence_min_confidence,
+            Some(0.12)
+        );
     }
 
     #[test]
@@ -906,12 +1047,9 @@ cameras:
     url: rtsp://admin:%21pass@192.168.1.21:554/h264Preview_01_sub
     regions: []
 "#;
-        let text = video_test_config_text(
-            config,
-            Path::new("/tmp/test-camera-1.mp4"),
-            Some("cam1"),
-        )
-        .expect("video test config should serialize");
+        let text =
+            video_test_config_text(config, Path::new("/tmp/test-camera-1.mp4"), Some("cam1"))
+                .expect("video test config should serialize");
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&text).expect("generated YAML should parse");
         let cameras = parsed
@@ -960,9 +1098,12 @@ cameras:
             camera_name: "cam0".to_string(),
             region_id: Some("near".to_string()),
             image_points: vec![[10.0, 20.0], [30.0, 40.0], [50.0, 60.0], [70.0, 80.0]],
+            point_kind: Some("floor".to_string()),
         };
-        let text = calibration_config_text(config, &request).expect("calibration config should save");
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let text =
+            calibration_config_text(config, &request).expect("calibration config should save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
         let points = parsed
             .get("cameras")
             .and_then(|value| value.as_sequence())
@@ -975,6 +1116,47 @@ cameras:
             .expect("image points should exist");
         assert_eq!(points.len(), 4);
         assert_eq!(yaml_number_vec(points.first()), vec![10.0, 20.0]);
+    }
+
+    #[test]
+    fn calibration_config_updates_existing_stair_relaxed_points() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam0
+    url: /tmp/test.mp4
+    regions:
+      - id: near
+        projection_id: corridor
+        image_points: [[0, 0], [1, 0], [1, 1], [0, 1]]
+        projection_uv: [0.0, 0.0, 0.5, 1.0]
+        dispatch_uv: [0.0, 0.0, 0.5, 1.0]
+"#;
+        let request = SaveCalibrationPointsRequest {
+            camera_name: "cam0".to_string(),
+            region_id: Some("near".to_string()),
+            image_points: vec![[100.0, 80.0], [320.0, 80.0], [300.0, 150.0], [120.0, 150.0]],
+            point_kind: Some("stair".to_string()),
+        };
+        let text = calibration_config_text(config, &request).expect("stair points should save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let region = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .and_then(|cameras| cameras.first())
+            .and_then(|camera| camera.get("regions"))
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .expect("region should exist");
+        assert!(region.get("image_points").is_some());
+        let relaxed = region
+            .get("relaxed_presence_points")
+            .and_then(|value| value.as_sequence())
+            .expect("relaxed points should exist");
+        assert_eq!(relaxed.len(), 4);
+        assert_eq!(yaml_number_vec(relaxed.first()), vec![100.0, 80.0]);
     }
 }
 
@@ -1101,6 +1283,7 @@ fn spawn_tracker_with_config(
     show_preview: bool,
 ) -> Result<ProcessStatus, String> {
     ensure_tracker_not_running(state)?;
+    copy_engine_files(&app)?;
 
     let python = python_path(&app)?;
     let tracker = engine_dir(&app)?.join("tracker.py");
@@ -1185,7 +1368,8 @@ fn capture_calibration_frame(
 ) -> Result<CalibrationFrame, String> {
     let config_text = fs::read_to_string(config_path(&app)?)
         .map_err(|err| format!("failed to read runtime config: {err}"))?;
-    let (camera, config_url) = camera_url_from_config(&config_text, request.camera_name.as_deref())?;
+    let (camera, config_url) =
+        camera_url_from_config(&config_text, request.camera_name.as_deref())?;
     let source = request
         .video_path
         .as_deref()
@@ -1206,7 +1390,13 @@ fn capture_calibration_frame(
         .map_err(|err| format!("failed to create {}: {err}", capture_dir.display()))?;
     let safe_camera = camera
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
     let capture_ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1264,6 +1454,19 @@ fn save_calibration_points(
     let config_text = fs::read_to_string(&config)
         .map_err(|err| format!("failed to read runtime config: {err}"))?;
     let next_config = calibration_config_text(&config_text, &request)?;
+    fs::write(&config, next_config)
+        .map_err(|err| format!("failed to write {}: {err}", config.display()))
+}
+
+#[tauri::command]
+fn save_calibration_mapping(
+    app: AppHandle,
+    request: SaveCalibrationMappingRequest,
+) -> Result<(), String> {
+    let config = config_path(&app)?;
+    let config_text = fs::read_to_string(&config)
+        .map_err(|err| format!("failed to read runtime config: {err}"))?;
+    let next_config = calibration_mapping_config_text(&config_text, &request)?;
     fs::write(&config, next_config)
         .map_err(|err| format!("failed to write {}: {err}", config.display()))
 }
@@ -1358,7 +1561,10 @@ fn run_field_checks(
         },
         format!(
             "venv={} config={} model={} tracker={}",
-            runtime.venv_exists, runtime.config_exists, runtime.model_exists, runtime.tracker_exists
+            runtime.venv_exists,
+            runtime.config_exists,
+            runtime.model_exists,
+            runtime.tracker_exists
         ),
     ));
 
@@ -1409,7 +1615,11 @@ fn run_field_checks(
         checks.push(field_check(
             "camera_routes",
             "Camera routes",
-            if route_failures.is_empty() { "ok" } else { "warn" },
+            if route_failures.is_empty() {
+                "ok"
+            } else {
+                "warn"
+            },
             if route_failures.is_empty() {
                 format!("{} route(s) resolved", targets.len())
             } else {
@@ -1444,14 +1654,16 @@ fn run_field_checks(
         "TouchDesigner handshake",
         "warn",
         "sidecar required".to_string(),
-        "TD ack needs an OSC listener/sidecar contract; this launcher does not own it yet.".to_string(),
+        "TD ack needs an OSC listener/sidecar contract; this launcher does not own it yet."
+            .to_string(),
     ));
     checks.push(field_check(
         "walk_test",
         "Walk test",
         "warn",
         "manual check".to_string(),
-        "Automatic seam walk-test needs structured fusion history from tracker/sidecar.".to_string(),
+        "Automatic seam walk-test needs structured fusion history from tracker/sidecar."
+            .to_string(),
     ));
 
     Ok(summarize_checks(generated_at, checks, targets.len()))
@@ -1477,6 +1689,7 @@ pub fn run() {
             start_video_test,
             capture_calibration_frame,
             save_calibration_points,
+            save_calibration_mapping,
             stop_tracker,
             tracker_status,
             collect_network_report,

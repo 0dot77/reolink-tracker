@@ -47,6 +47,9 @@ fusion:
   # 바닥 인터랙션에서는 OSC actor가 프로젝션 면을 갑자기 가로지르는 것을 막는 안전장치다.
   # 0이면 비활성화. 0.08은 40m projection에서 약 3.2m 규모의 큰 점프를 차단한다.
   max_update_jump_uv: 0.08
+  # 계단/착석자 relaxed actor는 detection이 잠깐 끊겨도 더 오래 held로 남긴다.
+  # 움직임이 적은 좌석 presence 전용 완충값이며, 일반 보행자 hold에는 적용되지 않는다.
+  relaxed_hold_s: 3.0
   # 사람이 완전히 lost된 뒤에는 가장 작은 빈 gid를 재사용한다.
   # TouchDesigner OSC 채널/테이블이 총 방문자 수만큼 계속 늘어나는 것을 막는다.
   reuse_lost_gids: true
@@ -66,6 +69,14 @@ detection_filter:
   max_aspect_h_over_w: 5.8
   max_width_over_height: 1.05
   projection_inner_margin_uv: 0.0
+  # relaxed_* 값은 region.relaxed_presence_points/stair_catch_points 안에서만 적용된다.
+  # 계단 착석자처럼 bbox가 가로로 넓거나 짧게 잡히는 경우를 살리기 위한 별도 기준이다.
+  relaxed_min_confidence: 0.12
+  relaxed_min_bbox_height_px: 24
+  relaxed_min_bbox_area_px: 500
+  relaxed_min_aspect_h_over_w: 0.45
+  relaxed_max_aspect_h_over_w: 6.5
+  relaxed_max_width_over_height: 2.4
   confirm_hits: 3
   confirm_window_s: 0.8
 
@@ -95,4 +106,19 @@ cameras:
   #       image_points: [[150, 140], [770, 130], [790, 470], [130, 460]]
   #       projection_uv: [0.45, 0.0, 1.0, 1.0]
   #       dispatch_uv: [0.50, 0.0, 1.0, 1.0]
+  #       # 선택 사항: 사람 몸통/bbox가 이 polygon과 겹치면 foot point가
+  #       # 바닥 region 경계 밖으로 살짝 빠져도 projection rect로 clamp하여 살린다.
+  #       # OSC 위치 계산은 여전히 image_points homography를 사용하고,
+  #       # bbox 크기/비율 필터와 confirm window는 그대로 적용된다.
+  #       body_catch_points: [[130, 90], [820, 90], [820, 210], [130, 210]]
+  #       body_catch_margin_uv: 0.35
+  #       body_catch_min_confidence: 0.12
+  #       # 계단/착석자 전용 완화 polygon. viewer에서는 s 키로 기존 floor region 위에
+  #       # 따로 그릴 수 있다. 이 polygon은 UV 변환용이 아니라 relaxed detection mask다.
+  #       relaxed_presence_points: [[150, 120], [780, 120], [760, 260], [160, 260]]
+  #       relaxed_presence_margin_uv: 0.10
+  #       relaxed_presence_min_confidence: 0.12
+  #       # 선택 사항: 계단/착석자 actor는 floor homography v 대신 이 projection v를 사용한다.
+  #       relaxed_presence_v: 0.35
+  #       # 같은 의미의 호환 alias: stair_catch_points
   #       min_bbox_height_px: 24
