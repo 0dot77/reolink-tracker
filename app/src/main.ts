@@ -143,6 +143,7 @@ const state: {
   calibrationRegionId: string;
   calibrationFrame: CalibrationFrame | null;
   calibrationPoints: number[][];
+  calibrationDraftActive: boolean;
   busy: string | null;
   error: string | null;
   saved: boolean;
@@ -161,6 +162,7 @@ const state: {
   calibrationRegionId: "",
   calibrationFrame: null,
   calibrationPoints: [],
+  calibrationDraftActive: false,
   busy: null,
   error: null,
   saved: true,
@@ -339,12 +341,14 @@ function render(): void {
     state.calibrationRegionId = firstRegionIdForCamera(calibrationCamera.value);
     state.calibrationFrame = null;
     state.calibrationPoints = [];
+    state.calibrationDraftActive = false;
     render();
   });
   const calibrationRegion = root.querySelector<HTMLSelectElement>("#calibrationRegion");
   calibrationRegion?.addEventListener("change", () => {
     state.calibrationRegionId = calibrationRegion.value;
     state.calibrationPoints = [];
+    state.calibrationDraftActive = false;
     render();
   });
   const calibrationFrame = root.querySelector<HTMLElement>("#calibrationFrame");
@@ -355,9 +359,8 @@ function render(): void {
     const rect = calibrationFrame.getBoundingClientRect();
     const x = ((event.clientX - rect.left) / rect.width) * state.calibrationFrame.width;
     const y = ((event.clientY - rect.top) / rect.height) * state.calibrationFrame.height;
-    const next = state.calibrationPoints.length >= 4 ? [] : [...state.calibrationPoints];
-    next.push([Math.round(x), Math.round(y)]);
-    state.calibrationPoints = next;
+    state.calibrationPoints = nextCalibrationPoints([Math.round(x), Math.round(y)]);
+    state.calibrationDraftActive = true;
     render();
   });
 }
@@ -512,7 +515,7 @@ function calibrationSection(): string {
     state.calibrationRegionId = firstRegionIdForCamera(state.calibrationCamera);
     selectedRegion = regions.find((region) => region.id === state.calibrationRegionId);
   }
-  const points = state.calibrationPoints.length ? state.calibrationPoints : selectedRegion?.image_points ?? [];
+  const points = state.calibrationDraftActive ? state.calibrationPoints : selectedRegion?.image_points ?? [];
   const frame = state.calibrationFrame;
   const frameSrc = frame && hasTauriRuntime ? convertFileSrc(frame.path) : "";
   const frameStyle = frame
@@ -928,6 +931,10 @@ function calibrationRegionsForCamera(camera: string): RegionInfo[] {
   return (state.projection?.regions ?? []).filter((region) => region.camera === camera);
 }
 
+function selectedCalibrationRegion(): RegionInfo | undefined {
+  return calibrationRegionsForCamera(state.calibrationCamera).find((region) => region.id === state.calibrationRegionId);
+}
+
 function firstRegionIdForCamera(camera: string): string {
   return calibrationRegionsForCamera(camera)[0]?.id ?? defaultCalibrationRegionId(camera);
 }
@@ -951,6 +958,38 @@ function calibrationPointMarkers(points: number[][], frame: CalibrationFrame): s
     const top = clamp01(Number(point[1]) / Math.max(1, frame.height)) * 100;
     return `<span class="calib-point" style="left:${left}%;top:${top}%">${index + 1}</span>`;
   });
+}
+
+function currentCalibrationPoints(): number[][] {
+  const source = state.calibrationDraftActive
+    ? state.calibrationPoints
+    : selectedCalibrationRegion()?.image_points ?? [];
+  return source.slice(0, 4).map((point) => [Math.round(Number(point[0]) || 0), Math.round(Number(point[1]) || 0)]);
+}
+
+function nextCalibrationPoints(clickedPoint: number[]): number[][] {
+  const current = currentCalibrationPoints();
+  if (current.length >= 4) {
+    const next = current.map((point) => [...point]);
+    next[nearestCalibrationPointIndex(next, clickedPoint)] = clickedPoint;
+    return next;
+  }
+  return [...current, clickedPoint];
+}
+
+function nearestCalibrationPointIndex(points: number[][], target: number[]): number {
+  let nearestIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  points.forEach((point, index) => {
+    const dx = Number(point[0]) - Number(target[0]);
+    const dy = Number(point[1]) - Number(target[1]);
+    const distance = dx * dx + dy * dy;
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  });
+  return nearestIndex;
 }
 
 function formatImagePoints(points: number[][]): string {
@@ -1355,6 +1394,7 @@ async function handleAction(action: string): Promise<void> {
       });
       state.calibrationCamera = state.calibrationFrame.camera;
       state.calibrationPoints = [];
+      state.calibrationDraftActive = false;
     } else if (action === "save-calibration-points") {
       await invoke("save_calibration_points", {
         request: {
@@ -1366,8 +1406,10 @@ async function handleAction(action: string): Promise<void> {
       state.saved = true;
       await refreshConfig();
       await refreshProjection();
+      state.calibrationDraftActive = false;
     } else if (action === "clear-calibration-points") {
       state.calibrationPoints = [];
+      state.calibrationDraftActive = true;
     } else if (action === "stop") {
       state.process = await invoke<ProcessStatus>("stop_tracker");
     } else if (action === "network") {
