@@ -25,6 +25,10 @@
   1프레임 오검출이 actor로 승격되는 것을 줄이는 레이어입니다.
 - `fusion.position_alpha`는 fused person 좌표를 EMA로 부드럽게 합니다. OSC schema는
   유지하고 `(u, v)` 값만 완만하게 움직입니다.
+- `fusion.max_update_jump_uv`가 0보다 크면 같은 `gid`의 다음 관측점이 지정 UV 거리보다
+  멀리 튀는 경우 순간이동으로 보고 기존 gid를 lost 처리한 뒤 새 gid로 분리합니다.
+  바닥 인터랙션에서 OSC actor가 프로젝션 면을 갑자기 가로지르는 것을 막기 위한
+  안전장치입니다.
 - 같은 projection을 공유하는 카메라들의 `dispatch_uv` slice는 겹치지 않아야 합니다. 겹치면 count가 부풀 수 있습니다.
 - cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 중앙 hand-off나 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
 - `fusion.hold_boundary_margin_uv`가 0보다 크면 held gid는 projection 가장자리 근처에서만 active로 남습니다. 중앙에서 track을 놓친 경우에는 ghost actor가 남지 않도록 즉시 `/lost` 처리합니다.

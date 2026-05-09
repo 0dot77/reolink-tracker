@@ -944,6 +944,7 @@ def main() -> int:
             velocity_alpha=float(fusion_cfg.get("velocity_alpha", 0.3)),
             position_alpha=float(fusion_cfg.get("position_alpha", 0.45)),
             hold_boundary_margin_uv=float(fusion_cfg.get("hold_boundary_margin_uv", 0.08)),
+            max_update_jump_uv=float(fusion_cfg.get("max_update_jump_uv", 0.0)),
             reuse_lost_gids=bool(fusion_cfg.get("reuse_lost_gids", True)),
         )
         zone_tracker = InteractionZoneTracker()
@@ -953,6 +954,7 @@ def main() -> int:
             f"velocity_alpha={person_tracker.velocity_alpha} "
             f"position_alpha={person_tracker.position_alpha} "
             f"hold_boundary_margin_uv={person_tracker.hold_boundary_margin_uv} "
+            f"max_update_jump_uv={person_tracker.max_update_jump_uv} "
             f"reuse_lost_gids={person_tracker.reuse_lost_gids} "
             f"miss_buffer_frames={miss_buffer_frames}"
         )

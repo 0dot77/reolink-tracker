@@ -325,6 +325,7 @@ class PersonTracker:
         velocity_max_dt_s: float = 1.0,
         velocity_predict_max_dt_s: float = 1.0,
         hold_boundary_margin_uv: float = 0.0,
+        max_update_jump_uv: float = 0.0,
         reuse_lost_gids: bool = True,
     ):
         self.hand_off_window_s = hand_off_window_s
@@ -341,6 +342,10 @@ class PersonTracker:
         # the projection edge. Interior misses become immediate lost events so
         # downstream visuals do not show a ghost in the middle of the floor.
         self.hold_boundary_margin_uv = max(0.0, min(float(hold_boundary_margin_uv), 0.5))
+        # Optional teleport guard. When enabled, a fresh observation that would
+        # move an existing gid farther than this UV distance is treated as a
+        # new person instead of dragging the OSC actor across the floor.
+        self.max_update_jump_uv = max(0.0, float(max_update_jump_uv))
         # Reuse gids only after they are terminally lost. This keeps OSC
         # address/key cardinality bounded by peak concurrent occupancy instead
         # of total historical visitors.
@@ -354,8 +359,10 @@ class PersonTracker:
         self._source_to_gid: dict[tuple[str, int], int] = {}
         self._pending: dict[int, _Pending] = {}
         self._just_lost: list[LostPerson] = []  # drained by `drain_lost_gids()`
+        self._release_after_update: list[int] = []
         self.handoff_count = 0
         self.lost_count = 0
+        self.teleport_reject_count = 0
 
     def update(
         self,
@@ -405,8 +412,12 @@ class PersonTracker:
                 new_events.append(ev)
                 continue
             if ev.dispatching:
-                self._update_person(gid, ev, now)
-                fresh.add(gid)
+                if self._can_update_person(gid, ev):
+                    self._update_person(gid, ev, now)
+                    fresh.add(gid)
+                else:
+                    self._retire_person(gid)
+                    new_events.append(ev)
             else:
                 self._hold_person(gid, ev, now)
 
@@ -455,6 +466,8 @@ class PersonTracker:
                 )
                 self._release_gid(gid)
             self.lost_count += 1
+
+        self._release_deferred_gids()
 
         active = list(self._persons.values())
         active.extend(p.person for p in self._pending.values())
@@ -523,6 +536,8 @@ class PersonTracker:
                 continue
             if p.person.projection_id != ev.projection_id:
                 continue
+            if not self._allows_update_distance(p.person, ev):
+                continue
             dt = max(0.0, min(ev.t - p.lost_t, self.velocity_predict_max_dt_s))
             pu = p.person.u + p.person.vx * dt
             pv = p.person.v + p.person.vy * dt
@@ -549,6 +564,8 @@ class PersonTracker:
             if p.source == (ev.cam_name, ev.track_id):
                 continue
             if p.state == "fresh":
+                continue
+            if not self._allows_update_distance(p, ev):
                 continue
             du = ev.u - p.u
             dv = ev.v - p.v
@@ -583,6 +600,36 @@ class PersonTracker:
         )
         self._source_to_gid[src] = gid
         return gid
+
+    def _can_update_person(self, gid: int, ev: PersonEvent) -> bool:
+        p = self._persons.get(gid)
+        if p is None:
+            return False
+        return self._allows_update_distance(p, ev)
+
+    def _allows_update_distance(self, person: Person, ev: PersonEvent) -> bool:
+        limit = self.max_update_jump_uv
+        if limit <= 0.0:
+            return True
+        du = ev.u - person.u
+        dv = ev.v - person.v
+        return (du * du + dv * dv) ** 0.5 <= limit
+
+    def _retire_person(self, gid: int) -> None:
+        person = self._persons.pop(gid, None)
+        if person is None:
+            self._pending.pop(gid, None)
+            return
+        self._source_to_gid.pop(person.source, None)
+        self._just_lost.append(LostPerson(person.projection_id, gid))
+        self._release_after_update.append(gid)
+        self.lost_count += 1
+        self.teleport_reject_count += 1
+
+    def _release_deferred_gids(self) -> None:
+        for gid in self._release_after_update:
+            self._release_gid(gid)
+        self._release_after_update = []
 
     def _claim_gid(self) -> int:
         if self.reuse_lost_gids and self._free_gids:
@@ -1008,6 +1055,52 @@ if __name__ == "__main__":
         "(n) velocity uses raw observation delta, not smoothed delta",
         abs(p.u - 0.1) < 1e-6 and abs(p.vx - 0.2) < 1e-6,
         f"u={p.u}, vx={p.vx}",
+    )
+
+    # (n2) Teleport guard: a same-source observation that jumps far across the
+    # projection should not drag the old gid through OSC. It emits lost for the
+    # old gid and spawns a new gid for the far-away observation.
+    pt = PersonTracker(max_update_jump_uv=0.10)
+    pt.update([PersonEvent("corridor", "cam0", 1, 0.20, 0.50, 0.9, 0.0)], [], 0.0)
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 1, 0.80, 0.50, 0.9, 0.05)],
+        [],
+        0.05,
+    )
+    lost = pt.drain_lost_gids()
+    _check(
+        "(n2) same-source teleport is split into a new gid",
+        {p.gid for p in persons} == {2}
+        and lost == [LostPerson("corridor", 1)]
+        and pt.teleport_reject_count == 1,
+        f"persons={[p.gid for p in persons]}, lost={lost}, rejects={pt.teleport_reject_count}",
+    )
+
+    # (n3) Pending velocity prediction may match a far-away point, but the
+    # teleport guard still protects the displayed actor from a long jump.
+    pt = PersonTracker(
+        hand_off_window_s=2.5,
+        match_uv_radius=0.05,
+        velocity_predict_max_dt_s=1.0,
+        max_update_jump_uv=0.10,
+    )
+    t = 0.0
+    u = 0.20
+    for _ in range(10):
+        pt.update([PersonEvent("corridor", "cam0", 5, u, 0.50, 0.9, t)], [], t)
+        t += 0.05
+        u += 0.015
+    pt.update([], [("cam0", 5)], t)
+    t += 1.0
+    persons = pt.update(
+        [PersonEvent("corridor", "cam1", 9, u + 0.30, 0.50, 0.85, t)],
+        [],
+        t,
+    )
+    _check(
+        "(n3) pending predicted teleport is not stitched when guarded",
+        2 in {p.gid for p in persons} and pt.handoff_count == 0,
+        f"persons={[p.gid for p in persons]}, handoffs={pt.handoff_count}",
     )
 
     zone = SimpleNamespace(
