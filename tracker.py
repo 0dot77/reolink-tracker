@@ -892,6 +892,7 @@ def main() -> int:
             match_uv_radius=float(fusion_cfg.get("match_uv_radius", 0.05)),
             velocity_alpha=float(fusion_cfg.get("velocity_alpha", 0.3)),
             position_alpha=float(fusion_cfg.get("position_alpha", 0.45)),
+            hold_boundary_margin_uv=float(fusion_cfg.get("hold_boundary_margin_uv", 0.08)),
         )
         zone_tracker = InteractionZoneTracker()
         print(
@@ -899,6 +900,7 @@ def main() -> int:
             f"match_uv_radius={person_tracker.match_uv_radius} "
             f"velocity_alpha={person_tracker.velocity_alpha} "
             f"position_alpha={person_tracker.position_alpha} "
+            f"hold_boundary_margin_uv={person_tracker.hold_boundary_margin_uv} "
             f"miss_buffer_frames={miss_buffer_frames}"
         )
     else:

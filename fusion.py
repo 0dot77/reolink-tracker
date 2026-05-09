@@ -323,6 +323,7 @@ class PersonTracker:
         position_alpha: float = 1.0,
         velocity_max_dt_s: float = 1.0,
         velocity_predict_max_dt_s: float = 1.0,
+        hold_boundary_margin_uv: float = 0.0,
     ):
         self.hand_off_window_s = hand_off_window_s
         self.match_uv_radius = match_uv_radius
@@ -334,6 +335,10 @@ class PersonTracker:
         # freezes at the last seen UV — the longer the gap, the less we trust
         # the stored velocity, so we fall back to "match where we last saw it".
         self.velocity_predict_max_dt_s = velocity_predict_max_dt_s
+        # When > 0, disappeared sources are only exposed as held persons near
+        # the projection edge. Interior misses become immediate lost events so
+        # downstream visuals do not show a ghost in the middle of the floor.
+        self.hold_boundary_margin_uv = max(0.0, min(float(hold_boundary_margin_uv), 0.5))
 
         self._next_gid = 1
         self._persons: dict[int, Person] = {}
@@ -372,6 +377,10 @@ class PersonTracker:
             if person is None:
                 continue
             person.state = "held"
+            if not self._allows_held(person):
+                self._just_lost.append(LostPerson(person.projection_id, gid))
+                self.lost_count += 1
+                continue
             self._pending[gid] = _Pending(person=person, lost_t=now)
 
         fresh: set[int] = set()
@@ -473,6 +482,17 @@ class PersonTracker:
         out = self._just_lost
         self._just_lost = []
         return out
+
+    def _allows_held(self, person: Person) -> bool:
+        margin = self.hold_boundary_margin_uv
+        if margin <= 0.0:
+            return True
+        return (
+            person.u <= margin
+            or person.u >= 1.0 - margin
+            or person.v <= margin
+            or person.v >= 1.0 - margin
+        )
 
     def _best_pending_match(
         self,
@@ -1018,6 +1038,30 @@ if __name__ == "__main__":
         and len(zu2.transitions) == 1
         and zu2.transitions[0].reason_code == InteractionZoneTracker.REASON_STALE,
         f"presence={held_presence}, update2={zu2}",
+    )
+
+    # (s) Edge-gated hold: a vanished interior person should disappear
+    # immediately instead of lingering as a held ghost in the middle.
+    pt = PersonTracker(hand_off_window_s=1.0, hold_boundary_margin_uv=0.1)
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.50, 0.50, 0.9, 0.0)], [], 0.0)
+    persons = pt.update([], [("cam0", 5)], 0.1)
+    lost = pt.drain_lost_gids()
+    _check(
+        "(s) interior miss emits lost immediately when hold is edge-gated",
+        persons == [] and lost == [LostPerson("corridor", 1)],
+        f"persons={persons}, lost={lost}",
+    )
+
+    # (t) The same edge gate still allows held state near projection edges,
+    # which is where walk-in/out and boundary hand-off smoothing is useful.
+    pt = PersonTracker(hand_off_window_s=1.0, hold_boundary_margin_uv=0.1)
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.04, 0.50, 0.9, 0.0)], [], 0.0)
+    persons = pt.update([], [("cam0", 5)], 0.1)
+    lost = pt.drain_lost_gids()
+    _check(
+        "(t) edge miss remains held inside hand-off window",
+        len(persons) == 1 and persons[0].state == "held" and lost == [],
+        f"persons={persons}, lost={lost}",
     )
 
     sys.exit(1 if failed else 0)

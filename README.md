@@ -117,6 +117,8 @@ projections:
 
 `zone_u`, `zone_v`는 zone rectangle 안의 0..1 local 좌표입니다. `state_code`는 `1=fresh`, `0=held`이며, held 상태에서는 `presence`가 `release_after_s` 동안 1에서 0으로 감소한 뒤 stale leave가 한 번 나갑니다. `reason_code`는 `1=exited`, `2=stale`, `3=zone_removed`입니다.
 
+`fusion.hold_boundary_margin_uv`가 0보다 크면 tracking을 놓친 gid는 projection 가장자리 근처에서만 `held`로 유지됩니다. 예시값 `0.08`은 UV 가장자리 8% 안쪽에서만 held를 허용하고, 영역 중앙에서 놓친 gid는 바로 `/lost` 처리해 화면 한가운데 ghost actor가 남지 않게 합니다.
+
 ### Detection filter / actor confirmation
 
 `detection_filter`는 YOLO raw person box가 곧바로 actor가 되는 것을 막는 후처리입니다.
