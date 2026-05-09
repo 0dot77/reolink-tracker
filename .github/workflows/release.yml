@@ -13,8 +13,8 @@ concurrency:
 
 jobs:
   github-release:
-    name: GitHub release
-    runs-on: ubuntu-latest
+    name: GitHub release with macOS app
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,6 +28,32 @@ jobs:
         id: release
         run: python .github/scripts/auto_release.py
 
+      - uses: actions/setup-node@v4
+        if: steps.release.outputs.should_release == 'true'
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install app dependencies
+        if: steps.release.outputs.should_release == 'true'
+        working-directory: app
+        run: npm ci
+
+      - name: Build macOS app
+        if: steps.release.outputs.should_release == 'true'
+        working-directory: app
+        run: npm run tauri:build
+
+      - name: Package macOS app
+        if: steps.release.outputs.should_release == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "app/src-tauri/target/release/bundle/macos/Reolink Tracker.app" \
+            "Reolink-Tracker-${TAG}-macos.zip"
+
       - name: Create GitHub release
         if: steps.release.outputs.should_release == 'true'
         env:
@@ -38,12 +64,13 @@ jobs:
           gh release create "$TAG" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
-            --notes-file "$NOTES_PATH"
+            --notes-file "$NOTES_PATH" \
+            "Reolink-Tracker-${TAG}-macos.zip"
 
       - name: Summary
         run: |
           if [ "${{ steps.release.outputs.should_release }}" = "true" ]; then
-            echo "Created ${{ steps.release.outputs.tag }} (${{ steps.release.outputs.bump }})"
+            echo "Created ${{ steps.release.outputs.tag }} (${{ steps.release.outputs.bump }}) with macOS app asset"
           else
             echo "No release needed"
           fi
