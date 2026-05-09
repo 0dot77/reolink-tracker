@@ -5,7 +5,11 @@ Usage:
     python tracker.py --show         # operator viewer (cv2 window)
     python tracker.py --config foo.yaml
 
-Person-keyed OSC schema (primary, when osc.person_level: true):
+TouchDesigner minimal OSC schema (default, when osc.td_minimal: true):
+    /proj/<projection_id>/active                [gid, gid, ...]
+    /proj/<projection_id>/xy                    [gid, x, y, gid, x, y, ...]
+
+Person-keyed debug OSC schema (when osc.td_minimal: false and osc.person_level: true):
     /proj/<projection_id>/person/<gid>          [u, v, vx, vy, conf, (u_px, v_px)?]
     /proj/<projection_id>/person/<gid>/lost     []
     /proj/<projection_id>/persons               [gid, gid, ...]
@@ -32,6 +36,7 @@ Legacy image-space schema (when osc.legacy_image_space: true):
 """
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -89,6 +94,11 @@ def _network_target_from_camera(cam: "CamCfg") -> Optional[tuple[str, str, int, 
     if not parts.hostname:
         return None
     return (cam.name, parts.hostname, int(parts.port or 554), "rtsp")
+
+
+def _is_local_video_source(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme.lower() == "file" or not parts.scheme
 
 
 def _network_target_from_osc(osc_cfg: dict) -> Optional[tuple[str, str, int, str]]:
@@ -159,15 +169,23 @@ class FrameGrabber(threading.Thread):
                 self.reconnects += 1
             first = False
             print(f"[{self.cam.name}] connected: {_redact_url(self.cam.url)}")
+            is_file_source = _is_local_video_source(self.cam.url)
+            source_fps = cap.get(cv2.CAP_PROP_FPS) if is_file_source else 0.0
+            frame_interval = 1.0 / source_fps if source_fps and source_fps > 0 else 0.0
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok:
+                    if is_file_source:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
                     print(f"[{self.cam.name}] read failed; reconnecting")
                     break
                 with self._lock:
                     self._latest = frame
                     self._idx += 1
                     self._ts = time.time()
+                if frame_interval:
+                    self._stop.wait(frame_interval)
             cap.release()
 
     def get(self) -> tuple[Optional[np.ndarray], int, float]:
@@ -528,7 +546,7 @@ def _require_field(entry: dict, key: str, label: str) -> object:
 
 def _validate_camera_url(url: object, label: str) -> str:
     if not isinstance(url, str) or not url.strip():
-        raise ConfigError(f"{label}.url must be a non-empty RTSP URL")
+        raise ConfigError(f"{label}.url must be a non-empty RTSP URL or local video path")
     if "<" in url or ">" in url:
         raise ConfigError(
             f"{label}.url still contains placeholder values. Copy "
@@ -536,9 +554,21 @@ def _validate_camera_url(url: object, label: str) -> str:
             "<urlencoded-password> with the real Reolink RTSP URL."
         )
     parts = urlsplit(url)
+    if parts.scheme.lower() == "rtsp" and parts.netloc:
+        return url
+    if parts.scheme.lower() == "file":
+        path = Path(parts.path)
+        if path.exists():
+            return str(path)
+        raise ConfigError(f"{label}.url video file does not exist: {path}")
+    if not parts.scheme:
+        path = Path(url).expanduser()
+        if path.exists():
+            return str(path)
+        raise ConfigError(f"{label}.url video file does not exist: {path}")
     if parts.scheme.lower() != "rtsp" or not parts.netloc:
         raise ConfigError(
-            f"{label}.url must be an rtsp:// URL, got {_redact_url(url)}"
+            f"{label}.url must be an rtsp:// URL or local video path, got {_redact_url(url)}"
         )
     return url
 
@@ -778,20 +808,39 @@ def _emit_person_osc(
     projections: dict[str, Projection],
     persons: list,
     lost_gids: list[LostPerson],
+    td_minimal: bool,
 ) -> int:
     """Send person-keyed OSC for the current frame.
 
-    Each active person emits `/proj/<pid>/person/<gid>` with `[u, v, vx, vy,
-    conf]` (and `[u_px, v_px]` appended when the projection has `pixel_size`).
-    Each projection emits `/persons` (active gid list) and `/persons/count`
-    every frame so TouchDesigner sees a heartbeat. Lost gids each get one
-    terminal `/lost` message.
+    In the default TouchDesigner-minimal mode, each projection emits only
+    `/active` and `/xy`. `/xy` is packed as gid/x/y triples so TD can build one
+    instancing table without dynamic per-person addresses. x/y are projection
+    video pixels when `pixel_size` is configured; otherwise they fall back to
+    normalized UV.
+
+    In debug mode, the older richer person/lost/count addresses are emitted.
     Returns the number of OSC messages sent.
     """
     sent = 0
     by_proj: dict[str, list] = {pid: [] for pid in projections}
     for p in persons:
         by_proj.setdefault(p.projection_id, []).append(p)
+    if td_minimal:
+        for pid, plist in by_proj.items():
+            proj = projections.get(pid)
+            gids = sorted(p.gid for p in plist)
+            xy_args = []
+            for p in sorted(plist, key=lambda person: person.gid):
+                if proj is not None and proj.pixel_size is not None:
+                    pw, ph = proj.pixel_size
+                    x, y = p.u * pw, p.v * ph
+                else:
+                    x, y = p.u, p.v
+                xy_args.extend([p.gid, x, y])
+            osc.send_message(f"/proj/{pid}/active", gids)
+            osc.send_message(f"/proj/{pid}/xy", xy_args)
+            sent += 2
+        return sent
     for lost in lost_gids:
         osc.send_message(f"/proj/{lost.projection_id}/person/{lost.gid}/lost", [])
         sent += 1
@@ -870,13 +919,15 @@ def main() -> int:
     osc_cfg = cfg.get("osc", {}) or {}
     osc = SimpleUDPClient(osc_cfg.get("host", "127.0.0.1"), int(osc_cfg.get("port", 7000)))
     legacy_image_space = bool(osc_cfg.get("legacy_image_space", False))
+    td_minimal = bool(osc_cfg.get("td_minimal", True))
     person_level = bool(osc_cfg.get("person_level", True))
-    raw_per_cam = bool(osc_cfg.get("raw_per_cam", True))
-    zone_level = bool(osc_cfg.get("zone_level", True))
+    raw_per_cam = bool(osc_cfg.get("raw_per_cam", not td_minimal)) and not td_minimal
+    zone_level = bool(osc_cfg.get("zone_level", not td_minimal)) and not td_minimal
     heartbeat_interval_s = max(float(osc_cfg.get("heartbeat_interval_s", 0.1)), 0.02)
     print(
         f"OSC -> {osc_cfg.get('host', '127.0.0.1')}:{osc_cfg.get('port', 7000)} "
-        f"(person_level={person_level} raw_per_cam={raw_per_cam} "
+        f"(td_minimal={td_minimal} "
+        f"person_level={person_level} raw_per_cam={raw_per_cam} "
         f"zone_level={zone_level} "
         f"legacy_image_space={legacy_image_space})"
     )
@@ -1050,7 +1101,9 @@ def main() -> int:
                     persons = person_tracker.update([], [], now_mono)
                     last_fused_persons = persons
                     lost_gids = person_tracker.drain_lost_gids()
-                emitted = _emit_person_osc(osc, projections, persons, lost_gids)
+                emitted = _emit_person_osc(
+                    osc, projections, persons, lost_gids, td_minimal
+                )
                 if zone_level and zone_tracker is not None:
                     emitted += _emit_zone_osc(
                         osc,
@@ -1124,15 +1177,83 @@ def main() -> int:
             if now - last_fps >= 2.0:
                 dt = now - last_fps
                 parts = []
+                camera_status = []
                 for w in workers:
                     f = w.fps_count / dt
                     o = w.osc_count / dt
                     last_fps_per_cam[w.cam.name] = f
                     last_osc_per_cam[w.cam.name] = o
                     parts.append(f"{w.cam.name}={f:.1f}fps osc={o:.0f}/s")
+                    frame_age = (
+                        now - last_frame_ts[w.cam.name]
+                        if last_frame_ts[w.cam.name] else None
+                    )
+                    camera_status.append(
+                        {
+                            "name": w.cam.name,
+                            "fps": f,
+                            "osc_rate": o,
+                            "reconnects": next(
+                                (
+                                    grab.reconnects
+                                    for grab in grabbers
+                                    if grab.cam.name == w.cam.name
+                                ),
+                                0,
+                            ),
+                            "frame_age_s": frame_age,
+                        }
+                    )
                     w.fps_count = 0
                     w.osc_count = 0
+                projection_status = []
+                for pid, projection in projections.items():
+                    plist = [
+                        p
+                        for p in last_fused_persons
+                        if p.projection_id == pid
+                    ]
+                    active = sorted(p.gid for p in plist)
+                    persons_payload = []
+                    xy_payload = []
+                    for p in sorted(plist, key=lambda person: person.gid):
+                        if projection.pixel_size is not None:
+                            pw, ph = projection.pixel_size
+                            x, y = p.u * pw, p.v * ph
+                        else:
+                            x, y = p.u, p.v
+                        xy_payload.extend([p.gid, x, y])
+                        persons_payload.append(
+                            {
+                                "gid": p.gid,
+                                "x": x,
+                                "y": y,
+                                "u": p.u,
+                                "v": p.v,
+                                "state": p.state,
+                                "source": p.source,
+                            }
+                        )
+                    projection_status.append(
+                        {
+                            "id": pid,
+                            "active": active,
+                            "xy": xy_payload,
+                            "persons": persons_payload,
+                        }
+                    )
                 print("  ".join(parts))
+                print(
+                    json.dumps(
+                        {
+                            "event": "fps_tick",
+                            "ts": time.time(),
+                            "cameras": camera_status,
+                            "projections": projection_status,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
                 last_fps = now
     finally:
         for g in grabbers:
