@@ -12,6 +12,7 @@ config.yaml
 .omc/
 .claude/
 .playwright-mcp/
+release-notes.md
 
 # Tauri field launcher app artifacts
 app/node_modules/

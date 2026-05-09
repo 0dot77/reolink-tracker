@@ -15,4 +15,22 @@ jobs:
         with:
           python-version: "3.12"
       - name: Python 파일 컴파일
-        run: python -m py_compile tracker.py region.py viewer.py
+        run: python -m py_compile tracker.py region.py viewer.py fusion.py
+      - name: Fusion self-test
+        run: python fusion.py
+
+  app-frontend:
+    name: App frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm run build
