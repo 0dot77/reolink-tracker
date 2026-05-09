@@ -507,10 +507,11 @@ function calibrationSection(): string {
     state.calibrationCamera = cameras[0] ?? "cam0";
   }
   const regions = calibrationRegionsForCamera(state.calibrationCamera);
-  if (!state.calibrationRegionId) {
-    state.calibrationRegionId = regions[0]?.id ?? "app_calibration";
+  let selectedRegion = regions.find((region) => region.id === state.calibrationRegionId);
+  if (!state.calibrationRegionId || !selectedRegion) {
+    state.calibrationRegionId = firstRegionIdForCamera(state.calibrationCamera);
+    selectedRegion = regions.find((region) => region.id === state.calibrationRegionId);
   }
-  const selectedRegion = regions.find((region) => region.id === state.calibrationRegionId);
   const points = state.calibrationPoints.length ? state.calibrationPoints : selectedRegion?.image_points ?? [];
   const frame = state.calibrationFrame;
   const frameSrc = frame && hasTauriRuntime ? convertFileSrc(frame.path) : "";
@@ -530,7 +531,7 @@ function calibrationSection(): string {
         </div>
         <div class="calib-toolbar">
           <label>Camera ${selectHtml("calibrationCamera", cameras, state.calibrationCamera)}</label>
-          <label>Region ${selectHtml("calibrationRegion", regions.map((region) => region.id), state.calibrationRegionId || "app_calibration")}</label>
+          <label>Region ${selectHtml("calibrationRegion", regions.map((region) => region.id), state.calibrationRegionId)}</label>
           <button class="btn" data-action="clear-calibration-points" ${buttonDisabled(!points.length)}>Clear points</button>
           <button class="btn primary" data-action="save-calibration-points" ${buttonDisabled(state.calibrationPoints.length !== 4)}>Save 4 points</button>
         </div>
@@ -548,7 +549,7 @@ function calibrationSection(): string {
           </div>
           <div class="kv">
             <div class="row"><span class="k">camera</span><span class="v">${escapeHtml(state.calibrationCamera)}</span></div>
-            <div class="row"><span class="k">region</span><span class="v">${escapeHtml(state.calibrationRegionId || "app_calibration")}</span></div>
+            <div class="row"><span class="k">region</span><span class="v">${escapeHtml(state.calibrationRegionId)}</span></div>
             <div class="row"><span class="k">points</span><span class="v">${escapeHtml(formatImagePoints(points))}</span></div>
             <div class="row"><span class="k">projection uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.projection_uv ?? []))}</span></div>
             <div class="row"><span class="k">dispatch uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.dispatch_uv ?? []))}</span></div>
@@ -928,11 +929,16 @@ function calibrationRegionsForCamera(camera: string): RegionInfo[] {
 }
 
 function firstRegionIdForCamera(camera: string): string {
-  return calibrationRegionsForCamera(camera)[0]?.id ?? "app_calibration";
+  return calibrationRegionsForCamera(camera)[0]?.id ?? defaultCalibrationRegionId(camera);
+}
+
+function defaultCalibrationRegionId(camera: string): string {
+  const name = camera.trim() || "camera";
+  return `${name}_region_1`;
 }
 
 function selectHtml(id: string, options: string[], selected: string): string {
-  const normalized = options.length ? options : [selected || "app_calibration"];
+  const normalized = options.length ? options : [selected];
   const withSelected = normalized.includes(selected) ? normalized : [selected, ...normalized].filter(Boolean);
   return `<select id="${escapeAttr(id)}">${withSelected
     .map((option) => `<option value="${escapeAttr(option)}" ${option === selected ? "selected" : ""}>${escapeHtml(option)}</option>`)
@@ -1353,7 +1359,7 @@ async function handleAction(action: string): Promise<void> {
       await invoke("save_calibration_points", {
         request: {
           cameraName: state.calibrationCamera,
-          regionId: state.calibrationRegionId || "app_calibration",
+          regionId: state.calibrationRegionId || defaultCalibrationRegionId(state.calibrationCamera),
           imagePoints: state.calibrationPoints,
         },
       });
