@@ -13,6 +13,7 @@
 - `viewer.py`: OpenCV operator preview와 projection UV canvas
 - `config.example.yaml`: 공유 가능한 설정 예시
 - `config.yaml`: 실제 카메라 URL이 들어가는 로컬 전용 런타임 설정
+- `app/`: macOS 현장 런처용 Tauri/Vite/Rust 하위 프로젝트
 
 ## 아키텍처 메모
 
@@ -32,12 +33,34 @@
 - `tracker.py --show`는 operator preview이면서 검증 dashboard입니다. fused gid, trail, velocity, held 상태, 카메라 health를 함께 확인합니다.
 - viewer는 `Tab`으로 `regions` / `lan` 페이지를 전환합니다. `lan` 페이지는 macOS의 `networksetup`, `route`, `ifconfig`, `arp` 출력만 읽어서 현재 Mac에 연결된 물리 LAN/IPv4 대역과 `config.yaml`의 RTSP target 라우팅을 보여주며 새 dependency를 요구하지 않습니다.
 
+## 현장 런처 앱
+
+`app/`은 Python tracker를 대체하지 않고 운영 UI와 runtime supervisor만 담당합니다.
+앱의 Setup은 repo root의 engine 파일(`tracker.py`, `fusion.py`, `region.py`, `viewer.py`,
+`requirements.txt`, `config.example.yaml`)을 macOS app data 아래 `runtime/engine/`으로 복사합니다.
+
+앱 runtime의 실제 설정은 저장소 root가 아니라 app data의 `runtime/config.yaml`에 둡니다.
+처음 Setup할 때 없으면 `runtime/engine/config.example.yaml`을 복사하고, 이후 Config 패널에서 읽고 저장합니다.
+tracker 실행 형태는 아래와 같습니다.
+
+```bash
+<app-data>/runtime/.venv/bin/python \
+  <app-data>/runtime/engine/tracker.py \
+  --config <app-data>/runtime/config.yaml
+```
+
+Show Preview는 같은 명령에 `--show`만 추가합니다. primary OSC schema와 기존 Python CLI 동작은 앱 통합과
+무관하게 유지해야 합니다.
+
+Setup은 재시도 가능한 작업이어야 합니다. engine 파일 복사, Python 3.12/venv 준비, `requirements.txt`
+설치, YOLO model warmup/download가 반복 실행되어도 기존 config를 덮어쓰지 않아야 합니다.
+
 ## 검증
 
 가벼운 확인:
 
 ```bash
-python -m py_compile tracker.py region.py viewer.py
+python -m py_compile tracker.py region.py viewer.py fusion.py
 ```
 
 실행 확인은 실제 카메라와 로컬 `config.yaml`이 필요합니다.
@@ -45,4 +68,12 @@ python -m py_compile tracker.py region.py viewer.py
 ```bash
 python tracker.py
 python tracker.py --show
+```
+
+앱 변경 확인:
+
+```bash
+cd app
+npm run build
+cargo check --manifest-path src-tauri/Cargo.toml
 ```

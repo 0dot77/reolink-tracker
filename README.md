@@ -37,6 +37,29 @@ python tracker.py --show
 
 카메라, 모델, OSC 대상은 `config.yaml`에서 수정합니다. 수정 후에는 프로그램을 다시 시작합니다.
 
+## 현장 런처 앱
+
+macOS 현장 점검용 Tauri 앱은 이 저장소의 `app/` 하위 프로젝트입니다. 앱은 Python tracker를
+대체하지 않고 setup, config 편집, start/stop, preview 실행, 로그 확인, 네트워크 점검 UI만 제공합니다.
+
+```bash
+cd app
+npm install
+npm run tauri:dev
+```
+
+앱의 Setup은 repo root의 engine 파일을 macOS app data runtime으로 복사하고, 그 runtime 안에서
+Python 3.12 venv와 dependencies, YOLO model을 준비합니다. 실제 카메라 credential이 들어가는
+`config.yaml`은 저장소 root가 아니라 app data의 `runtime/config.yaml`에 저장됩니다.
+
+앱이 tracker를 시작할 때의 기본 형태는 아래와 같습니다. Show Preview는 `--show`만 추가합니다.
+
+```bash
+<app-data>/runtime/.venv/bin/python \
+  <app-data>/runtime/engine/tracker.py \
+  --config <app-data>/runtime/config.yaml
+```
+
 `--show` 미리보기 키:
 
 - `q` 또는 `Esc`: 종료 (slice 편집 중에는 편집 모드만 빠져나옵니다)

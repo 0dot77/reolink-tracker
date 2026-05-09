@@ -21,3 +21,15 @@ fused person 좌표도 `fusion.position_alpha`로 EMA smoothing 하여 인터랙
 TouchDesigner 인스턴싱용 인터랙션 영역은 카메라 image region이 아니라 projection별 UV rectangle로 저장합니다.
 기존 카메라 `regions`는 calibration/dispatch용으로 유지하고, `projections[].interaction_zones`에서 zone-local 좌표, dwell, held presence를 별도 OSC stream으로 내보냅니다.
 기존 `/person/<gid>` payload 순서는 유지하며, 추가 zone 주소만 additive로 붙입니다.
+
+## 2026-05-09: 현장 런처 앱은 repo 내부 `app/` 하위 프로젝트로 둔다
+
+초기 Tauri 런처는 `/Users/taeyang/Developer/tools/reolink-tracker-app` sibling 프로젝트로 만들었지만,
+engine 파일과 운영 문맥이 갈라져서 현장 작업 중 어떤 tracker 버전을 앱이 복사하는지 확인하기 어려웠습니다.
+
+결정: Tauri/Vite/Rust 런처를 이 저장소의 `app/` 하위 프로젝트로 편입합니다. Python tracker는 계속 source of truth로 유지하고,
+앱은 repo root의 `tracker.py`, `fusion.py`, `region.py`, `viewer.py`, `requirements.txt`, `config.example.yaml`을
+macOS app data runtime으로 복사해 실행합니다.
+
+결과: 앱 소스와 tracker engine 변경을 같은 PR/diff에서 검토할 수 있습니다. 실제 `config.yaml`은 저장소가 아니라
+앱 data runtime에 유지하므로 RTSP credential과 현장 private IP는 여전히 git에 들어가지 않습니다.

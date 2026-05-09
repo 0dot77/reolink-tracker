@@ -11,6 +11,16 @@ config.yaml
 .omx/
 .omc/
 .claude/
+.playwright-mcp/
+
+# Tauri field launcher app artifacts
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+app/src-tauri/.tauri/
+app/.tauri/
+app/.vite/
 
 # Keep a sanitized config in git.
 !config.example.yaml

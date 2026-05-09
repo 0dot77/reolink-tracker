@@ -1,0 +1,21 @@
+[package]
+name = "reolink-tracker-app"
+version = "0.1.0"
+description = "Field operator app for Reolink tracker"
+authors = ["taeyang"]
+edition = "2021"
+
+[lib]
+name = "reolink_tracker_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tauri = { version = "2", features = [] }
+thiserror = "2"
