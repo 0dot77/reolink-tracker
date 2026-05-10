@@ -108,14 +108,19 @@ repo-local `config.yaml` 대신 앱에서 저장한 `runtime/config.yaml`을 우
 
 ### TouchDesigner minimal (권장, 기본 ON)
 
-운영용 기본값은 `osc.td_minimal: true`입니다. 동적 `/person/<gid>` 주소를 만들지 않고, projection마다 고정 주소 2개만 보냅니다.
+운영용 기본값은 `osc.td_minimal: true`입니다. projection마다 고정 주소를 보내고, `person_level: true`이면 per-person 디버그 주소도 함께 보냅니다.
 
 | 주소 | 인자 | 송신 시점 |
 |---|---|---|
 | `/proj/<projection_id>/active` | `[gid, ...]` | 활성 gid 목록, heartbeat마다 |
 | `/proj/<projection_id>/xy` | `[gid, x, y, gid, x, y, ...]` | 활성 person 위치, heartbeat마다 |
+| `/proj/<projection_id>/uv` | `[gid, u, v, gid, u, v, ...]` | 활성 person UV 위치, heartbeat마다 |
+| `/proj/<projection_id>/persons/count` | int | heartbeat마다 |
 
 `x/y`는 `projections[].pixel_size`가 있으면 projection pixel 좌표이고, 없으면 0..1 UV입니다.
+`u/v`는 항상 0..1 정규화 좌표입니다. TD 패치가 variable-length `/xy`를 전부 unpack하지
+못하거나 pixel/UV 단위가 헷갈릴 때는 `/uv` 또는 `person_level: true`의
+`/proj/<projection_id>/person/<gid>` 스트림으로 확인합니다.
 
 ### Person-keyed debug (`osc.td_minimal: false`)
 

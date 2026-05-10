@@ -88,6 +88,7 @@ type ProjectionRuntime = {
   id: string;
   active: number[];
   xy: number[];
+  uv: number[];
   persons: Array<{
     gid: number;
     x: number;
@@ -977,6 +978,7 @@ function calibrationSection(): string {
             <div class="row"><span class="k">dispatch uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.dispatch_uv ?? []))}</span></div>
             <div class="row"><span class="k">body catch</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.body_catch_points ?? []))}</span></div>
             <div class="row"><span class="k">stair mask</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.relaxed_presence_points ?? []))}</span></div>
+            <div class="row"><span class="k">stair margin/conf</span><span class="v">${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_margin_uv))} / ${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_min_confidence))}</span></div>
             <div class="row"><span class="k">stair fixed v</span><span class="v">${stairV == null ? "not set" : escapeHtml(formatUvNumber(stairV))}</span></div>
             <div class="row"><span class="k">save path</span><span class="v">${escapeHtml(shortPath(state.runtime?.config_path))}</span></div>
             <div class="row"><span class="k">frame</span><span class="v">${frame ? `${frame.width} x ${frame.height}` : "not captured"}</span></div>
@@ -1009,7 +1011,7 @@ function oscSection(): string {
     <section class="panel">
       <div class="panel-head"><h3>osc monitor requirements</h3><span class="sub">kept outside tracker runtime</span></div>
       <div class="panel-body future-grid">
-        ${statusTile("current stream", "active id list and packed projection x/y triples", "live")}
+        ${statusTile("current stream", "active id list plus packed projection xy/uv triples", "live")}
         ${statusTile("log export", "requires sidecar ring buffer, not tracker process memory", "sidecar")}
         ${statusTile("TD ack", "optional TouchDesigner reply handshake", "manual")}
       </div>
@@ -1814,6 +1816,9 @@ function projectionRuntimeItems(): ProjectionRuntime[] {
       xy: Array.isArray(projection.xy)
         ? projection.xy.map((value) => Number(value)).filter(Number.isFinite)
         : [],
+      uv: Array.isArray(projection.uv)
+        ? projection.uv.map((value) => Number(value)).filter(Number.isFinite)
+        : [],
       persons: Array.isArray(projection.persons)
         ? (projection.persons as Record<string, unknown>[]).map((person) => ({
             gid: Number(person.gid),
@@ -1832,12 +1837,13 @@ function projectionRuntimeItems(): ProjectionRuntime[] {
 function tdRuntimePanel(): string {
   const projections = projectionRuntimeItems();
   if (!projections.length) {
-    return `<p class="muted">No projection runtime payload yet. Start tracker to see /active and /xy state.</p>`;
+    return `<p class="muted">No projection runtime payload yet. Start tracker to see /active, /xy, and /uv state.</p>`;
   }
   return `<div class="td-runtime-list">${projections
     .map((projection) => {
       const active = projection.active.length ? projection.active.join(", ") : "-";
       const xyTriples = Math.floor(projection.xy.length / 3);
+      const uvTriples = Math.floor(projection.uv.length / 3);
       const rows = projection.persons.length
         ? projection.persons
             .slice(0, 8)
@@ -1853,6 +1859,7 @@ function tdRuntimePanel(): string {
         <div class="micro-row"><span>/proj/${escapeHtml(projection.id)}/active</span><b>${escapeHtml(active)}</b></div>
         <div class="micro-row"><span>/proj/${escapeHtml(projection.id)}/persons/count</span><b>${projection.active.length}</b></div>
         <div class="micro-row"><span>/proj/${escapeHtml(projection.id)}/xy</span><b>${xyTriples} triples / ${projection.xy.length} values</b></div>
+        <div class="micro-row"><span>/proj/${escapeHtml(projection.id)}/uv</span><b>${uvTriples} triples / ${projection.uv.length} values</b></div>
         ${rows}
       </div>`;
     })
@@ -1866,6 +1873,7 @@ function minimalAddressRows(): string {
     return [
       addressRate(`/proj/${pid}/active`, 0, "ids"),
       addressRate(`/proj/${pid}/xy`, 0, "xy"),
+      addressRate(`/proj/${pid}/uv`, 0, "uv"),
       addressRate(`/proj/${pid}/persons/count`, 0, "count"),
     ].join("");
   }
@@ -1875,6 +1883,7 @@ function minimalAddressRows(): string {
       return [
         addressRate(`/proj/${projection.id}/active`, rate / 3, "ids"),
         addressRate(`/proj/${projection.id}/xy`, rate / 3, "xy"),
+        addressRate(`/proj/${projection.id}/uv`, rate / 3, "uv"),
         addressRate(`/proj/${projection.id}/persons/count`, rate / 3, "count"),
       ].join("");
     })
@@ -1885,10 +1894,11 @@ function regionTile(region: RegionInfo, index: number): string {
   const rect = uvRect(region.dispatch_uv.length === 4 ? region.dispatch_uv : region.projection_uv);
   const camClass = cameraClassForName(region.camera, index);
   const hasRelaxed = Boolean(region.relaxed_presence_points?.length);
+  const relaxedMeta = `stair m ${formatOptionalNumber(region.relaxed_presence_margin_uv)}`;
   return `<div class="dispatch ${camClass} ${hasRelaxed ? "has-relaxed" : ""}" style="${rectStyle(rect)}">
     <span>${escapeHtml(region.camera)} · ${escapeHtml(region.id)}</span>
     <b>${formatUvRange(region.dispatch_uv)}</b>
-    ${hasRelaxed ? `<em>stair</em>` : ""}
+    ${hasRelaxed ? `<em>${escapeHtml(relaxedMeta)}</em>` : ""}
   </div>`;
 }
 
@@ -1905,7 +1915,7 @@ function projectionRegionRows(regions: RegionInfo[]): string {
     .map(
       (region) => `<div class="row">
         <span class="k">${escapeHtml(region.camera)} / ${escapeHtml(region.id)}</span>
-        <span class="v">${escapeHtml(region.projection_id)} · proj ${formatUvRange(region.projection_uv)} · dispatch ${formatUvRange(region.dispatch_uv)}${region.relaxed_presence_points?.length ? ` · stair ${region.relaxed_presence_points.length}pt conf ${formatOptionalNumber(region.relaxed_presence_min_confidence)}` : ""}</span>
+        <span class="v">${escapeHtml(region.projection_id)} · proj ${formatUvRange(region.projection_uv)} · dispatch ${formatUvRange(region.dispatch_uv)}${region.relaxed_presence_points?.length ? ` · stair ${region.relaxed_presence_points.length}pt margin ${formatOptionalNumber(region.relaxed_presence_margin_uv)} conf ${formatOptionalNumber(region.relaxed_presence_min_confidence)}` : ""}</span>
       </div>`,
     )
     .join("")}</div>`;
@@ -2462,26 +2472,26 @@ cameras:
           id: "cam0_region_1",
           projection_id: "corridor",
           image_points: [[120, 120], [740, 120], [780, 520], [90, 520]],
-          projection_uv: [0, 0, 0.55, 1],
-          dispatch_uv: [0, 0, 0.5, 1],
+          projection_uv: [0, 0.5, 0.44, 1],
+          dispatch_uv: [0, 0.5, 0.2, 1],
           min_bbox_height_px: 24,
           body_catch_points: [],
-          relaxed_presence_points: [[170, 110], [700, 110], [680, 230], [160, 240]],
-          relaxed_presence_margin_uv: 0.1,
-          relaxed_presence_min_confidence: 0.12,
-          relaxed_presence_v: 0.35,
+          relaxed_presence_points: [],
+          relaxed_presence_margin_uv: 0,
+          relaxed_presence_min_confidence: null,
+          relaxed_presence_v: null,
         },
         {
           camera: "cam2",
-          id: "cam2_center",
+          id: "center_band",
           projection_id: "corridor",
           image_points: [[180, 110], [1040, 120], [1080, 570], [150, 560]],
-          projection_uv: [0.32, 0, 0.68, 1],
-          dispatch_uv: [0.4, 0, 0.6, 1],
+          projection_uv: [0.18, 0.5, 0.82, 1],
+          dispatch_uv: [0.2, 0.5, 0.8, 1],
           min_bbox_height_px: 24,
           body_catch_points: [[150, 80], [1080, 90], [1100, 260], [140, 250]],
-          relaxed_presence_points: [],
-          relaxed_presence_margin_uv: 0.1,
+          relaxed_presence_points: [[405, 280], [1115, 292], [1133, 416], [338, 390]],
+          relaxed_presence_margin_uv: 0.12,
           relaxed_presence_min_confidence: 0.12,
           relaxed_presence_v: null,
         },
@@ -2490,8 +2500,8 @@ cameras:
           id: "cam1_region_1",
           projection_id: "corridor",
           image_points: [[1180, 120], [520, 120], [500, 530], [1210, 540]],
-          projection_uv: [0.52, 0, 1, 1],
-          dispatch_uv: [0.6, 0, 1, 1],
+          projection_uv: [0.56, 0.5, 1, 1],
+          dispatch_uv: [0.8, 0.5, 1, 1],
           min_bbox_height_px: 24,
           body_catch_points: [],
           relaxed_presence_points: [],
@@ -2683,8 +2693,12 @@ async function handleAction(action: string): Promise<void> {
     } else if (action === "refresh") {
       await refreshAll();
     } else if (action === "start") {
+      await refreshConfig();
+      await refreshProjection();
       state.process = await invoke<ProcessStatus>("start_tracker", { showPreview: false });
     } else if (action === "preview") {
+      await refreshConfig();
+      await refreshProjection();
       state.process = await invoke<ProcessStatus>("start_tracker", { showPreview: true });
     } else if (action === "start-video-test" || action === "preview-video-test") {
       const cameraName = configuredCameraNames().includes(state.videoTestCamera)
@@ -2937,7 +2951,8 @@ if (hasTauriRuntime) {
       {
         id: "corridor",
         active: [1, 2],
-        xy: [0.18, 0.42, 0.72, 0.58],
+        xy: [1, 1728, 453.6, 2, 6912, 626.4],
+        uv: [1, 0.18, 0.42, 2, 0.72, 0.58],
         persons: [
           { gid: 1, x: 0.18, y: 0.42, u: 0.18, v: 0.42, state: "fresh" },
           { gid: 2, x: 0.72, y: 0.58, u: 0.72, v: 0.58, state: "held" },

@@ -622,7 +622,11 @@ def _render_tile(
                                     for (x, y) in reg.relaxed_presence_points], dtype=np.int32)
             cv2.polylines(tile, [relaxed_pts], True, _C_RELAXED, 2, cv2.LINE_AA)
         u0, v0, u1, v1 = reg.projection_uv
-        label = f"{reg.id} [{u0:.2f},{v0:.2f}->{u1:.2f},{v1:.2f}]"
+        du0, dv0, du1, dv1 = reg.dispatch_uv
+        label = (
+            f"{reg.id} p[{u0:.2f},{v0:.2f}->{u1:.2f},{v1:.2f}] "
+            f"d[{du0:.2f},{dv0:.2f}->{du1:.2f},{dv1:.2f}]"
+        )
         if is_focus:
             label = "* " + label
         tlx, tly = int(pts[:, 0].min()), int(pts[:, 1].min())
@@ -786,7 +790,12 @@ def _render_uv_canvas(
                 cv2.addWeighted(overlay, 0.30, panel, 0.70, 0, dst=panel)
                 cv2.rectangle(panel, (dx0, dy0), (dx1, dy1), color, 1, cv2.LINE_AA)
 
-                label = f"{cam.name}:{reg.id}"
+                label = (
+                    f"{cam.name}:{reg.id} "
+                    f"d {reg.dispatch_uv[0]:.2f}-{reg.dispatch_uv[2]:.2f}"
+                )
+                if reg.relaxed_presence_points:
+                    label += f" stair m={reg.relaxed_presence_margin_uv:.2f}"
                 cv2.putText(panel, label, (px0 + 6, min(py1 - 6, py0 + 18)),
                             _FONT, 0.45, color, 1, cv2.LINE_AA)
 
@@ -1068,10 +1077,13 @@ def _render_region_panel(
             is_focus_reg = is_focus_cam and ri == focused_region_idx
             prefix = "  *" if is_focus_reg else "   "
             d = reg.dispatch_uv
+            p = reg.projection_uv
             text = (
-                f"{prefix} {reg.id} d=[{d[0]:.2f},{d[1]:.2f}->"
-                f"{d[2]:.2f},{d[3]:.2f}]"
+                f"{prefix} {reg.id} p=[{p[0]:.2f}->{p[2]:.2f}] "
+                f"d=[{d[0]:.2f}->{d[2]:.2f}]"
             )
+            if reg.relaxed_presence_points:
+                text += f" stair m={reg.relaxed_presence_margin_uv:.2f}"
             text = _ellipsize_text(text, width - pad * 2, 0.4, 1)
             text_color = _C_REGION_FOCUS if is_focus_reg else _C_PANEL_TEXT
             cv2.putText(panel, text, (pad, y), _FONT, 0.4,

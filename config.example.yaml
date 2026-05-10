@@ -16,9 +16,12 @@ osc:
   # td_minimal: TouchDesigner 런타임용 최소 스트림.
   #   /proj/<id>/active [gid, ...]
   #   /proj/<id>/xy     [gid, x, y, gid, x, y, ...]
+  #   /proj/<id>/uv     [gid, u, v, gid, u, v, ...]
   # x/y는 projection pixel_size가 있으면 픽셀 좌표, 없으면 0..1 UV입니다.
+  # uv는 항상 0..1 정규화 좌표입니다.
   td_minimal: true
-  # person_level: cross-camera fused stream. td_minimal=false일 때 디버그 주소를 송신합니다.
+  # person_level: cross-camera fused stream. td_minimal=true여도 보조 디버그 주소를 추가 송신합니다.
+  # packed /xy를 TD에서 전부 unpack하기 어려울 때 /proj/<id>/person/<gid>를 받을 수 있습니다.
   person_level: true
   # raw_per_cam: 카메라별 raw 트랙. td_minimal=true일 때는 자동으로 꺼집니다.
   raw_per_cam: false

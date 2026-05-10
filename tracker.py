@@ -8,6 +8,7 @@ Usage:
 TouchDesigner minimal OSC schema (default, when osc.td_minimal: true):
     /proj/<projection_id>/active                [gid, gid, ...]
     /proj/<projection_id>/xy                    [gid, x, y, gid, x, y, ...]
+    /proj/<projection_id>/uv                    [gid, u, v, gid, u, v, ...]
     /proj/<projection_id>/persons/count         int
 
 Person-keyed debug OSC schema (when osc.td_minimal: false and osc.person_level: true):
@@ -1175,15 +1176,16 @@ def _emit_person_osc(
     """Send person-keyed OSC for the current frame.
 
     In the default TouchDesigner-minimal mode, each projection emits `/active`,
-    `/xy`, and a compatibility `/persons/count`. `/xy` is packed as gid/x/y
-    triples so TD can build one instancing table without dynamic per-person
-    addresses. x/y are projection video pixels when `pixel_size` is configured;
-    otherwise they fall back to normalized UV.
+    `/xy`, `/uv`, and a compatibility `/persons/count`. `/xy` is packed as
+    gid/x/y triples so TD can build one instancing table without dynamic
+    per-person addresses. x/y are projection video pixels when `pixel_size` is
+    configured; otherwise they fall back to normalized UV. `/uv` is always
+    normalized 0..1 and mirrors the same gid order.
 
-    When `person_level` is enabled outside minimal mode, the older richer
-    person/lost/list addresses are emitted. Minimal mode keeps a single
-    coordinate source for TD to avoid mixing packed pixel coordinates with
-    person-level UV coordinates.
+    When `person_level` is enabled, the older richer person/lost/list addresses
+    are also emitted. This is intentionally additive so a TD patch that cannot
+    unpack the variable-length `/xy` list can consume `/person/<gid>` rows
+    without changing the primary minimal stream.
     Returns the number of OSC messages sent.
     """
     sent = 0
@@ -1195,6 +1197,7 @@ def _emit_person_osc(
             proj = projections.get(pid)
             gids = sorted(p.gid for p in plist)
             xy_args = []
+            uv_args = []
             for p in sorted(plist, key=lambda person: person.gid):
                 if proj is not None and proj.pixel_size is not None:
                     pw, ph = proj.pixel_size
@@ -1202,11 +1205,13 @@ def _emit_person_osc(
                 else:
                     x, y = p.u, p.v
                 xy_args.extend([p.gid, x, y])
+                uv_args.extend([p.gid, p.u, p.v])
             osc.send_message(f"/proj/{pid}/active", gids)
             osc.send_message(f"/proj/{pid}/xy", xy_args)
+            osc.send_message(f"/proj/{pid}/uv", uv_args)
             osc.send_message(f"/proj/{pid}/persons/count", len(gids))
-            sent += 3
-        if person_level and not td_minimal:
+            sent += 4
+        if person_level:
             sent += _emit_person_level_osc(
                 osc,
                 projections,
@@ -1669,6 +1674,7 @@ def main() -> int:
                     active = sorted(p.gid for p in plist)
                     persons_payload = []
                     xy_payload = []
+                    uv_payload = []
                     for p in sorted(plist, key=lambda person: person.gid):
                         if projection.pixel_size is not None:
                             pw, ph = projection.pixel_size
@@ -1676,6 +1682,7 @@ def main() -> int:
                         else:
                             x, y = p.u, p.v
                         xy_payload.extend([p.gid, x, y])
+                        uv_payload.extend([p.gid, p.u, p.v])
                         persons_payload.append(
                             {
                                 "gid": p.gid,
@@ -1692,6 +1699,7 @@ def main() -> int:
                             "id": pid,
                             "active": active,
                             "xy": xy_payload,
+                            "uv": uv_payload,
                             "persons": persons_payload,
                         }
                     )
