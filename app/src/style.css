@@ -1977,6 +1977,85 @@ textarea:focus {
   align-items: start;
 }
 
+.mobile-ops {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+
+.mobile-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.mobile-pin-box {
+  display: grid;
+  grid-template-columns: 72px minmax(0, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+  border: 1px solid rgba(255, 138, 61, 0.34);
+  border-radius: 6px;
+  background: rgba(255, 138, 61, 0.08);
+  color: var(--ink);
+  margin: 12px 0 14px;
+  padding: 12px 14px;
+}
+
+.mobile-pin-box span,
+.mobile-pin-box em,
+.mobile-url-list .label {
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-style: normal;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.mobile-pin-box b {
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+}
+
+.mobile-pin-box em {
+  line-height: 1.45;
+  text-transform: none;
+}
+
+.mobile-url-list {
+  display: grid;
+  gap: 8px;
+}
+
+.mobile-url {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #08090b;
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+}
+
+.mobile-checks {
+  display: grid;
+  gap: 8px;
+}
+
+.mobile-api-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.mobile-error {
+  margin-top: 10px;
+}
+
 .phone-shell {
   justify-self: center;
   width: min(360px, 100%);

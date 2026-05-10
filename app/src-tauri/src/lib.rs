@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
+    collections::VecDeque,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -11,10 +13,28 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager};
 
-#[derive(Default)]
 struct AppState {
     child: Mutex<Option<Child>>,
     active_config: Mutex<Option<PathBuf>>,
+    logs: Mutex<VecDeque<LogEvent>>,
+    events: Mutex<VecDeque<JsonValue>>,
+    mobile_token: String,
+    mobile_port: Mutex<Option<u16>>,
+    mobile_error: Mutex<Option<String>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            child: Mutex::new(None),
+            active_config: Mutex::new(None),
+            logs: Mutex::new(VecDeque::new()),
+            events: Mutex::new(VecDeque::new()),
+            mobile_token: generate_mobile_token(),
+            mobile_port: Mutex::new(None),
+            mobile_error: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +69,18 @@ struct LogEvent {
 struct ProcessStatus {
     running: bool,
     exit_code: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct MobileServerStatus {
+    running: bool,
+    bind: String,
+    port: Option<u16>,
+    token: String,
+    urls: Vec<String>,
+    status_path: String,
+    token_header: String,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -172,6 +204,59 @@ struct SaveCalibrationMappingRequest {
     relaxed_presence_v: Option<f64>,
 }
 
+const MOBILE_TOKEN_HEADER: &str = "X-Reolink-Mobile-Token";
+const MOBILE_BIND_ADDR: &str = "0.0.0.0";
+const MOBILE_LOG_LIMIT: usize = 500;
+const MOBILE_EVENT_LIMIT: usize = 200;
+const MOBILE_API_LOG_LIMIT: usize = 80;
+const MOBILE_API_EVENT_LIMIT: usize = 80;
+const MOBILE_PREVIEW_REQUEST_FILE: &str = ".request";
+const MOBILE_PREVIEW_MAX_WIDTH: &str = "640";
+const MOBILE_PREVIEW_INTERVAL_S: &str = "0.75";
+const MOBILE_PREVIEW_REQUEST_TTL_S: &str = "4.0";
+const MOBILE_PREVIEW_JPEG_QUALITY: &str = "65";
+
+fn generate_mobile_token() -> String {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or_default()
+        ^ ((std::process::id() as u64) << 17);
+    let mixed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    format!("{:06}", mixed % 1_000_000)
+}
+
+fn mobile_token_matches(expected: &str, provided: Option<&str>) -> bool {
+    let Some(candidate) = provided.map(str::trim) else {
+        return false;
+    };
+    if expected.is_empty() || candidate.len() != expected.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(candidate.bytes())
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
+fn select_mobile_port<I, F>(ports: I, mut can_bind: F) -> Option<u16>
+where
+    I: IntoIterator<Item = u16>,
+    F: FnMut(u16) -> bool,
+{
+    ports.into_iter().find(|port| can_bind(*port))
+}
+
+fn push_bounded<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
+    items.push_back(item);
+    while items.len() > limit {
+        let _ = items.pop_front();
+    }
+}
+
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -187,6 +272,14 @@ fn engine_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(runtime_dir(app)?.join("config.yaml"))
+}
+
+fn mobile_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(runtime_dir(app)?.join("preview"))
+}
+
+fn mobile_preview_request_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(mobile_preview_dir(app)?.join(MOBILE_PREVIEW_REQUEST_FILE))
 }
 
 fn local_path_from_input(input: &str) -> PathBuf {
@@ -249,11 +342,8 @@ fn write_text_atomically(path: &Path, content: &str) -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let tmp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        nonce
-    ));
+    let tmp_path =
+        path.with_file_name(format!(".{file_name}.tmp-{}-{}", std::process::id(), nonce));
     fs::write(&tmp_path, content)
         .map_err(|err| format!("failed to write {}: {err}", tmp_path.display()))?;
     fs::rename(&tmp_path, path).map_err(|err| {
@@ -343,16 +433,20 @@ fn install_uv() -> Result<PathBuf, String> {
 }
 
 fn emit_log(app: &AppHandle, stream: &str, line: String) {
-    let _ = app.emit(
-        "tracker-log",
-        LogEvent {
-            stream: stream.to_string(),
-            line: line.clone(),
-        },
-    );
+    let log = LogEvent {
+        stream: stream.to_string(),
+        line: line.clone(),
+    };
+    if let Ok(mut logs) = app.state::<AppState>().logs.lock() {
+        push_bounded(&mut logs, log.clone(), MOBILE_LOG_LIMIT);
+    }
+    let _ = app.emit("tracker-log", log);
     if line.trim_start().starts_with('{') {
         if let Ok(value) = serde_json::from_str::<JsonValue>(&line) {
             if value.get("event").is_some() {
+                if let Ok(mut events) = app.state::<AppState>().events.lock() {
+                    push_bounded(&mut events, value.clone(), MOBILE_EVENT_LIMIT);
+                }
                 let _ = app.emit("tracker-status", value);
             }
         }
@@ -395,6 +489,24 @@ fn parse_config_targets(config: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+fn parse_config_camera_names(config: &str) -> Vec<String> {
+    let parsed: serde_yaml::Value = match serde_yaml::from_str(config) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .get("cameras")
+        .and_then(|v| v.as_sequence())
+        .map(|cameras| {
+            cameras
+                .iter()
+                .filter_map(|camera| camera.get("name").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn yaml_number_vec(value: Option<&serde_yaml::Value>) -> Vec<f64> {
@@ -975,6 +1087,1093 @@ fn summarize_checks(
     }
 }
 
+fn parse_ifconfig_ipv4(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let rest = trimmed.strip_prefix("inet ")?;
+            let ip = rest.split_whitespace().next()?;
+            if ip == "127.0.0.1" || ip.starts_with("169.254.") || ip.contains(':') {
+                None
+            } else {
+                Some(ip.to_string())
+            }
+        })
+        .collect()
+}
+
+fn local_ipv4_candidates() -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        let _ = socket.connect("8.8.8.8:80");
+        if let Ok(addr) = socket.local_addr() {
+            let ip = addr.ip().to_string();
+            if ip != "0.0.0.0" && ip != "127.0.0.1" {
+                ips.push(ip);
+            }
+        }
+    }
+    if let Ok(output) = Command::new("ifconfig").output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        ips.extend(parse_ifconfig_ipv4(&text));
+    }
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+fn mobile_urls(port: u16) -> Vec<String> {
+    let mut urls = local_ipv4_candidates()
+        .into_iter()
+        .map(|ip| format!("http://{ip}:{port}/mobile"))
+        .collect::<Vec<_>>();
+    urls.push(format!("http://127.0.0.1:{port}/mobile"));
+    urls.dedup();
+    urls
+}
+
+fn mobile_server_status(app: &AppHandle) -> MobileServerStatus {
+    let state = app.state::<AppState>();
+    let port = state.mobile_port.lock().ok().and_then(|guard| *guard);
+    let error = state
+        .mobile_error
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    MobileServerStatus {
+        running: port.is_some() && error.is_none(),
+        bind: MOBILE_BIND_ADDR.to_string(),
+        urls: port.map(mobile_urls).unwrap_or_default(),
+        port,
+        token: state.mobile_token.clone(),
+        status_path: "/api/status".to_string(),
+        token_header: MOBILE_TOKEN_HEADER.to_string(),
+        error,
+    }
+}
+
+fn snapshot_logs(state: &AppState, limit: usize) -> Vec<LogEvent> {
+    state
+        .logs
+        .lock()
+        .map(|logs| {
+            let start = logs.len().saturating_sub(limit);
+            logs.iter().skip(start).cloned().collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_events(state: &AppState, limit: usize) -> Vec<JsonValue> {
+    state
+        .events
+        .lock()
+        .map(|events| {
+            let start = events.len().saturating_sub(limit);
+            events.iter().skip(start).cloned().collect()
+        })
+        .unwrap_or_default()
+}
+
+fn runtime_ready_status(runtime: &RuntimeStatus) -> bool {
+    runtime.venv_exists && runtime.config_exists && runtime.model_exists && runtime.tracker_exists
+}
+
+fn mobile_status_json(
+    runtime: RuntimeStatus,
+    process: ProcessStatus,
+    configured_cameras: Vec<String>,
+    events: Vec<JsonValue>,
+    logs: Vec<LogEvent>,
+) -> JsonValue {
+    let latest_fps = events
+        .iter()
+        .rev()
+        .find(|event| event.get("event").and_then(|value| value.as_str()) == Some("fps_tick"));
+    let cameras = latest_fps
+        .and_then(|event| event.get("cameras"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let projections = latest_fps
+        .and_then(|event| event.get("projections"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let camera_count = cameras
+        .as_array()
+        .map(Vec::len)
+        .filter(|count| *count > 0)
+        .unwrap_or(configured_cameras.len());
+    let osc_rate = cameras
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|camera| camera.get("osc_rate").and_then(|value| value.as_f64()))
+                .sum::<f64>()
+        })
+        .unwrap_or_default();
+    let latest_event = events
+        .last()
+        .and_then(|event| event.get("event"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("-");
+    serde_json::json!({
+        "ok": true,
+        "generated_at": now_label(),
+        "summary": {
+            "runtime_ready": runtime_ready_status(&runtime),
+            "camera_count": camera_count,
+            "osc_rate": osc_rate,
+            "latest_event": latest_event,
+            "log_count": logs.len(),
+            "event_count": events.len()
+        },
+        "runtime": runtime,
+        "process": process,
+        "configured_cameras": configured_cameras,
+        "cameras": cameras,
+        "projections": projections,
+        "events": events,
+        "logs": logs
+    })
+}
+
+fn mobile_status_for_app(app: &AppHandle) -> Result<JsonValue, String> {
+    let runtime = get_runtime_status(app.clone())?;
+    let configured_cameras = fs::read_to_string(config_path(app)?)
+        .map(|config| parse_config_camera_names(&config))
+        .unwrap_or_default();
+    let state = app.state::<AppState>();
+    let process = inspect_tracker_state(&state)?;
+    Ok(mobile_status_json(
+        runtime,
+        process,
+        configured_cameras,
+        snapshot_events(&state, MOBILE_API_EVENT_LIMIT),
+        snapshot_logs(&state, MOBILE_API_LOG_LIMIT),
+    ))
+}
+
+fn bind_mobile_listener() -> Result<(TcpListener, u16), String> {
+    let mut listener = None;
+    let mut last_error = None;
+    let port = select_mobile_port(1421..=1430, |port| {
+        match TcpListener::bind((MOBILE_BIND_ADDR, port)) {
+            Ok(value) => {
+                listener = Some(value);
+                true
+            }
+            Err(err) => {
+                last_error = Some(format!("{MOBILE_BIND_ADDR}:{port}: {err}"));
+                false
+            }
+        }
+    })
+    .ok_or_else(|| {
+        format!(
+            "failed to bind mobile server on ports 1421..1430{}",
+            last_error
+                .map(|err| format!("; last error: {err}"))
+                .unwrap_or_default()
+        )
+    })?;
+    let listener = listener.ok_or_else(|| "selected mobile port without listener".to_string())?;
+    Ok((listener, port))
+}
+
+fn set_mobile_server_state(app: &AppHandle, port: Option<u16>, error: Option<String>) {
+    let state = app.state::<AppState>();
+    if let Ok(mut mobile_port) = state.mobile_port.lock() {
+        *mobile_port = port;
+    }
+    if let Ok(mut mobile_error) = state.mobile_error.lock() {
+        *mobile_error = error;
+    };
+}
+
+fn start_mobile_server(app: AppHandle) {
+    thread::spawn(move || match bind_mobile_listener() {
+        Ok((listener, port)) => {
+            set_mobile_server_state(&app, Some(port), None);
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let app = app.clone();
+                        thread::spawn(move || handle_mobile_connection(stream, app));
+                    }
+                    Err(err) => {
+                        set_mobile_server_state(&app, Some(port), Some(err.to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            set_mobile_server_state(&app, None, Some(err));
+        }
+    });
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+}
+
+fn read_http_request(stream: &TcpStream) -> Result<HttpRequest, String> {
+    let reader_stream = stream
+        .try_clone()
+        .map_err(|err| format!("failed to clone mobile HTTP stream: {err}"))?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .map_err(|err| format!("failed to read request line: {err}"))?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    if method.is_empty() || path.is_empty() {
+        return Err("empty mobile HTTP request".to_string());
+    }
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|err| format!("failed to read request header: {err}"))?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+    })
+}
+
+fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
+    let wanted = name.to_ascii_lowercase();
+    request
+        .headers
+        .iter()
+        .find(|(header, _)| header == &wanted)
+        .map(|(_, value)| value.as_str())
+}
+
+fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.as_bytes().len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+}
+
+fn write_http_bytes(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+}
+
+fn write_http_redirect(stream: &mut TcpStream, location: &str) {
+    let header = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(header.as_bytes());
+}
+
+fn write_json_response(stream: &mut TcpStream, status: &str, value: JsonValue) {
+    write_http_response(stream, status, "application/json", &value.to_string());
+}
+
+fn write_json_error(stream: &mut TcpStream, status: &str, message: &str) {
+    write_json_response(
+        stream,
+        status,
+        serde_json::json!({
+            "ok": false,
+            "error": message
+        }),
+    );
+}
+
+fn percent_decode_path_segment(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).copied()?;
+            let lo = bytes.get(i + 2).copied()?;
+            let hex = [hi, lo];
+            let decoded = u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?;
+            out.push(decoded);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn safe_preview_camera_name(value: &str) -> Option<String> {
+    let decoded = percent_decode_path_segment(value)?;
+    if decoded.is_empty()
+        || decoded
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+    {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+fn preview_camera_from_route(route: &str) -> Option<String> {
+    let name = route
+        .strip_prefix("/api/preview/")
+        .and_then(|rest| rest.strip_suffix(".jpg"))?;
+    safe_preview_camera_name(name)
+}
+
+fn touch_mobile_preview_request(app: &AppHandle) -> Result<(), String> {
+    let request_path = mobile_preview_request_path(app)?;
+    if let Some(parent) = request_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    fs::write(&request_path, now_label())
+        .map_err(|err| format!("failed to request mobile preview: {err}"))
+}
+
+fn handle_mobile_preview_request(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    camera_name: &str,
+) -> Result<(), String> {
+    touch_mobile_preview_request(app)?;
+    let path = mobile_preview_dir(app)?.join(format!("{camera_name}.jpg"));
+    match fs::read(&path) {
+        Ok(bytes) => {
+            write_http_bytes(stream, "200 OK", "image/jpeg", &bytes);
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            write_json_error(
+                stream,
+                "404 Not Found",
+                "Preview frame is not ready yet. Keep View open for a moment.",
+            );
+            Ok(())
+        }
+        Err(err) => Err(format!("failed to read {}: {err}", path.display())),
+    }
+}
+
+fn handle_mobile_connection(mut stream: TcpStream, app: AppHandle) {
+    let request = match read_http_request(&stream) {
+        Ok(request) => request,
+        Err(err) => {
+            write_json_error(&mut stream, "400 Bad Request", &err);
+            return;
+        }
+    };
+    let route = request.path.split('?').next().unwrap_or(&request.path);
+    if let Some(camera_name) = preview_camera_from_route(route) {
+        if request.method != "GET" {
+            write_json_error(
+                &mut stream,
+                "405 Method Not Allowed",
+                "Use GET for preview.",
+            );
+            return;
+        }
+        let state = app.state::<AppState>();
+        if !mobile_token_matches(
+            &state.mobile_token,
+            request_header(&request, MOBILE_TOKEN_HEADER),
+        ) {
+            write_json_error(&mut stream, "401 Unauthorized", "Invalid mobile PIN.");
+            return;
+        }
+        if let Err(err) = handle_mobile_preview_request(&mut stream, &app, &camera_name) {
+            write_json_error(&mut stream, "500 Internal Server Error", &err);
+        }
+        return;
+    }
+    match (request.method.as_str(), route) {
+        ("GET", "/") => write_http_redirect(&mut stream, "/mobile"),
+        ("GET", "/mobile") => {
+            write_http_response(&mut stream, "200 OK", "text/html", mobile_page_html());
+        }
+        ("GET", "/api/status") | ("POST", "/api/start") | ("POST", "/api/stop") => {
+            let state = app.state::<AppState>();
+            if !mobile_token_matches(
+                &state.mobile_token,
+                request_header(&request, MOBILE_TOKEN_HEADER),
+            ) {
+                write_json_error(&mut stream, "401 Unauthorized", "Invalid mobile PIN.");
+                return;
+            }
+            match (request.method.as_str(), route) {
+                ("GET", "/api/status") => match mobile_status_for_app(&app) {
+                    Ok(value) => write_json_response(&mut stream, "200 OK", value),
+                    Err(err) => write_json_error(&mut stream, "500 Internal Server Error", &err),
+                },
+                ("POST", "/api/start") => {
+                    let result = spawn_tracker_with_config(
+                        app.clone(),
+                        &state,
+                        match config_path(&app) {
+                            Ok(path) => path,
+                            Err(err) => {
+                                write_json_error(&mut stream, "500 Internal Server Error", &err);
+                                return;
+                            }
+                        },
+                        false,
+                    );
+                    match result {
+                        Ok(_) => match mobile_status_for_app(&app) {
+                            Ok(value) => write_json_response(&mut stream, "200 OK", value),
+                            Err(err) => {
+                                write_json_error(&mut stream, "500 Internal Server Error", &err)
+                            }
+                        },
+                        Err(err) => write_json_error(&mut stream, "409 Conflict", &err),
+                    }
+                }
+                ("POST", "/api/stop") => match stop_tracker_state(&state) {
+                    Ok(_) => match mobile_status_for_app(&app) {
+                        Ok(value) => write_json_response(&mut stream, "200 OK", value),
+                        Err(err) => {
+                            write_json_error(&mut stream, "500 Internal Server Error", &err)
+                        }
+                    },
+                    Err(err) => write_json_error(&mut stream, "500 Internal Server Error", &err),
+                },
+                _ => write_json_error(&mut stream, "404 Not Found", "Not found."),
+            }
+        }
+        _ => write_json_error(&mut stream, "404 Not Found", "Not found."),
+    }
+}
+
+fn mobile_page_html() -> &'static str {
+    r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Reolink Mobile Control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08090b;
+      --panel: #12151a;
+      --panel-2: #181c22;
+      --line: #2a303a;
+      --ink: #f0eadc;
+      --muted: #918b7d;
+      --amber: #ff8a3d;
+      --green: #7bd88f;
+      --red: #ff4757;
+      --yellow: #ffd166;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      background: var(--bg);
+      color: var(--ink);
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input { font: inherit; }
+    .app {
+      min-height: 100svh;
+      padding: max(18px, env(safe-area-inset-top)) 14px calc(96px + env(safe-area-inset-bottom));
+    }
+    .top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      padding: 5px 9px;
+    }
+    .hero {
+      margin-bottom: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(180deg, #151820, #101217);
+      padding: 18px;
+    }
+    .state {
+      color: var(--yellow);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: clamp(36px, 12vw, 54px);
+      font-weight: 300;
+      line-height: 0.95;
+      letter-spacing: 0;
+    }
+    .state.running { color: var(--green); }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 9px;
+      margin-top: 16px;
+    }
+    .tile, .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .tile { padding: 12px; }
+    .tile span, .label {
+      display: block;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .tile b {
+      display: block;
+      margin-top: 7px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 18px;
+      font-weight: 500;
+      overflow-wrap: anywhere;
+    }
+    .card {
+      margin-top: 12px;
+      overflow: hidden;
+    }
+    .card h2 {
+      margin: 0;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      padding: 11px 13px;
+      text-transform: uppercase;
+    }
+    .card-body { padding: 12px 13px; }
+    .row {
+      display: grid;
+      grid-template-columns: minmax(82px, .7fr) minmax(0, 1fr);
+      gap: 10px;
+      border-bottom: 1px solid rgba(42, 48, 58, .75);
+      padding: 8px 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .row:last-child { border-bottom: 0; }
+    .row span { color: var(--muted); }
+    .row b { font-weight: 500; overflow-wrap: anywhere; text-align: right; }
+    .feed {
+      display: grid;
+      gap: 8px;
+      max-height: 240px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+    .feed-item {
+      border: 1px solid rgba(42, 48, 58, .75);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--muted);
+      padding: 9px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+    .feed-item b {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--ink);
+      font-weight: 500;
+    }
+    .preview-card { margin-top: 12px; }
+    .preview-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+    }
+    .preview-head h2 {
+      border-bottom: 0;
+      padding: 0;
+    }
+    .preview-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .preview-controls select,
+    .preview-controls button {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      color: var(--ink);
+      min-height: 38px;
+      padding: 8px 10px;
+    }
+    .preview-controls button.active {
+      border-color: var(--amber);
+      background: var(--amber);
+      color: #1b1007;
+      font-weight: 700;
+    }
+    .preview-frame {
+      position: relative;
+      display: grid;
+      min-height: 190px;
+      place-items: center;
+      background: #040507;
+    }
+    .preview-frame img {
+      display: block;
+      width: 100%;
+      max-height: min(52svh, 420px);
+      object-fit: contain;
+    }
+    .preview-frame span {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      padding: 18px;
+      text-align: center;
+    }
+    .preview-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      padding: 8px 12px 12px;
+    }
+    .auth {
+      display: grid;
+      gap: 12px;
+      min-height: calc(100svh - 56px);
+      align-content: center;
+    }
+    .auth h1 {
+      margin: 0;
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+    .auth p { margin: 0; color: var(--muted); line-height: 1.5; }
+    .auth input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 24px;
+      letter-spacing: .14em;
+      padding: 15px;
+      text-align: center;
+    }
+    .auth button, .bar button {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      color: var(--ink);
+      min-height: 48px;
+      padding: 10px 12px;
+    }
+    .auth button.primary, .bar button.primary {
+      border-color: var(--amber);
+      background: var(--amber);
+      color: #1b1007;
+      font-weight: 700;
+    }
+    .bar button.danger {
+      border-color: rgba(255, 71, 87, .65);
+      color: var(--red);
+    }
+    .bar button:disabled { opacity: .45; }
+    .bar {
+      position: fixed;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      border-top: 1px solid var(--line);
+      background: rgba(8, 9, 11, .94);
+      padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+      backdrop-filter: blur(14px);
+    }
+    .error {
+      border: 1px solid rgba(255, 71, 87, .5);
+      border-radius: 8px;
+      background: rgba(255, 71, 87, .12);
+      color: var(--red);
+      padding: 10px 12px;
+    }
+    @media (orientation: landscape) and (max-height: 720px) {
+      #dash {
+        display: grid;
+        grid-template-columns: minmax(360px, 1.25fr) minmax(300px, .75fr);
+        grid-auto-rows: min-content;
+        gap: 10px 12px;
+        padding: max(10px, env(safe-area-inset-top)) 12px calc(68px + env(safe-area-inset-bottom));
+      }
+      #dash .top,
+      #dash .preview-card {
+        grid-column: 1;
+      }
+      #dash .hero,
+      #dash .card:not(.preview-card),
+      #dash #dashError {
+        grid-column: 2;
+      }
+      #dash .top {
+        margin-bottom: 0;
+      }
+      #dash .hero {
+        margin-bottom: 0;
+        padding: 12px;
+      }
+      #dash .state {
+        font-size: clamp(30px, 9vw, 46px);
+      }
+      #dash .meta {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin-top: 12px;
+      }
+      .preview-card {
+        margin-top: 0;
+      }
+      .preview-frame {
+        min-height: calc(100svh - 178px);
+      }
+      .preview-frame img {
+        max-height: calc(100svh - 178px);
+      }
+      #events,
+      #logs {
+        max-height: 100px;
+      }
+      .bar {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        padding-top: 8px;
+      }
+    }
+    .hidden { display: none; }
+    #dash.hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main id="auth" class="app auth">
+    <div class="top"><span>vomlab/reolink</span><span class="badge">mobile</span></div>
+    <h1>Enter PIN</h1>
+    <p>Status and controls stay locked until the desktop app PIN is entered.</p>
+    <input id="pin" inputmode="numeric" autocomplete="one-time-code" placeholder="000000">
+    <button id="unlock" class="primary">Unlock</button>
+    <div id="authError" class="error hidden"></div>
+  </main>
+  <main id="dash" class="app hidden">
+    <div class="top"><span>vomlab/reolink</span><button id="lock" class="badge">Lock</button></div>
+    <section class="hero">
+      <div id="state" class="state">STOPPED</div>
+      <div class="meta">
+        <div class="tile"><span>runtime</span><b id="runtime">-</b></div>
+        <div class="tile"><span>osc</span><b id="osc">-</b></div>
+        <div class="tile"><span>cameras</span><b id="cameras">-</b></div>
+        <div class="tile"><span>latest</span><b id="latest">-</b></div>
+      </div>
+    </section>
+    <section class="card preview-card">
+      <div class="preview-head">
+        <h2>preview</h2>
+        <div class="preview-controls">
+          <select id="previewCamera" aria-label="Preview camera"></select>
+          <button id="view">View</button>
+        </div>
+      </div>
+      <div class="preview-frame">
+        <img id="previewImage" alt="Mobile camera preview" class="hidden">
+        <span id="previewMessage">Tap View to request low-rate preview frames.</span>
+      </div>
+      <div class="preview-meta">
+        <span id="previewAge">on demand</span>
+        <span>rotate phone for landscape</span>
+      </div>
+    </section>
+    <section class="card"><h2>cameras</h2><div id="cameraRows" class="card-body"></div></section>
+    <section class="card"><h2>events</h2><div id="events" class="card-body feed"></div></section>
+    <section class="card"><h2>stdout/stderr</h2><div id="logs" class="card-body feed"></div></section>
+    <div id="dashError" class="error hidden"></div>
+  </main>
+  <nav class="bar hidden" id="bar">
+    <button id="start" class="primary">Start</button>
+    <button id="stop" class="danger">Stop</button>
+    <button id="refresh">Refresh</button>
+  </nav>
+  <script>
+    const key = "reolink-mobile-token";
+    const auth = document.getElementById("auth");
+    const dash = document.getElementById("dash");
+    const bar = document.getElementById("bar");
+    const pin = document.getElementById("pin");
+    const authError = document.getElementById("authError");
+    const dashError = document.getElementById("dashError");
+    const previewCamera = document.getElementById("previewCamera");
+    const previewImage = document.getElementById("previewImage");
+    const previewMessage = document.getElementById("previewMessage");
+    const previewAge = document.getElementById("previewAge");
+    const viewButton = document.getElementById("view");
+    let token = localStorage.getItem(key) || "";
+    let busy = false;
+    let previewOn = false;
+    let previewTimer = 0;
+    let previewObjectUrl = "";
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+      }[ch] || ch));
+    }
+    function num(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toFixed(1) : "-";
+    }
+    function showAuth(message = "") {
+      setPreview(false);
+      auth.classList.remove("hidden");
+      dash.classList.add("hidden");
+      bar.classList.add("hidden");
+      authError.textContent = message;
+      authError.classList.toggle("hidden", !message);
+      pin.focus();
+    }
+    function showDash() {
+      auth.classList.add("hidden");
+      dash.classList.remove("hidden");
+      bar.classList.remove("hidden");
+    }
+    function cameraNames(data) {
+      const live = Array.isArray(data?.cameras)
+        ? data.cameras.map(cam => String(cam.name || "")).filter(Boolean)
+        : [];
+      const configured = Array.isArray(data?.configured_cameras)
+        ? data.configured_cameras.map(String).filter(Boolean)
+        : [];
+      return [...new Set([...live, ...configured])];
+    }
+    function syncPreviewCameras(data) {
+      const names = cameraNames(data);
+      const selected = previewCamera.value || names[0] || "";
+      previewCamera.innerHTML = names.length
+        ? names.map(name => `<option value="${esc(name)}" ${name === selected ? "selected" : ""}>${esc(name)}</option>`).join("")
+        : "<option value=''>No camera</option>";
+      if (names.includes(selected)) {
+        previewCamera.value = selected;
+      }
+      viewButton.disabled = !names.length;
+    }
+    function previewUrl() {
+      const camera = previewCamera.value;
+      return camera ? `/api/preview/${encodeURIComponent(camera)}.jpg?ts=${Date.now()}` : "";
+    }
+    function setPreview(on) {
+      previewOn = Boolean(on);
+      viewButton.textContent = previewOn ? "Hide" : "View";
+      viewButton.classList.toggle("active", previewOn);
+      if (!previewOn) {
+        if (previewTimer) window.clearTimeout(previewTimer);
+        previewTimer = 0;
+        previewImage.classList.add("hidden");
+        previewMessage.classList.remove("hidden");
+        previewMessage.textContent = "Tap View to request low-rate preview frames.";
+        previewAge.textContent = "on demand";
+      } else {
+        previewMessage.textContent = "Waiting for preview frame...";
+        previewMessage.classList.remove("hidden");
+        fetchPreview();
+      }
+    }
+    async function fetchPreview() {
+      if (!previewOn || !token) return;
+      const url = previewUrl();
+      if (!url) {
+        previewMessage.textContent = "No camera is available yet.";
+        return;
+      }
+      try {
+        const response = await fetch(url, {
+          headers: { "X-Reolink-Mobile-Token": token },
+          cache: "no-store"
+        });
+        if (response.status === 401) {
+          localStorage.removeItem(key);
+          token = "";
+          showAuth("Wrong PIN.");
+          return;
+        }
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.error || response.statusText);
+        }
+        const blob = await response.blob();
+        if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+        previewObjectUrl = URL.createObjectURL(blob);
+        previewImage.src = previewObjectUrl;
+        previewImage.classList.remove("hidden");
+        previewMessage.classList.add("hidden");
+        previewAge.textContent = new Date().toLocaleTimeString();
+      } catch (error) {
+        previewImage.classList.add("hidden");
+        previewMessage.classList.remove("hidden");
+        previewMessage.textContent = String(error.message || error);
+      } finally {
+        if (previewOn) {
+          previewTimer = window.setTimeout(fetchPreview, 1000);
+        }
+      }
+    }
+    async function callApi(path, method = "GET") {
+      const response = await fetch(path, {
+        method,
+        headers: { "X-Reolink-Mobile-Token": token },
+        cache: "no-store"
+      });
+      const data = await response.json().catch(() => ({ ok: false, error: "Invalid response" }));
+      if (response.status === 401) {
+        localStorage.removeItem(key);
+        token = "";
+        showAuth("Wrong PIN.");
+        throw new Error("Wrong PIN.");
+      }
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.error || response.statusText);
+      }
+      return data;
+    }
+    function renderRows(cameras) {
+      if (!Array.isArray(cameras) || !cameras.length) {
+        return "<p class='label'>No camera events yet.</p>";
+      }
+      return cameras.map(cam => `<div class="row"><span>${esc(cam.name)}</span><b>${num(cam.fps)} fps / age ${num(cam.frame_age_s)}s / reconnects ${esc(cam.reconnects ?? 0)}</b></div>`).join("");
+    }
+    function renderFeed(items, kind) {
+      if (!Array.isArray(items) || !items.length) {
+        return "<div class='feed-item'>No entries yet.</div>";
+      }
+      return items.slice(-20).reverse().map(item => {
+        if (kind === "log") {
+          return `<div class="feed-item"><b>${esc(item.stream)}</b>${esc(item.line)}</div>`;
+        }
+        const name = item.event || "event";
+        return `<div class="feed-item"><b>${esc(name)}</b>${esc(JSON.stringify(item))}</div>`;
+      }).join("");
+    }
+    function renderStatus(data) {
+      showDash();
+      const running = Boolean(data.process && data.process.running);
+      document.getElementById("state").textContent = running ? "RUNNING" : "STOPPED";
+      document.getElementById("state").classList.toggle("running", running);
+      document.getElementById("runtime").textContent = data.summary?.runtime_ready ? "ready" : "setup";
+      document.getElementById("osc").textContent = `${num(data.summary?.osc_rate)}/s`;
+      document.getElementById("cameras").textContent = String(data.summary?.camera_count ?? 0);
+      document.getElementById("latest").textContent = data.summary?.latest_event || "-";
+      document.getElementById("cameraRows").innerHTML = renderRows(data.cameras);
+      document.getElementById("events").innerHTML = renderFeed(data.events, "event");
+      document.getElementById("logs").innerHTML = renderFeed(data.logs, "log");
+      syncPreviewCameras(data);
+      document.getElementById("start").disabled = running || busy;
+      document.getElementById("stop").disabled = !running || busy;
+      dashError.classList.add("hidden");
+    }
+    async function refresh() {
+      if (!token) {
+        showAuth();
+        return;
+      }
+      try {
+        renderStatus(await callApi("/api/status"));
+      } catch (error) {
+        dashError.textContent = String(error.message || error);
+        dashError.classList.remove("hidden");
+      }
+    }
+    async function action(path) {
+      if (busy) return;
+      busy = true;
+      try {
+        renderStatus(await callApi(path, "POST"));
+      } catch (error) {
+        dashError.textContent = String(error.message || error);
+        dashError.classList.remove("hidden");
+      } finally {
+        busy = false;
+      }
+    }
+    document.getElementById("unlock").addEventListener("click", () => {
+      token = pin.value.trim();
+      localStorage.setItem(key, token);
+      refresh();
+    });
+    pin.addEventListener("keydown", event => {
+      if (event.key === "Enter") document.getElementById("unlock").click();
+    });
+    document.getElementById("lock").addEventListener("click", () => {
+      localStorage.removeItem(key);
+      token = "";
+      showAuth();
+    });
+    viewButton.addEventListener("click", () => setPreview(!previewOn));
+    previewCamera.addEventListener("change", () => {
+      if (previewOn) {
+        if (previewTimer) window.clearTimeout(previewTimer);
+        previewTimer = 0;
+        previewMessage.textContent = "Waiting for preview frame...";
+        previewMessage.classList.remove("hidden");
+        fetchPreview();
+      }
+    });
+    document.getElementById("start").addEventListener("click", () => action("/api/start"));
+    document.getElementById("stop").addEventListener("click", () => action("/api/stop"));
+    document.getElementById("refresh").addEventListener("click", refresh);
+    if (token) refresh(); else showAuth();
+    setInterval(() => { if (token && !busy) refresh(); }, 2500);
+  </script>
+</body>
+</html>"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,6 +2261,21 @@ cameras:
     }
 
     #[test]
+    fn parse_config_camera_names_reads_configured_order() {
+        let config = r#"
+cameras:
+  - name: cam0
+    url: /tmp/a.mp4
+  - name: cam2
+    url: /tmp/b.mp4
+"#;
+        assert_eq!(
+            parse_config_camera_names(config),
+            vec!["cam0".to_string(), "cam2".to_string()]
+        );
+    }
+
+    #[test]
     fn summarize_checks_counts_statuses() {
         let checks = vec![
             field_check("a", "A", "ok", "ready".to_string(), String::new()),
@@ -1073,6 +2287,118 @@ cameras:
         assert_eq!(report.warn_count, 1);
         assert_eq!(report.fail_count, 1);
         assert_eq!(report.target_count, 2);
+    }
+
+    #[test]
+    fn mobile_token_validation_requires_exact_header_value() {
+        assert!(mobile_token_matches("123456", Some("123456")));
+        assert!(mobile_token_matches("123456", Some(" 123456 ")));
+        assert!(!mobile_token_matches("123456", None));
+        assert!(!mobile_token_matches("123456", Some("12345")));
+        assert!(!mobile_token_matches("123456", Some("1234567")));
+        assert!(!mobile_token_matches("123456", Some("654321")));
+    }
+
+    #[test]
+    fn select_mobile_port_uses_first_available_candidate() {
+        let picked = select_mobile_port([1421, 1422, 1423], |port| port >= 1422);
+        assert_eq!(picked, Some(1422));
+
+        let none = select_mobile_port([1421, 1422], |_| false);
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn preview_camera_route_accepts_safe_names_only() {
+        assert_eq!(
+            preview_camera_from_route("/api/preview/cam0.jpg"),
+            Some("cam0".to_string())
+        );
+        assert_eq!(
+            preview_camera_from_route("/api/preview/cam-2_aux.jpg"),
+            Some("cam-2_aux".to_string())
+        );
+        assert_eq!(
+            preview_camera_from_route("/api/preview/../secret.jpg"),
+            None
+        );
+        assert_eq!(preview_camera_from_route("/api/preview/cam%200.jpg"), None);
+    }
+
+    #[test]
+    fn mobile_status_json_includes_runtime_process_camera_event_and_log_shape() {
+        let runtime = RuntimeStatus {
+            app_data_dir: "/tmp/app".to_string(),
+            runtime_dir: "/tmp/app/runtime".to_string(),
+            engine_dir: "/tmp/app/runtime/engine".to_string(),
+            config_path: "/tmp/app/runtime/config.yaml".to_string(),
+            python_path: "/tmp/app/runtime/.venv/bin/python".to_string(),
+            venv_exists: true,
+            config_exists: true,
+            model_exists: true,
+            tracker_exists: true,
+            uv_path: Some("/usr/local/bin/uv".to_string()),
+        };
+        let process = ProcessStatus {
+            running: true,
+            exit_code: None,
+        };
+        let events = vec![serde_json::json!({
+            "event": "fps_tick",
+            "ts": 1.0,
+            "cameras": [
+                {"name": "cam0", "fps": 12.0, "osc_rate": 9.5, "reconnects": 0, "frame_age_s": 0.1},
+                {"name": "cam1", "fps": 11.0, "osc_rate": 8.5, "reconnects": 1, "frame_age_s": 0.2}
+            ],
+            "projections": [{"id": "corridor", "active": [1], "xy": [1, 10, 20], "uv": [1, 0.1, 0.2]}]
+        })];
+        let logs = vec![LogEvent {
+            stream: "stdout".to_string(),
+            line: "ready".to_string(),
+        }];
+
+        let value = mobile_status_json(
+            runtime,
+            process,
+            vec!["cam0".to_string(), "cam1".to_string()],
+            events,
+            logs,
+        );
+        assert_eq!(value.get("ok").and_then(|item| item.as_bool()), Some(true));
+        assert_eq!(
+            value
+                .pointer("/summary/runtime_ready")
+                .and_then(|item| item.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .pointer("/summary/camera_count")
+                .and_then(|item| item.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            value
+                .get("configured_cameras")
+                .and_then(|item| item.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            value
+                .pointer("/process/running")
+                .and_then(|item| item.as_bool()),
+            Some(true)
+        );
+        assert!(value
+            .get("cameras")
+            .and_then(|item| item.as_array())
+            .is_some());
+        assert!(value
+            .get("events")
+            .and_then(|item| item.as_array())
+            .is_some());
+        assert!(value.get("logs").and_then(|item| item.as_array()).is_some());
     }
 
     #[test]
@@ -1276,7 +2602,12 @@ cameras:
         let request = SaveCalibrationPointsRequest {
             camera_name: "cam2".to_string(),
             region_id: Some("center_band".to_string()),
-            image_points: vec![[180.0, 120.0], [1040.0, 120.0], [1080.0, 560.0], [150.0, 560.0]],
+            image_points: vec![
+                [180.0, 120.0],
+                [1040.0, 120.0],
+                [1080.0, 560.0],
+                [150.0, 560.0],
+            ],
             point_kind: Some("floor".to_string()),
         };
         let text = calibration_config_text(config, &request).expect("cam2 floor should save");
@@ -1295,7 +2626,10 @@ cameras:
             .and_then(|value| value.as_sequence())
             .and_then(|regions| regions.first())
             .expect("cam2 region should exist");
-        assert_eq!(region.get("id").and_then(|value| value.as_str()), Some("center_band"));
+        assert_eq!(
+            region.get("id").and_then(|value| value.as_str()),
+            Some("center_band")
+        );
         assert_eq!(
             region.get("projection_id").and_then(|value| value.as_str()),
             Some("corridor")
@@ -1341,8 +2675,8 @@ cameras:
             relaxed_presence_uv: Some([0.32, 0.2, 0.58, 0.82]),
             relaxed_presence_v: Some(0.35),
         };
-        let text = calibration_mapping_config_text(config, &request)
-            .expect("cam2 mapping should save");
+        let text =
+            calibration_mapping_config_text(config, &request).expect("cam2 mapping should save");
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&text).expect("generated YAML should parse");
         let cameras = parsed
@@ -1582,9 +2916,30 @@ fn spawn_tracker_with_config(
     if !config.exists() {
         return Err("config.yaml is missing. Run setup first.".to_string());
     }
+    let preview_dir = mobile_preview_dir(&app)?;
+    fs::create_dir_all(&preview_dir)
+        .map_err(|err| format!("failed to create {}: {err}", preview_dir.display()))?;
 
     let mut cmd = Command::new(&python);
     cmd.current_dir(runtime_dir(&app)?)
+        .env("REOLINK_MOBILE_PREVIEW_DIR", &preview_dir)
+        .env(
+            "REOLINK_MOBILE_PREVIEW_REQUEST_FILE",
+            mobile_preview_request_path(&app)?,
+        )
+        .env("REOLINK_MOBILE_PREVIEW_MAX_WIDTH", MOBILE_PREVIEW_MAX_WIDTH)
+        .env(
+            "REOLINK_MOBILE_PREVIEW_INTERVAL_S",
+            MOBILE_PREVIEW_INTERVAL_S,
+        )
+        .env(
+            "REOLINK_MOBILE_PREVIEW_REQUEST_TTL_S",
+            MOBILE_PREVIEW_REQUEST_TTL_S,
+        )
+        .env(
+            "REOLINK_MOBILE_PREVIEW_JPEG_QUALITY",
+            MOBILE_PREVIEW_JPEG_QUALITY,
+        )
         .arg(&tracker)
         .arg("--config")
         .arg(&config)
@@ -1779,8 +3134,7 @@ fn save_calibration_mapping(
     Ok(())
 }
 
-#[tauri::command]
-fn stop_tracker(state: tauri::State<AppState>) -> Result<ProcessStatus, String> {
+fn stop_tracker_state(state: &AppState) -> Result<ProcessStatus, String> {
     let mut guard = state
         .child
         .lock()
@@ -1805,6 +3159,11 @@ fn stop_tracker(state: tauri::State<AppState>) -> Result<ProcessStatus, String> 
         running: false,
         exit_code: None,
     })
+}
+
+#[tauri::command]
+fn stop_tracker(state: tauri::State<AppState>) -> Result<ProcessStatus, String> {
+    stop_tracker_state(&state)
 }
 
 #[tauri::command]
@@ -1990,10 +3349,19 @@ fn read_projection_snapshot(app: AppHandle) -> Result<ProjectionSnapshot, String
     parse_projection_snapshot(&config)
 }
 
+#[tauri::command]
+fn get_mobile_server_status(app: AppHandle) -> MobileServerStatus {
+    mobile_server_status(&app)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            start_mobile_server(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
             prepare_runtime,
@@ -2008,7 +3376,8 @@ pub fn run() {
             tracker_status,
             collect_network_report,
             run_field_checks,
-            read_projection_snapshot
+            read_projection_snapshot,
+            get_mobile_server_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

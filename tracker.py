@@ -79,6 +79,8 @@ from region import (
 PERSON_CLASS_ID = 0  # COCO
 TAURI_APP_IDENTIFIER = "com.taeyang.reolink-tracker"
 CONFIG_RELOAD_INTERVAL_S = 0.5
+MOBILE_PREVIEW_DEFAULT_INTERVAL_S = 0.75
+MOBILE_PREVIEW_DEFAULT_TTL_S = 4.0
 SOURCE_ZONE_CODES = {
     "floor": 0,
     "body_catch": 1,
@@ -226,6 +228,16 @@ class CamCfg:
 
 
 @dataclass
+class MobilePreviewCfg:
+    directory: Path
+    request_file: Path
+    max_width: int = 640
+    interval_s: float = MOBILE_PREVIEW_DEFAULT_INTERVAL_S
+    request_ttl_s: float = MOBILE_PREVIEW_DEFAULT_TTL_S
+    jpeg_quality: int = 65
+
+
+@dataclass
 class DetectionFilterCfg:
     """Post-YOLO hygiene before raw tracks become interaction actors."""
 
@@ -311,6 +323,174 @@ class FrameGrabber(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def _safe_preview_name(name: str) -> str:
+    safe = "".join(
+        ch if ch.isascii() and (ch.isalnum() or ch in {"-", "_"}) else "_"
+        for ch in name
+    )
+    return safe or "camera"
+
+
+def _mobile_preview_cfg_from_env() -> Optional[MobilePreviewCfg]:
+    directory = os.environ.get("REOLINK_MOBILE_PREVIEW_DIR")
+    if not directory:
+        return None
+    preview_dir = Path(directory).expanduser()
+    request_file = Path(
+        os.environ.get(
+            "REOLINK_MOBILE_PREVIEW_REQUEST_FILE",
+            str(preview_dir / ".request"),
+        )
+    ).expanduser()
+    try:
+        max_width = max(int(os.environ.get("REOLINK_MOBILE_PREVIEW_MAX_WIDTH", "640")), 160)
+    except ValueError:
+        max_width = 640
+    try:
+        interval_s = max(float(os.environ.get("REOLINK_MOBILE_PREVIEW_INTERVAL_S", "0.75")), 0.25)
+    except ValueError:
+        interval_s = MOBILE_PREVIEW_DEFAULT_INTERVAL_S
+    try:
+        request_ttl_s = max(float(os.environ.get("REOLINK_MOBILE_PREVIEW_REQUEST_TTL_S", "4.0")), 1.0)
+    except ValueError:
+        request_ttl_s = MOBILE_PREVIEW_DEFAULT_TTL_S
+    try:
+        jpeg_quality = int(os.environ.get("REOLINK_MOBILE_PREVIEW_JPEG_QUALITY", "65"))
+    except ValueError:
+        jpeg_quality = 65
+    return MobilePreviewCfg(
+        directory=preview_dir,
+        request_file=request_file,
+        max_width=max_width,
+        interval_s=interval_s,
+        request_ttl_s=request_ttl_s,
+        jpeg_quality=min(max(jpeg_quality, 35), 85),
+    )
+
+
+class MobilePreviewSink:
+    """Writes low-rate mobile preview JPEGs only while the app requests them."""
+
+    def __init__(self, cfg: MobilePreviewCfg):
+        self.cfg = cfg
+        self._last_write_mono: dict[str, float] = {}
+        self.cfg.directory.mkdir(parents=True, exist_ok=True)
+
+    def _requested(self) -> bool:
+        try:
+            age = time.time() - self.cfg.request_file.stat().st_mtime
+        except OSError:
+            return False
+        return age <= self.cfg.request_ttl_s
+
+    def write(
+        self,
+        camera_name: str,
+        frame: np.ndarray,
+        overlays: list,
+        fps: float,
+        osc_rate: float,
+        reconnects: int,
+        frame_age_s: float,
+        now_mono: float,
+    ) -> None:
+        if not self._requested():
+            return
+        last_write = self._last_write_mono.get(camera_name, 0.0)
+        if now_mono - last_write < self.cfg.interval_s:
+            return
+
+        try:
+            jpg = self._render_jpeg(
+                camera_name,
+                frame,
+                overlays,
+                fps,
+                osc_rate,
+                reconnects,
+                frame_age_s,
+            )
+            target = self.cfg.directory / f"{_safe_preview_name(camera_name)}.jpg"
+            tmp = target.with_name(f".{target.name}.tmp")
+            tmp.write_bytes(jpg)
+            os.replace(tmp, target)
+            self._last_write_mono[camera_name] = now_mono
+        except Exception as ex:  # noqa: BLE001 - preview must never break tracking.
+            print(f"[mobile-preview] {camera_name}: {ex}", file=sys.stderr, flush=True)
+
+    def _render_jpeg(
+        self,
+        camera_name: str,
+        frame: np.ndarray,
+        overlays: list,
+        fps: float,
+        osc_rate: float,
+        reconnects: int,
+        frame_age_s: float,
+    ) -> bytes:
+        canvas = frame.copy()
+        for tid, bbox, conf, hits in overlays:
+            x1, y1, x2, y2 = (int(round(v)) for v in bbox)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 138, 61), 2)
+            label = f"id {tid} {conf:.2f}"
+            cv2.putText(
+                canvas,
+                label,
+                (x1, max(18, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            for reg_id, u, v, in_dispatch in hits:
+                color = (123, 216, 143) if in_dispatch else (255, 209, 102)
+                text = f"{reg_id} {u:.2f},{v:.2f}"
+                cv2.putText(
+                    canvas,
+                    text,
+                    (x1, min(canvas.shape[0] - 10, y2 + 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        status = (
+            f"{camera_name}  {fps:.1f}fps  osc={osc_rate:.1f}/s  "
+            f"age={frame_age_s:.1f}s  rc={reconnects}"
+        )
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 32), (8, 9, 11), -1)
+        cv2.putText(
+            canvas,
+            status,
+            (12, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (240, 234, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+        h, w = canvas.shape[:2]
+        if w > self.cfg.max_width:
+            scale = self.cfg.max_width / float(w)
+            canvas = cv2.resize(
+                canvas,
+                (self.cfg.max_width, max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            canvas,
+            [int(cv2.IMWRITE_JPEG_QUALITY), self.cfg.jpeg_quality],
+        )
+        if not ok:
+            raise RuntimeError("failed to encode jpeg")
+        return encoded.tobytes()
 
 
 class CamWorker:
@@ -1622,6 +1802,17 @@ def main() -> int:
     last_person_osc_mono = 0.0
     last_config_mtime_ns = _config_mtime_ns(config_path)
     last_config_reload_check = time.monotonic()
+    mobile_preview_cfg = _mobile_preview_cfg_from_env()
+    mobile_preview = MobilePreviewSink(mobile_preview_cfg) if mobile_preview_cfg else None
+    if mobile_preview_cfg is not None:
+        print(
+            "mobile_preview: "
+            f"dir={mobile_preview_cfg.directory} "
+            f"max_width={mobile_preview_cfg.max_width} "
+            f"interval_s={mobile_preview_cfg.interval_s:.2f} "
+            f"ttl_s={mobile_preview_cfg.request_ttl_s:.1f}",
+            flush=True,
+        )
 
     try:
         while not stop_flag.is_set():
@@ -1679,6 +1870,17 @@ def main() -> int:
                 last_frame[grab.cam.name] = frame
                 last_frame_ts[grab.cam.name] = frame_ts
                 last_overlays[grab.cam.name] = overlays
+                if mobile_preview is not None:
+                    mobile_preview.write(
+                        grab.cam.name,
+                        frame,
+                        overlays,
+                        last_fps_per_cam[grab.cam.name],
+                        last_osc_per_cam[grab.cam.name],
+                        grab.reconnects,
+                        time.time() - frame_ts if frame_ts else 999.0,
+                        now_mono,
+                    )
                 frame_events.extend(events)
                 frame_lost_sources.extend(lost_sources)
 

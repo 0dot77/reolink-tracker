@@ -20,6 +20,17 @@ type ProcessStatus = {
   exit_code: number | null;
 };
 
+type MobileServerStatus = {
+  running: boolean;
+  bind: string;
+  port: number | null;
+  token: string;
+  urls: string[];
+  status_path: string;
+  token_header: string;
+  error: string | null;
+};
+
 type TrackerLog = {
   stream: string;
   line: string;
@@ -164,6 +175,7 @@ const sectionLabels: Record<SectionId, string> = {
 const state: {
   section: SectionId;
   runtime: RuntimeStatus | null;
+  mobile: MobileServerStatus | null;
   process: ProcessStatus;
   config: string;
   logs: TrackerLog[];
@@ -198,6 +210,7 @@ const state: {
 } = {
   section: "live",
   runtime: null,
+  mobile: null,
   process: { running: false, exit_code: null },
   config: "",
   logs: [],
@@ -399,7 +412,7 @@ function render(): void {
           ${navButton("osc", "OSC", `${formatNumber(oscRate)}/s`)}
           ${navButton("network", "Network", state.network ? String(state.network.targets.length) : "probe")}
           ${navButton("showtime", "Showtime", setupReady ? "ready" : "todo")}
-          ${navButton("mobile", "Mobile", "health")}
+          ${navButton("mobile", "Mobile", state.mobile?.port ? String(state.mobile.port) : "off")}
         </div>
         <div class="nav-section">
           <div class="nav-label">Tools</div>
@@ -1094,26 +1107,72 @@ function replaySection(): string {
 }
 
 function mobileSection(): string {
+  const mobile = state.mobile;
+  const setupReady = isSetupReady();
+  const status = mobile?.running ? "serving" : mobile?.error ? "error" : "starting";
+  const urlRows = mobile?.urls.length
+    ? mobile.urls.map((url) => `<div class="mobile-url">${escapeHtml(url)}</div>`).join("")
+    : `<p class="muted">Mobile URL is pending. Refresh after the desktop app finishes starting.</p>`;
   return `
-    <section class="mobile-wrap">
-      <div class="phone-shell">
-        <div class="phone-screen">
-          <div class="phone-top">vomlab/reolink</div>
-          <div class="phone-status ${state.process.running ? "ok" : "warn"}">${state.process.running ? "RUNNING" : "STOPPED"}</div>
-          <div class="traffic-grid">
-            ${trafficTile("tracker", state.process.running ? "ok" : "warn", state.process.running ? "running" : "stopped")}
-            ${trafficTile("runtime", isSetupReady() ? "ok" : "warn", isSetupReady() ? "ready" : "setup")}
-            ${trafficTile("cameras", cameraItems().length ? "ok" : "warn", String(cameraItems().length))}
-            ${trafficTile("osc", sumCameraNumber("osc_rate") > 0 ? "ok" : "warn", `${formatNumber(sumCameraNumber("osc_rate"))}/s`)}
-          </div>
-          <div class="phone-events">${eventRows()}</div>
-        </div>
-      </div>
+    <section class="mobile-ops">
       <article class="panel">
-        <div class="panel-head"><h3>mobile health mirror</h3><span class="sub">desktop state, read-only</span></div>
+        <div class="panel-head">
+          <h3>LAN mobile control</h3>
+          <span class="sub">status plus PIN-protected Start/Stop</span>
+          <div class="actions"><button class="btn" data-action="mobile-refresh" ${buttonDisabled()}>Refresh</button></div>
+        </div>
         <div class="panel-body">
-          <p class="muted block-copy">This preview mirrors the current desktop state. Real phone polling should live in the sidecar so tracker latency is untouched.</p>
-          ${pathPanel(state.runtime)}
+          <div class="mobile-status-grid">
+            ${trafficTile("server", mobile?.running ? "ok" : "warn", status)}
+            ${trafficTile("port", mobile?.port ? "ok" : "warn", mobile?.port ? String(mobile.port) : "-")}
+            ${trafficTile("runtime", setupReady ? "ok" : "warn", setupReady ? "ready" : "setup")}
+            ${trafficTile("tracker", state.process.running ? "ok" : "warn", state.process.running ? "running" : "stopped")}
+          </div>
+          ${mobile?.error ? `<div class="banner error mobile-error">${escapeHtml(mobile.error)}</div>` : ""}
+          <div class="mobile-pin-box">
+            <span>PIN</span>
+            <b>${escapeHtml(mobile?.token ?? "-")}</b>
+            <em>${escapeHtml(mobile?.token_header ?? "X-Reolink-Mobile-Token")} header is required for every API request.</em>
+          </div>
+          <div class="mobile-url-list">
+            <span class="label">Open on phone</span>
+            ${urlRows}
+          </div>
+        </div>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><h3>connection checks</h3><span class="sub">when the phone cannot reach the page</span></div>
+        <div class="panel-body mobile-checks">
+          <div class="field-check-item ${mobile?.running ? "ok" : "warn"}">
+            <span class="ck">${mobile?.running ? "OK" : "WAIT"}</span>
+            <span class="body"><b>Desktop app running</b><em>The mobile server exists only while this Tauri app is open.</em></span>
+            <span class="meta">${escapeHtml(mobile?.bind ?? "0.0.0.0")}</span>
+          </div>
+          <div class="field-check-item warn">
+            <span class="ck">LAN</span>
+            <span class="body"><b>Same Wi-Fi or wired LAN</b><em>The phone must be on the same local network as this Mac.</em></span>
+            <span class="meta">local only</span>
+          </div>
+          <div class="field-check-item warn">
+            <span class="ck">FW</span>
+            <span class="body"><b>macOS firewall</b><em>Allow incoming connections for Reolink Tracker if macOS prompts.</em></span>
+            <span class="meta">port ${escapeHtml(String(mobile?.port ?? "1421-1430"))}</span>
+          </div>
+          <div class="field-check-item warn">
+            <span class="ck">PIN</span>
+            <span class="body"><b>Status is private</b><em>The phone shows only the PIN entry screen until the correct PIN is entered.</em></span>
+            <span class="meta">required</span>
+          </div>
+        </div>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><h3>mobile API</h3><span class="sub">v1 scope</span></div>
+        <div class="panel-body future-grid mobile-api-grid">
+          ${statusTile("GET /mobile", "Phone-first status and emergency control page.", "live")}
+          ${statusTile("GET /api/status", "Runtime, process, camera, OSC, event, and log summary after PIN.", "live")}
+          ${statusTile("GET /api/preview/<cam>.jpg", "Low-rate preview frame served only while mobile View is active.", "live")}
+          ${statusTile("POST /api/start", "Starts tracker headless through the same desktop process supervisor.", "live")}
+          ${statusTile("POST /api/stop", "Stops the shared tracker process. Preview and calibration stay desktop-only.", "live")}
         </div>
       </article>
     </section>
@@ -2386,6 +2445,18 @@ async function mockInvoke<T>(command: string): Promise<T> {
   if (command === "tracker_status") {
     return { running: false, exit_code: null } as T;
   }
+  if (command === "get_mobile_server_status") {
+    return {
+      running: true,
+      bind: "0.0.0.0",
+      port: 1421,
+      token: "123456",
+      urls: ["http://192.168.1.42:1421/mobile", "http://127.0.0.1:1421/mobile"],
+      status_path: "/api/status",
+      token_header: "X-Reolink-Mobile-Token",
+      error: null,
+    } as T;
+  }
   if (command === "start_video_test") {
     return { running: true, exit_code: null } as T;
   }
@@ -2715,6 +2786,8 @@ async function handleAction(action: string): Promise<void> {
       });
     } else if (action === "refresh") {
       await refreshAll();
+    } else if (action === "mobile-refresh") {
+      await refreshMobile();
     } else if (action === "start") {
       await refreshConfig();
       await refreshProjection();
@@ -2876,9 +2949,18 @@ async function refreshProjection(): Promise<void> {
   }
 }
 
+async function refreshMobile(): Promise<void> {
+  try {
+    state.mobile = await invoke<MobileServerStatus>("get_mobile_server_status");
+  } catch {
+    state.mobile = null;
+  }
+}
+
 async function refreshAll(): Promise<void> {
   state.runtime = await invoke<RuntimeStatus>("get_runtime_status");
   state.process = await invoke<ProcessStatus>("tracker_status");
+  await refreshMobile();
   await refreshConfig();
   await refreshProjection();
 }
