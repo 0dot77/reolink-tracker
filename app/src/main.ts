@@ -67,6 +67,55 @@ type FieldCheckReport = {
   fail_count: number;
 };
 
+type OpsDay = {
+  day: string;
+  event_count: number;
+  file_size_bytes: number;
+  first_ts: number | null;
+  last_ts: number | null;
+  path: string;
+};
+
+type OpsCameraSummary = {
+  name: string;
+  sample_count: number;
+  fps_avg: number | null;
+  fps_min: number | null;
+  reconnect_delta: number;
+  frame_age_warn_count: number;
+  osc_rate_avg: number | null;
+};
+
+type OpsProjectionSummary = {
+  id: string;
+  sample_count: number;
+  active_count_avg: number | null;
+  active_count_max: number;
+};
+
+type OpsSeriesPoint = {
+  ts: number | null;
+  osc_rate: number;
+  active_count: number;
+};
+
+type OpsSummary = {
+  day: string;
+  path: string;
+  event_count: number;
+  valid_event_count: number;
+  malformed_count: number;
+  file_size_bytes: number;
+  first_ts: number | null;
+  last_ts: number | null;
+  cameras: OpsCameraSummary[];
+  projections: OpsProjectionSummary[];
+  osc_rate_avg: number | null;
+  projection_active_count_avg: number | null;
+  projection_active_count_max: number;
+  series: OpsSeriesPoint[];
+};
+
 type ProjectionInfo = {
   id: string;
   pixel_size: number[];
@@ -151,6 +200,7 @@ type SectionId =
   | "calibration"
   | "osc"
   | "network"
+  | "operations"
   | "showtime"
   | "replay"
   | "mobile"
@@ -164,6 +214,7 @@ const sectionLabels: Record<SectionId, string> = {
   calibration: "Calibration",
   osc: "OSC",
   network: "Network",
+  operations: "Operations",
   showtime: "Showtime",
   replay: "Replay",
   mobile: "Mobile",
@@ -182,6 +233,9 @@ const state: {
   events: TrackerEvent[];
   network: NetworkReport | null;
   fieldChecks: FieldCheckReport | null;
+  opsDays: OpsDay[];
+  opsSummary: OpsSummary | null;
+  opsSelectedDay: string;
   projection: ProjectionSnapshot | null;
   videoPath: string;
   videoTestCamera: string;
@@ -217,6 +271,9 @@ const state: {
   events: [],
   network: null,
   fieldChecks: null,
+  opsDays: [],
+  opsSummary: null,
+  opsSelectedDay: "",
   projection: null,
   videoPath: "/Users/taeyang/Desktop/VomReo01-01-211808-211942.mp4",
   videoTestCamera: "cam2",
@@ -411,6 +468,7 @@ function render(): void {
           ${navButton("projection", "Projection", "uv")}
           ${navButton("osc", "OSC", `${formatNumber(oscRate)}/s`)}
           ${navButton("network", "Network", state.network ? String(state.network.targets.length) : "probe")}
+          ${navButton("operations", "Operations", state.opsDays.length ? `${state.opsDays.length}d` : "daily")}
           ${navButton("showtime", "Showtime", setupReady ? "ready" : "todo")}
           ${navButton("mobile", "Mobile", state.mobile?.port ? String(state.mobile.port) : "off")}
         </div>
@@ -460,6 +518,9 @@ function render(): void {
   root.querySelectorAll<HTMLButtonElement>("button[data-section]").forEach((button) => {
     button.addEventListener("click", () => {
       state.section = (button.dataset.section ?? "live") as SectionId;
+      if (state.section === "operations" && !state.opsDays.length) {
+        void refreshOperations().finally(render);
+      }
       render();
     });
   });
@@ -481,6 +542,12 @@ function render(): void {
   const videoTestCamera = root.querySelector<HTMLSelectElement>("#videoTestCamera");
   videoTestCamera?.addEventListener("change", () => {
     state.videoTestCamera = videoTestCamera.value;
+  });
+  const opsDaySelect = root.querySelector<HTMLSelectElement>("#opsDaySelect");
+  opsDaySelect?.addEventListener("change", () => {
+    state.opsSelectedDay = opsDaySelect.value;
+    state.opsSummary = null;
+    void refreshOpsSummary().finally(render);
   });
   const calibrationCamera = root.querySelector<HTMLSelectElement>("#calibrationCamera");
   calibrationCamera?.addEventListener("change", () => {
@@ -743,10 +810,7 @@ function handleWorkbenchKeyDown(event: KeyboardEvent): void {
 }
 
 function vomlabLogo(): string {
-  return `<svg class="brand-logo" viewBox="0 0 174 42" role="img" aria-label="VOMLab">
-    <path class="brand-logo-mark" d="M14 3 C22 8 29 18 37 30 C42 37 46 39 50 39 C57 39 63 33 72 20 C76 14 80 8 84 4 L89 4 C82 15 74 28 65 41 L55 41 C45 27 34 12 23 3 Z" />
-    <text class="brand-logo-text" x="0" y="34">VOMLab</text>
-  </svg>`;
+  return `<img class="brand-logo" src="/reolink-logo.svg" alt="Reolink Tracker">`;
 }
 
 function mainSection(): string {
@@ -767,6 +831,9 @@ function mainSection(): string {
   }
   if (state.section === "network") {
     return networkSection();
+  }
+  if (state.section === "operations") {
+    return operationsSection();
   }
   if (state.section === "showtime") {
     return showtimeSection();
@@ -1047,10 +1114,99 @@ function oscSection(): string {
   `;
 }
 
+function operationsSection(): string {
+  if (!state.opsSelectedDay && state.opsDays.length) {
+    state.opsSelectedDay = state.opsDays[0].day;
+  }
+  if (state.opsSelectedDay && !state.opsDays.some((day) => day.day === state.opsSelectedDay)) {
+    state.opsSelectedDay = state.opsDays[0]?.day ?? "";
+  }
+  const selectedDay = state.opsSelectedDay;
+  const selectedMeta = state.opsDays.find((day) => day.day === selectedDay) ?? null;
+  const summary = state.opsSummary?.day === selectedDay ? state.opsSummary : null;
+  const activeAvg = summary?.projection_active_count_avg;
+  return `
+    <section class="panel operations-head">
+      <div class="panel-head">
+        <h3>daily operations</h3>
+        <span class="sub">stored sidecar telemetry from tracker fps_tick events</span>
+        <div class="actions">
+          <label class="ops-day-select">Day ${opsDaySelect(selectedDay)}</label>
+          <button class="btn" data-action="operations-refresh" ${buttonDisabled()}>Refresh</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        ${
+          selectedDay
+            ? `<div class="ops-summary-strip">
+                ${opsMetric("events", summary ? String(summary.valid_event_count) : String(selectedMeta?.event_count ?? 0), "valid fps_tick lines")}
+                ${opsMetric("osc avg", summary?.osc_rate_avg == null ? "-" : `${formatNumber(summary.osc_rate_avg)}/s`, "sum of camera osc_rate")}
+                ${opsMetric("active avg", activeAvg == null ? "-" : formatNumber(activeAvg), "projection active count")}
+                ${opsMetric("active max", String(summary?.projection_active_count_max ?? 0), "peak concurrent ids")}
+                ${opsMetric("cameras", String(summary?.cameras.length ?? 0), "camera summaries")}
+                ${opsMetric("malformed", String(summary?.malformed_count ?? 0), "ignored JSONL lines")}
+              </div>`
+            : `<p class="muted">No operations day files have been recorded yet. Start or Preview writes fps_tick telemetry to runtime/ops.</p>`
+        }
+      </div>
+    </section>
+
+    ${
+      selectedDay
+        ? `<section class="ops-grid">
+            <article class="panel">
+              <div class="panel-head"><h3>camera health</h3><span class="sub">${escapeHtml(selectedDay)}</span></div>
+              <div class="panel-body panel-body-flush">
+                <table class="app-table ops-table">
+                  <thead><tr><th>Camera</th><th>Samples</th><th>FPS avg</th><th>FPS min</th><th>Reconnect +</th><th>Frame age warnings</th><th>OSC avg</th></tr></thead>
+                  <tbody>${opsCameraRows(summary)}</tbody>
+                </table>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><h3>projection activity</h3><span class="sub">active ids + osc rate</span></div>
+              <div class="panel-body ops-chart-stack">
+                ${opsSparkline("Active count", summary, "active")}
+                ${opsSparkline("OSC rate", summary, "osc")}
+                <div class="panel-body-flush">
+                  <table class="app-table ops-table">
+                    <thead><tr><th>Projection</th><th>Samples</th><th>Active avg</th><th>Active max</th></tr></thead>
+                    <tbody>${opsProjectionRows(summary)}</tbody>
+                  </table>
+                </div>
+              </div>
+            </article>
+          </section>
+          <section class="split ops-split">
+            <article class="panel">
+              <div class="panel-head"><h3>recent 30 days</h3><span class="sub">retention window</span></div>
+              <div class="panel-body panel-body-flush">
+                <table class="app-table ops-table">
+                  <thead><tr><th>Day</th><th>Events</th><th>Size</th><th>First</th><th>Last</th></tr></thead>
+                  <tbody>${opsDayRows(selectedDay)}</tbody>
+                </table>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><h3>raw storage</h3><span class="sub">metadata only in v1</span></div>
+              <div class="panel-body">
+                ${opsRawPanel(summary, selectedMeta)}
+              </div>
+            </article>
+          </section>`
+        : ""
+    }
+  `;
+}
+
 function showtimeSection(): string {
   const report = state.fieldChecks;
   const steps = report?.checks ?? fallbackShowtimeChecks();
   const criticalReady = Boolean(report && report.fail_count === 0 && isSetupReady());
+  const blockers = report?.checks.filter((check) => check.status === "fail") ?? [];
+  const latestTracker = report?.checks.find((check) => check.id === "tracker_event_recent");
+  const cameraFresh = report?.checks.find((check) => check.id === "camera_frame_fresh");
+  const oscActivity = report?.checks.find((check) => check.id === "osc_activity");
   return `
     <section class="showtime-layout">
       <article class="panel">
@@ -1070,7 +1226,18 @@ function showtimeSection(): string {
         <div class="panel-head"><h3>go live gate</h3><span class="sub">operator confirmation</span></div>
         <div class="panel-body">
           <div class="big-num">${criticalReady ? "READY" : "WAIT"}<span class="unit">checks</span></div>
-          <p class="muted block-copy">Launcher checks cover runtime, config, routes, RTSP port probes, and process state. TD handshake and walk-test stay manual until sidecar instrumentation exists.</p>
+          <p class="muted block-copy">Start is blocked only by failures the app can decide: runtime setup, config, camera routing, and live tracker telemetry. TD handshake and walk-test stay manual until sidecar instrumentation exists.</p>
+          <div class="gate-facts">
+            ${gateFact("last check", report ? formatCheckTime(report.generated_at) : "not run", report ? "ok" : "warn")}
+            ${gateFact("tracker event", latestTracker?.meta ?? "not measured", latestTracker?.status ?? "warn")}
+            ${gateFact("camera frames", cameraFresh?.meta ?? "not measured", cameraFresh?.status ?? "warn")}
+            ${gateFact("osc", oscActivity?.meta ?? "not measured", oscActivity?.status ?? "warn")}
+          </div>
+          ${
+            blockers.length
+              ? `<div class="field-blockers">${blockers.map((check) => `<span>${escapeHtml(check.label)}: ${escapeHtml(check.meta)}</span>`).join("")}</div>`
+              : ""
+          }
           <div class="inline-actions">
             <button class="btn primary" data-action="start" ${buttonDisabled(!criticalReady || state.process.running)}>Start</button>
             <button class="btn" data-action="preview" ${buttonDisabled(!isSetupReady() || state.process.running)}>Preview</button>
@@ -2076,6 +2243,15 @@ function fallbackShowtimeChecks(): FieldCheck[] {
   ];
 }
 
+function gateFact(label: string, value: string, status: FieldCheck["status"]): string {
+  const tone = status === "ok" ? "ok" : status === "fail" ? "err" : "warn";
+  return `<div class="gate-fact">
+    <span>${escapeHtml(label)}</span>
+    <b>${escapeHtml(value)}</b>
+    <i class="pill ${tone}">${escapeHtml(status)}</i>
+  </div>`;
+}
+
 function showtimeStep(index: number, check: FieldCheck): string {
   const tone = check.status === "ok" ? "ok" : check.status === "fail" ? "err" : "warn";
   return `<div class="showtime-step ${escapeHtml(check.status)}">
@@ -2424,10 +2600,10 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   if (hasTauriRuntime) {
     return tauriInvoke<T>(command, args);
   }
-  return mockInvoke<T>(command);
+  return mockInvoke<T>(command, args);
 }
 
-async function mockInvoke<T>(command: string): Promise<T> {
+async function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (command === "get_runtime_status") {
     return {
       app_data_dir: "Tauri runtime required",
@@ -2544,6 +2720,55 @@ cameras:
           ts: "",
         },
       ],
+    } as T;
+  }
+  if (command === "list_ops_days") {
+    return [
+      {
+        day: "2026-05-10",
+        event_count: 128,
+        file_size_bytes: 524_288,
+        first_ts: 1_778_383_200,
+        last_ts: 1_778_389_800,
+        path: "app-data/runtime/ops/2026-05-10.jsonl",
+      },
+      {
+        day: "2026-05-09",
+        event_count: 92,
+        file_size_bytes: 386_112,
+        first_ts: 1_778_296_800,
+        last_ts: 1_778_303_160,
+        path: "app-data/runtime/ops/2026-05-09.jsonl",
+      },
+    ] as T;
+  }
+  if (command === "read_ops_summary") {
+    const day = String(args?.day ?? "2026-05-10");
+    return {
+      day,
+      path: `app-data/runtime/ops/${day}.jsonl`,
+      event_count: 128,
+      valid_event_count: 126,
+      malformed_count: 2,
+      file_size_bytes: 524_288,
+      first_ts: 1_778_383_200,
+      last_ts: 1_778_389_800,
+      cameras: [
+        { name: "cam0", sample_count: 126, fps_avg: 13.2, fps_min: 8.8, reconnect_delta: 0, frame_age_warn_count: 2, osc_rate_avg: 8.9 },
+        { name: "cam2", sample_count: 126, fps_avg: 12.4, fps_min: 6.1, reconnect_delta: 1, frame_age_warn_count: 5, osc_rate_avg: 7.4 },
+        { name: "cam1-long-field-right-approach", sample_count: 126, fps_avg: 11.7, fps_min: 5.9, reconnect_delta: 0, frame_age_warn_count: 3, osc_rate_avg: 6.8 },
+      ],
+      projections: [
+        { id: "corridor", sample_count: 126, active_count_avg: 1.8, active_count_max: 4 },
+      ],
+      osc_rate_avg: 23.1,
+      projection_active_count_avg: 1.8,
+      projection_active_count_max: 4,
+      series: Array.from({ length: 48 }, (_, index) => ({
+        ts: 1_778_383_200 + index * 120,
+        osc_rate: 18 + Math.sin(index / 4) * 7 + (index % 9 === 0 ? 5 : 0),
+        active_count: Math.max(0, Math.round(1.5 + Math.sin(index / 5) * 1.4 + (index % 13 === 0 ? 1 : 0))),
+      })),
     } as T;
   }
   if (command === "read_projection_snapshot") {
@@ -2724,6 +2949,138 @@ function eventRows(): string {
     .join("");
 }
 
+function opsDaySelect(selectedDay: string): string {
+  if (!state.opsDays.length) {
+    return `<select id="opsDaySelect" disabled><option>No data</option></select>`;
+  }
+  return `<select id="opsDaySelect">${state.opsDays
+    .map((day) => `<option value="${escapeAttr(day.day)}" ${day.day === selectedDay ? "selected" : ""}>${escapeHtml(day.day)}</option>`)
+    .join("")}</select>`;
+}
+
+function opsMetric(label: string, value: string, note: string): string {
+  return `<div class="ops-metric">
+    <span>${escapeHtml(label)}</span>
+    <b>${escapeHtml(value)}</b>
+    <em>${escapeHtml(note)}</em>
+  </div>`;
+}
+
+function opsCameraRows(summary: OpsSummary | null): string {
+  if (!summary) {
+    return `<tr><td colspan="7" class="empty-cell">Select a day and refresh the summary.</td></tr>`;
+  }
+  if (!summary.cameras.length) {
+    return `<tr><td colspan="7" class="empty-cell">No camera telemetry in this day file.</td></tr>`;
+  }
+  return summary.cameras
+    .map((camera, index) => {
+      const camClass = cameraClassForName(camera.name, index);
+      return `<tr>
+        <td><span class="cam-swatch ${camClass}"></span>${escapeHtml(camera.name)}</td>
+        <td>${camera.sample_count}</td>
+        <td>${formatOptionalNumber(camera.fps_avg)}</td>
+        <td>${formatOptionalNumber(camera.fps_min)}</td>
+        <td>${camera.reconnect_delta}</td>
+        <td>${camera.frame_age_warn_count}</td>
+        <td>${camera.osc_rate_avg == null ? "-" : `${formatNumber(camera.osc_rate_avg)}/s`}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function opsProjectionRows(summary: OpsSummary | null): string {
+  if (!summary) {
+    return `<tr><td colspan="4" class="empty-cell">No summary loaded.</td></tr>`;
+  }
+  if (!summary.projections.length) {
+    return `<tr><td colspan="4" class="empty-cell">No projection telemetry in this day file.</td></tr>`;
+  }
+  return summary.projections
+    .map(
+      (projection) => `<tr>
+        <td>${escapeHtml(projection.id)}</td>
+        <td>${projection.sample_count}</td>
+        <td>${formatOptionalNumber(projection.active_count_avg)}</td>
+        <td>${projection.active_count_max}</td>
+      </tr>`,
+    )
+    .join("");
+}
+
+function opsDayRows(selectedDay: string): string {
+  if (!state.opsDays.length) {
+    return `<tr><td colspan="5" class="empty-cell">No operations files found.</td></tr>`;
+  }
+  return state.opsDays
+    .map(
+      (day) => `<tr class="${day.day === selectedDay ? "selected" : ""}">
+        <td>${escapeHtml(day.day)}</td>
+        <td>${day.event_count}</td>
+        <td>${formatBytes(day.file_size_bytes)}</td>
+        <td>${formatTimestamp(day.first_ts)}</td>
+        <td>${formatTimestamp(day.last_ts)}</td>
+      </tr>`,
+    )
+    .join("");
+}
+
+function opsRawPanel(summary: OpsSummary | null, meta: OpsDay | null): string {
+  const path = summary?.path ?? meta?.path ?? "-";
+  const eventCount = summary?.event_count ?? meta?.event_count ?? 0;
+  const size = summary?.file_size_bytes ?? meta?.file_size_bytes ?? 0;
+  const rows = [
+    ["Raw file", path],
+    ["Lines", String(eventCount)],
+    ["Valid fps_tick", String(summary?.valid_event_count ?? "-")],
+    ["Malformed", String(summary?.malformed_count ?? "-")],
+    ["Size", formatBytes(size)],
+    ["First", formatTimestamp(summary?.first_ts ?? meta?.first_ts)],
+    ["Last", formatTimestamp(summary?.last_ts ?? meta?.last_ts)],
+  ];
+  return `<div class="kv ops-raw-kv">${rows
+    .map(([key, value]) => `<div class="row"><span class="k">${escapeHtml(key)}</span><span class="v">${escapeHtml(value)}</span></div>`)
+    .join("")}</div>
+    <p class="muted block-copy">Raw JSONL lines are retained for sidecar diagnostics, but v1 renders only aggregate health and file metadata.</p>`;
+}
+
+function opsSparkline(label: string, summary: OpsSummary | null, kind: "active" | "osc"): string {
+  const points = summary?.series ?? [];
+  if (points.length < 2) {
+    return `<div class="ops-chart"><div class="ops-chart-head"><span>${escapeHtml(label)}</span><b>-</b></div><div class="empty-projection">No series data.</div></div>`;
+  }
+  const values = points.map((point) => (kind === "active" ? point.active_count : point.osc_rate));
+  const maxValue = Math.max(...values, 1);
+  const path = values
+    .map((value, index) => {
+      const x = (index / Math.max(1, values.length - 1)) * 100;
+      const y = 100 - (Number(value) / maxValue) * 92 - 4;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+  const latest = values[values.length - 1] ?? 0;
+  return `<div class="ops-chart">
+    <div class="ops-chart-head"><span>${escapeHtml(label)}</span><b>${kind === "osc" ? `${formatNumber(latest)}/s` : formatNumber(latest)}</b></div>
+    <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+      <polyline points="${path}" />
+    </svg>
+  </div>`;
+}
+
+function formatBytes(value: unknown): string {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${bytes.toFixed(0)} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function rightRail(setupReady: boolean): string {
   const latest = state.events[state.events.length - 1];
   return `
@@ -2896,6 +3253,8 @@ async function handleAction(action: string): Promise<void> {
       state.network = await invoke<NetworkReport>("collect_network_report");
     } else if (action === "field-checks") {
       state.fieldChecks = await invoke<FieldCheckReport>("run_field_checks");
+    } else if (action === "operations-refresh") {
+      await refreshOperations();
     } else if (action === "projection-refresh") {
       await refreshProjection();
     } else if (action === "workbench-reset-canvas") {
@@ -2957,12 +3316,34 @@ async function refreshMobile(): Promise<void> {
   }
 }
 
+async function refreshOperations(): Promise<void> {
+  try {
+    state.opsDays = await invoke<OpsDay[]>("list_ops_days");
+    if (!state.opsSelectedDay || !state.opsDays.some((day) => day.day === state.opsSelectedDay)) {
+      state.opsSelectedDay = state.opsDays[0]?.day ?? "";
+    }
+    await refreshOpsSummary();
+  } catch {
+    state.opsDays = [];
+    state.opsSummary = null;
+  }
+}
+
+async function refreshOpsSummary(): Promise<void> {
+  if (!state.opsSelectedDay) {
+    state.opsSummary = null;
+    return;
+  }
+  state.opsSummary = await invoke<OpsSummary>("read_ops_summary", { day: state.opsSelectedDay });
+}
+
 async function refreshAll(): Promise<void> {
   state.runtime = await invoke<RuntimeStatus>("get_runtime_status");
   state.process = await invoke<ProcessStatus>("tracker_status");
   await refreshMobile();
   await refreshConfig();
   await refreshProjection();
+  await refreshOperations();
 }
 
 function escapeHtml(value: string): string {

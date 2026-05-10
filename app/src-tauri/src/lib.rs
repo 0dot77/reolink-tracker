@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -119,6 +119,60 @@ struct FieldCheckReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct OpsDay {
+    day: String,
+    event_count: usize,
+    file_size_bytes: u64,
+    first_ts: Option<f64>,
+    last_ts: Option<f64>,
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpsCameraSummary {
+    name: String,
+    sample_count: u64,
+    fps_avg: Option<f64>,
+    fps_min: Option<f64>,
+    reconnect_delta: u64,
+    frame_age_warn_count: u64,
+    osc_rate_avg: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpsProjectionSummary {
+    id: String,
+    sample_count: u64,
+    active_count_avg: Option<f64>,
+    active_count_max: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpsSeriesPoint {
+    ts: Option<f64>,
+    osc_rate: f64,
+    active_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpsSummary {
+    day: String,
+    path: String,
+    event_count: usize,
+    valid_event_count: usize,
+    malformed_count: usize,
+    file_size_bytes: u64,
+    first_ts: Option<f64>,
+    last_ts: Option<f64>,
+    cameras: Vec<OpsCameraSummary>,
+    projections: Vec<OpsProjectionSummary>,
+    osc_rate_avg: Option<f64>,
+    projection_active_count_avg: Option<f64>,
+    projection_active_count_max: u64,
+    series: Vec<OpsSeriesPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ProjectionInfo {
     id: String,
     pixel_size: Vec<f64>,
@@ -215,6 +269,13 @@ const MOBILE_PREVIEW_MAX_WIDTH: &str = "640";
 const MOBILE_PREVIEW_INTERVAL_S: &str = "0.75";
 const MOBILE_PREVIEW_REQUEST_TTL_S: &str = "4.0";
 const MOBILE_PREVIEW_JPEG_QUALITY: &str = "65";
+const TRACKER_EVENT_STALE_FAIL_S: f64 = 8.0;
+const CAMERA_FRAME_WARN_S: f64 = 2.5;
+const CAMERA_FRAME_FAIL_S: f64 = 6.0;
+const OSC_ACTIVITY_MIN_RATE: f64 = 0.1;
+const OPS_RETENTION_DAYS: i64 = 30;
+const OPS_SERIES_MAX_POINTS: usize = 360;
+const SECONDS_PER_DAY: i64 = 86_400;
 
 fn generate_mobile_token() -> String {
     let seed = SystemTime::now()
@@ -444,6 +505,9 @@ fn emit_log(app: &AppHandle, stream: &str, line: String) {
     if line.trim_start().starts_with('{') {
         if let Ok(value) = serde_json::from_str::<JsonValue>(&line) {
             if value.get("event").is_some() {
+                if let Err(err) = persist_ops_event(app, &value) {
+                    eprintln!("failed to store operations event: {err}");
+                }
                 if let Ok(mut events) = app.state::<AppState>().events.lock() {
                     push_bounded(&mut events, value.clone(), MOBILE_EVENT_LIMIT);
                 }
@@ -1179,17 +1243,844 @@ fn runtime_ready_status(runtime: &RuntimeStatus) -> bool {
     runtime.venv_exists && runtime.config_exists && runtime.model_exists && runtime.tracker_exists
 }
 
+fn now_seconds_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_default()
+}
+
+fn latest_fps_event(events: &[JsonValue]) -> Option<&JsonValue> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.get("event").and_then(|value| value.as_str()) == Some("fps_tick"))
+}
+
+fn json_number(value: &JsonValue, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(|item| item.as_f64().or_else(|| item.as_i64().map(|n| n as f64)))
+}
+
+fn event_age_s(event: &JsonValue, now: f64) -> Option<f64> {
+    json_number(event, "ts").map(|ts| (now - ts).max(0.0))
+}
+
+fn camera_name(camera: &JsonValue) -> String {
+    camera
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("camera")
+        .to_string()
+}
+
+fn camera_reconnects(camera: &JsonValue) -> u64 {
+    camera
+        .get("reconnects")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().map(|n| n.max(0) as u64))
+        })
+        .unwrap_or_default()
+}
+
+fn latest_cameras(latest_fps: Option<&JsonValue>) -> Vec<&JsonValue> {
+    latest_fps
+        .and_then(|event| event.get("cameras"))
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
+fn latest_projections(latest_fps: Option<&JsonValue>) -> Vec<&JsonValue> {
+    latest_fps
+        .and_then(|event| event.get("projections"))
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
+fn parse_utc_offset_seconds(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if trimmed.len() != 5 {
+        return None;
+    }
+    let sign = match &trimmed[0..1] {
+        "+" => 1_i64,
+        "-" => -1_i64,
+        _ => return None,
+    };
+    let hours = trimmed[1..3].parse::<i64>().ok()?;
+    let minutes = trimmed[3..5].parse::<i64>().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * ((hours * 60 + minutes) * 60))
+}
+
+fn local_utc_offset_seconds() -> i64 {
+    Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| parse_utc_offset_seconds(&text))
+        .unwrap_or_default()
+}
+
+fn unix_seconds_now_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn epoch_day_from_unix_seconds(seconds: i64, utc_offset_seconds: i64) -> i64 {
+    (seconds + utc_offset_seconds).div_euclid(SECONDS_PER_DAY)
+}
+
+fn current_local_epoch_day() -> i64 {
+    epoch_day_from_unix_seconds(unix_seconds_now_i64(), local_utc_offset_seconds())
+}
+
+fn civil_from_epoch_day(epoch_day: i64) -> (i32, u32, u32) {
+    let z = epoch_day + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2).div_euclid(153);
+    let day = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
+}
+
+fn ops_day_from_epoch_day(epoch_day: i64) -> String {
+    let (year, month, day) = civil_from_epoch_day(epoch_day);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn is_valid_ops_day(day: &str) -> bool {
+    if day.len() != 10 {
+        return false;
+    }
+    let bytes = day.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(idx, byte)| idx == 4 || idx == 7 || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let month = day[5..7].parse::<u32>().unwrap_or_default();
+    let date = day[8..10].parse::<u32>().unwrap_or_default();
+    (1..=12).contains(&month) && (1..=31).contains(&date)
+}
+
+fn ops_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(runtime_dir(app)?.join("ops"))
+}
+
+fn ops_day_path(root: &Path, day: &str) -> Result<PathBuf, String> {
+    if !is_valid_ops_day(day) {
+        return Err(format!("invalid operations day: {day}"));
+    }
+    Ok(root.join(format!("{day}.jsonl")))
+}
+
+fn ops_day_from_path(path: &Path) -> Option<String> {
+    if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let day = path.file_stem()?.to_str()?.to_string();
+    is_valid_ops_day(&day).then_some(day)
+}
+
+fn prune_ops_dir(root: &Path, current_epoch_day: i64) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let cutoff = ops_day_from_epoch_day(current_epoch_day - OPS_RETENTION_DAYS + 1);
+    for entry in fs::read_dir(root)
+        .map_err(|err| format!("failed to read operations dir {}: {err}", root.display()))?
+    {
+        let entry = entry.map_err(|err| format!("failed to read operations dir entry: {err}"))?;
+        let path = entry.path();
+        let Some(day) = ops_day_from_path(&path) else {
+            continue;
+        };
+        if day < cutoff {
+            fs::remove_file(&path)
+                .map_err(|err| format!("failed to prune {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn ops_timestamp(event: &JsonValue) -> Option<f64> {
+    json_number(event, "ts").or_else(|| json_number(event, "_ops_saved_at_s"))
+}
+
+fn enriched_ops_event(event: &JsonValue, saved_at_s: f64, day: &str) -> Result<JsonValue, String> {
+    if event.get("event").and_then(|value| value.as_str()) != Some("fps_tick") {
+        return Err("only fps_tick operations events can be stored".to_string());
+    }
+    let mut out = event.clone();
+    let Some(object) = out.as_object_mut() else {
+        return Err("tracker event must be a JSON object".to_string());
+    };
+    object.insert("_ops_saved_at_s".to_string(), JsonValue::from(saved_at_s));
+    object.insert("_ops_saved_day".to_string(), JsonValue::from(day));
+    Ok(out)
+}
+
+fn append_ops_event_to_dir(
+    root: &Path,
+    event: &JsonValue,
+    current_epoch_day: i64,
+    saved_at_s: f64,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(root)
+        .map_err(|err| format!("failed to create operations dir {}: {err}", root.display()))?;
+    prune_ops_dir(root, current_epoch_day)?;
+    let day = ops_day_from_epoch_day(current_epoch_day);
+    let path = ops_day_path(root, &day)?;
+    let stored = enriched_ops_event(event, saved_at_s, &day)?;
+    let line = serde_json::to_string(&stored)
+        .map_err(|err| format!("failed to encode operations event: {err}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    writeln!(file, "{line}").map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+fn persist_ops_event(app: &AppHandle, event: &JsonValue) -> Result<(), String> {
+    if event.get("event").and_then(|value| value.as_str()) != Some("fps_tick") {
+        return Ok(());
+    }
+    let root = ops_dir(app)?;
+    append_ops_event_to_dir(&root, event, current_local_epoch_day(), now_seconds_f64()).map(|_| ())
+}
+
+fn scan_ops_day(path: &Path, day: &str) -> Result<OpsDay, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("failed to stat operations file {}: {err}", path.display()))?;
+    let file = fs::File::open(path)
+        .map_err(|err| format!("failed to open operations file {}: {err}", path.display()))?;
+    let mut event_count = 0_usize;
+    let mut first_ts = None;
+    let mut last_ts = None;
+    for line in BufReader::new(file).lines() {
+        let line = line
+            .map_err(|err| format!("failed to read operations file {}: {err}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        event_count += 1;
+        if let Ok(value) = serde_json::from_str::<JsonValue>(&line) {
+            if let Some(ts) = ops_timestamp(&value) {
+                first_ts.get_or_insert(ts);
+                last_ts = Some(ts);
+            }
+        }
+    }
+    Ok(OpsDay {
+        day: day.to_string(),
+        event_count,
+        file_size_bytes: metadata.len(),
+        first_ts,
+        last_ts,
+        path: path.display().to_string(),
+    })
+}
+
+fn discover_ops_days(root: &Path, current_epoch_day: Option<i64>) -> Result<Vec<OpsDay>, String> {
+    if let Some(epoch_day) = current_epoch_day {
+        prune_ops_dir(root, epoch_day)?;
+    }
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut days = Vec::new();
+    for entry in fs::read_dir(root)
+        .map_err(|err| format!("failed to read operations dir {}: {err}", root.display()))?
+    {
+        let entry = entry.map_err(|err| format!("failed to read operations dir entry: {err}"))?;
+        let path = entry.path();
+        if let Some(day) = ops_day_from_path(&path) {
+            days.push(scan_ops_day(&path, &day)?);
+        }
+    }
+    days.sort_by(|left, right| right.day.cmp(&left.day));
+    Ok(days)
+}
+
+#[derive(Default)]
+struct OpsCameraAccumulator {
+    sample_count: u64,
+    fps_sample_count: u64,
+    fps_sum: f64,
+    fps_min: Option<f64>,
+    reconnect_first: Option<u64>,
+    reconnect_last: Option<u64>,
+    frame_age_warn_count: u64,
+    osc_sample_count: u64,
+    osc_rate_sum: f64,
+}
+
+#[derive(Default)]
+struct OpsProjectionAccumulator {
+    sample_count: u64,
+    active_count_sum: u64,
+    active_count_max: u64,
+}
+
+fn downsample_ops_series(points: Vec<OpsSeriesPoint>) -> Vec<OpsSeriesPoint> {
+    if points.len() <= OPS_SERIES_MAX_POINTS {
+        return points;
+    }
+    let stride = (points.len() + OPS_SERIES_MAX_POINTS - 1) / OPS_SERIES_MAX_POINTS;
+    let mut out = points
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, point)| (idx % stride == 0).then(|| point.clone()))
+        .collect::<Vec<_>>();
+    if let (Some(last_out), Some(last_point)) = (out.last(), points.last()) {
+        if last_out.ts != last_point.ts {
+            out.push(last_point.clone());
+        }
+    }
+    out
+}
+
+fn read_ops_summary_from_path(path: &Path, day: &str) -> Result<OpsSummary, String> {
+    let metadata = fs::metadata(path).ok();
+    if metadata.is_none() {
+        return Ok(OpsSummary {
+            day: day.to_string(),
+            path: path.display().to_string(),
+            event_count: 0,
+            valid_event_count: 0,
+            malformed_count: 0,
+            file_size_bytes: 0,
+            first_ts: None,
+            last_ts: None,
+            cameras: Vec::new(),
+            projections: Vec::new(),
+            osc_rate_avg: None,
+            projection_active_count_avg: None,
+            projection_active_count_max: 0,
+            series: Vec::new(),
+        });
+    }
+    let file = fs::File::open(path)
+        .map_err(|err| format!("failed to open operations file {}: {err}", path.display()))?;
+    let mut event_count = 0_usize;
+    let mut valid_event_count = 0_usize;
+    let mut malformed_count = 0_usize;
+    let mut first_ts = None;
+    let mut last_ts = None;
+    let mut cameras: BTreeMap<String, OpsCameraAccumulator> = BTreeMap::new();
+    let mut projections: BTreeMap<String, OpsProjectionAccumulator> = BTreeMap::new();
+    let mut total_osc_rate_sum = 0.0_f64;
+    let mut total_osc_rate_samples = 0_u64;
+    let mut total_active_count_sum = 0_u64;
+    let mut total_active_count_samples = 0_u64;
+    let mut total_active_count_max = 0_u64;
+    let mut series = Vec::new();
+
+    for line in BufReader::new(file).lines() {
+        let line = line
+            .map_err(|err| format!("failed to read operations file {}: {err}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        event_count += 1;
+        let value = match serde_json::from_str::<JsonValue>(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                malformed_count += 1;
+                continue;
+            }
+        };
+        if value.get("event").and_then(|item| item.as_str()) != Some("fps_tick") {
+            continue;
+        }
+        valid_event_count += 1;
+        let ts = ops_timestamp(&value);
+        if let Some(ts) = ts {
+            first_ts.get_or_insert(ts);
+            last_ts = Some(ts);
+        }
+
+        let mut event_osc_rate = 0.0_f64;
+        if let Some(items) = value.get("cameras").and_then(|item| item.as_array()) {
+            for camera in items {
+                let name = camera_name(camera);
+                let entry = cameras.entry(name).or_default();
+                entry.sample_count += 1;
+                if let Some(fps) = json_number(camera, "fps") {
+                    entry.fps_sample_count += 1;
+                    entry.fps_sum += fps;
+                    entry.fps_min = Some(entry.fps_min.map_or(fps, |current| current.min(fps)));
+                }
+                let reconnects = camera_reconnects(camera);
+                entry.reconnect_first.get_or_insert(reconnects);
+                entry.reconnect_last = Some(reconnects);
+                if json_number(camera, "frame_age_s").is_some_and(|age| age > CAMERA_FRAME_WARN_S) {
+                    entry.frame_age_warn_count += 1;
+                }
+                if let Some(osc_rate) = json_number(camera, "osc_rate") {
+                    entry.osc_sample_count += 1;
+                    entry.osc_rate_sum += osc_rate;
+                    event_osc_rate += osc_rate;
+                }
+            }
+        }
+        total_osc_rate_sum += event_osc_rate;
+        total_osc_rate_samples += 1;
+
+        let mut event_active_count = 0_u64;
+        if let Some(items) = value.get("projections").and_then(|item| item.as_array()) {
+            for projection in items {
+                let id = projection
+                    .get("id")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("projection")
+                    .to_string();
+                let active_count = projection
+                    .get("active")
+                    .and_then(|item| item.as_array())
+                    .map(|items| items.len() as u64)
+                    .unwrap_or_default();
+                let entry = projections.entry(id).or_default();
+                entry.sample_count += 1;
+                entry.active_count_sum += active_count;
+                entry.active_count_max = entry.active_count_max.max(active_count);
+                event_active_count += active_count;
+            }
+        }
+        total_active_count_sum += event_active_count;
+        total_active_count_samples += 1;
+        total_active_count_max = total_active_count_max.max(event_active_count);
+        series.push(OpsSeriesPoint {
+            ts,
+            osc_rate: event_osc_rate,
+            active_count: event_active_count,
+        });
+    }
+
+    let camera_summaries = cameras
+        .into_iter()
+        .map(|(name, acc)| OpsCameraSummary {
+            name,
+            sample_count: acc.sample_count,
+            fps_avg: (acc.fps_sample_count > 0).then(|| acc.fps_sum / acc.fps_sample_count as f64),
+            fps_min: acc.fps_min,
+            reconnect_delta: acc
+                .reconnect_last
+                .unwrap_or_default()
+                .saturating_sub(acc.reconnect_first.unwrap_or_default()),
+            frame_age_warn_count: acc.frame_age_warn_count,
+            osc_rate_avg: (acc.osc_sample_count > 0)
+                .then(|| acc.osc_rate_sum / acc.osc_sample_count as f64),
+        })
+        .collect();
+    let projection_summaries = projections
+        .into_iter()
+        .map(|(id, acc)| OpsProjectionSummary {
+            id,
+            sample_count: acc.sample_count,
+            active_count_avg: (acc.sample_count > 0)
+                .then(|| acc.active_count_sum as f64 / acc.sample_count as f64),
+            active_count_max: acc.active_count_max,
+        })
+        .collect();
+
+    Ok(OpsSummary {
+        day: day.to_string(),
+        path: path.display().to_string(),
+        event_count,
+        valid_event_count,
+        malformed_count,
+        file_size_bytes: metadata.map(|item| item.len()).unwrap_or_default(),
+        first_ts,
+        last_ts,
+        cameras: camera_summaries,
+        projections: projection_summaries,
+        osc_rate_avg: (total_osc_rate_samples > 0)
+            .then(|| total_osc_rate_sum / total_osc_rate_samples as f64),
+        projection_active_count_avg: (total_active_count_samples > 0)
+            .then(|| total_active_count_sum as f64 / total_active_count_samples as f64),
+        projection_active_count_max: total_active_count_max,
+        series: downsample_ops_series(series),
+    })
+}
+
+fn tracker_event_recent_check(
+    process: &ProcessStatus,
+    events: &[JsonValue],
+    now: f64,
+) -> FieldCheck {
+    let latest = latest_fps_event(events);
+    if !process.running {
+        return field_check(
+            "tracker_event_recent",
+            "Tracker event freshness",
+            "warn",
+            "tracker stopped".to_string(),
+            latest
+                .and_then(|event| event_age_s(event, now))
+                .map(|age| {
+                    format!(
+                        "Last fps_tick was {age:.1}s ago. Start or Preview to refresh telemetry."
+                    )
+                })
+                .unwrap_or_else(|| "No fps_tick has been received yet.".to_string()),
+        );
+    }
+    match latest.and_then(|event| event_age_s(event, now)) {
+        Some(age) if age <= TRACKER_EVENT_STALE_FAIL_S => field_check(
+            "tracker_event_recent",
+            "Tracker event freshness",
+            "ok",
+            format!("fps_tick {age:.1}s ago"),
+            "Tracker status events are arriving within the pre-show freshness window.".to_string(),
+        ),
+        Some(age) => field_check(
+            "tracker_event_recent",
+            "Tracker event freshness",
+            "fail",
+            format!("fps_tick stale by {age:.1}s"),
+            format!(
+                "No fresh tracker status event within {TRACKER_EVENT_STALE_FAIL_S:.0}s while the tracker process is running."
+            ),
+        ),
+        None => field_check(
+            "tracker_event_recent",
+            "Tracker event freshness",
+            "fail",
+            "no fps_tick".to_string(),
+            "The tracker process is running but has not emitted structured status telemetry yet.".to_string(),
+        ),
+    }
+}
+
+fn camera_frame_fresh_check(process: &ProcessStatus, latest_fps: Option<&JsonValue>) -> FieldCheck {
+    let cameras = latest_cameras(latest_fps);
+    if cameras.is_empty() {
+        return field_check(
+            "camera_frame_fresh",
+            "Camera frame freshness",
+            if process.running { "fail" } else { "warn" },
+            "no camera telemetry".to_string(),
+            if process.running {
+                "The tracker is running but no camera frame ages are available.".to_string()
+            } else {
+                "Start or Preview to populate per-camera frame freshness.".to_string()
+            },
+        );
+    }
+
+    let mut missing = Vec::new();
+    let mut warn = Vec::new();
+    let mut fail = Vec::new();
+    let mut max_age = 0.0_f64;
+    for camera in cameras {
+        let name = camera_name(camera);
+        match json_number(camera, "frame_age_s") {
+            Some(age) => {
+                max_age = max_age.max(age);
+                if age > CAMERA_FRAME_FAIL_S {
+                    fail.push(format!("{name} {age:.1}s"));
+                } else if age > CAMERA_FRAME_WARN_S {
+                    warn.push(format!("{name} {age:.1}s"));
+                }
+            }
+            None => missing.push(name),
+        }
+    }
+
+    if process.running && (!fail.is_empty() || !missing.is_empty()) {
+        let mut parts = fail;
+        parts.extend(missing.into_iter().map(|name| format!("{name} no frame")));
+        return field_check(
+            "camera_frame_fresh",
+            "Camera frame freshness",
+            "fail",
+            format!("{} stale camera(s)", parts.len()),
+            parts.join(", "),
+        );
+    }
+    if !fail.is_empty() || !warn.is_empty() || !missing.is_empty() {
+        let mut parts = fail;
+        parts.extend(warn);
+        parts.extend(missing.into_iter().map(|name| format!("{name} no frame")));
+        return field_check(
+            "camera_frame_fresh",
+            "Camera frame freshness",
+            "warn",
+            format!("max age {max_age:.1}s"),
+            parts.join(", "),
+        );
+    }
+    field_check(
+        "camera_frame_fresh",
+        "Camera frame freshness",
+        "ok",
+        format!("max age {max_age:.1}s"),
+        "All reported cameras have recent frames.".to_string(),
+    )
+}
+
+fn camera_reconnects_check(process: &ProcessStatus, latest_fps: Option<&JsonValue>) -> FieldCheck {
+    let cameras = latest_cameras(latest_fps);
+    if cameras.is_empty() {
+        return field_check(
+            "camera_reconnects",
+            "Camera reconnects",
+            "warn",
+            "no camera telemetry".to_string(),
+            if process.running {
+                "Reconnect counts are unavailable in the current tracker event.".to_string()
+            } else {
+                "Reconnect counts appear after tracker telemetry starts.".to_string()
+            },
+        );
+    }
+    let reconnecting = cameras
+        .iter()
+        .filter_map(|camera| {
+            let count = camera_reconnects(camera);
+            (count > 0).then(|| format!("{}={count}", camera_name(camera)))
+        })
+        .collect::<Vec<_>>();
+    if reconnecting.is_empty() {
+        field_check(
+            "camera_reconnects",
+            "Camera reconnects",
+            "ok",
+            "0 reconnects".to_string(),
+            "No camera reconnects are reported in the latest tracker telemetry.".to_string(),
+        )
+    } else {
+        field_check(
+            "camera_reconnects",
+            "Camera reconnects",
+            "warn",
+            format!("{} camera(s)", reconnecting.len()),
+            reconnecting.join(", "),
+        )
+    }
+}
+
+fn osc_activity_check(process: &ProcessStatus, latest_fps: Option<&JsonValue>) -> FieldCheck {
+    let cameras = latest_cameras(latest_fps);
+    let osc_rate = cameras
+        .iter()
+        .filter_map(|camera| json_number(camera, "osc_rate"))
+        .sum::<f64>();
+    if cameras.is_empty() {
+        return field_check(
+            "osc_activity",
+            "OSC activity",
+            if process.running { "fail" } else { "warn" },
+            "no osc telemetry".to_string(),
+            if process.running {
+                "The tracker is running but no OSC rate telemetry is available.".to_string()
+            } else {
+                "Start or Preview to verify OSC heartbeat activity.".to_string()
+            },
+        );
+    }
+    if osc_rate > OSC_ACTIVITY_MIN_RATE {
+        field_check(
+            "osc_activity",
+            "OSC activity",
+            "ok",
+            format!("{osc_rate:.1}/s"),
+            "The tracker is reporting outgoing OSC heartbeat/activity.".to_string(),
+        )
+    } else {
+        field_check(
+            "osc_activity",
+            "OSC activity",
+            if process.running { "fail" } else { "warn" },
+            format!("{osc_rate:.1}/s"),
+            "OSC rate is zero in the latest tracker event.".to_string(),
+        )
+    }
+}
+
+fn projection_payload_check(process: &ProcessStatus, latest_fps: Option<&JsonValue>) -> FieldCheck {
+    let projections = latest_projections(latest_fps);
+    if projections.is_empty() {
+        return field_check(
+            "projection_payload",
+            "Projection payload",
+            if process.running { "fail" } else { "warn" },
+            "no projection telemetry".to_string(),
+            if process.running {
+                "The latest fps_tick did not include projection payload status.".to_string()
+            } else {
+                "Start or Preview to verify projection active/xy/uv payloads.".to_string()
+            },
+        );
+    }
+    let invalid = projections
+        .iter()
+        .filter_map(|projection| {
+            let id = projection
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("projection");
+            let valid = projection
+                .get("active")
+                .and_then(|value| value.as_array())
+                .is_some()
+                && projection
+                    .get("xy")
+                    .and_then(|value| value.as_array())
+                    .is_some()
+                && projection
+                    .get("uv")
+                    .and_then(|value| value.as_array())
+                    .is_some();
+            (!valid).then(|| id.to_string())
+        })
+        .collect::<Vec<_>>();
+    let active_count = projections
+        .iter()
+        .filter_map(|projection| projection.get("active").and_then(|value| value.as_array()))
+        .map(Vec::len)
+        .sum::<usize>();
+    if invalid.is_empty() {
+        field_check(
+            "projection_payload",
+            "Projection payload",
+            "ok",
+            format!("{} projection(s), {active_count} active", projections.len()),
+            "Latest tracker status includes active, xy, and uv payload arrays.".to_string(),
+        )
+    } else {
+        field_check(
+            "projection_payload",
+            "Projection payload",
+            if process.running { "fail" } else { "warn" },
+            format!("{} invalid projection(s)", invalid.len()),
+            invalid.join(", "),
+        )
+    }
+}
+
+fn mobile_preview_ready_check(mobile_running: bool, configured_cameras: &[String]) -> FieldCheck {
+    if mobile_running && !configured_cameras.is_empty() {
+        field_check(
+            "mobile_preview_ready",
+            "Mobile preview ready",
+            "ok",
+            format!("{} camera option(s)", configured_cameras.len()),
+            "Mobile server is available and camera names can be offered for preview requests."
+                .to_string(),
+        )
+    } else if mobile_running {
+        field_check(
+            "mobile_preview_ready",
+            "Mobile preview ready",
+            "warn",
+            "no camera names".to_string(),
+            "Mobile server is running, but config has no named cameras for preview selection."
+                .to_string(),
+        )
+    } else {
+        field_check(
+            "mobile_preview_ready",
+            "Mobile preview ready",
+            "warn",
+            "mobile server stopped".to_string(),
+            "Mobile preview needs the app's local mobile server.".to_string(),
+        )
+    }
+}
+
+fn operational_field_checks(
+    process: &ProcessStatus,
+    configured_cameras: &[String],
+    events: &[JsonValue],
+    mobile_running: bool,
+) -> Vec<FieldCheck> {
+    let now = now_seconds_f64();
+    let latest_fps = latest_fps_event(events);
+    vec![
+        tracker_event_recent_check(process, events, now),
+        camera_frame_fresh_check(process, latest_fps),
+        camera_reconnects_check(process, latest_fps),
+        osc_activity_check(process, latest_fps),
+        projection_payload_check(process, latest_fps),
+        mobile_preview_ready_check(mobile_running, configured_cameras),
+    ]
+}
+
+fn start_preflight_blockers(
+    runtime: &RuntimeStatus,
+    process: &ProcessStatus,
+    config_text: &str,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !runtime_ready_status(runtime) {
+        blockers.push("runtime setup is incomplete".to_string());
+    }
+    if process.running {
+        blockers.push("tracker is already running".to_string());
+    }
+    match serde_yaml::from_str::<serde_yaml::Value>(config_text) {
+        Ok(_) => {
+            let camera_names = parse_config_camera_names(config_text);
+            if camera_names.is_empty() {
+                blockers.push("config has no cameras[] entries".to_string());
+            }
+            if parse_config_targets(config_text).is_empty() {
+                blockers.push("config has no usable RTSP camera URLs".to_string());
+            }
+        }
+        Err(err) => blockers.push(format!("config YAML is invalid: {err}")),
+    }
+    blockers
+}
+
+fn ensure_mobile_start_allowed(
+    runtime: &RuntimeStatus,
+    process: &ProcessStatus,
+    config_text: &str,
+) -> Result<(), String> {
+    let blockers = start_preflight_blockers(runtime, process, config_text);
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Start blocked: {}", blockers.join("; ")))
+    }
+}
+
 fn mobile_status_json(
     runtime: RuntimeStatus,
     process: ProcessStatus,
-    configured_cameras: Vec<String>,
+    config_text: String,
     events: Vec<JsonValue>,
     logs: Vec<LogEvent>,
+    mobile_running: bool,
 ) -> JsonValue {
-    let latest_fps = events
-        .iter()
-        .rev()
-        .find(|event| event.get("event").and_then(|value| value.as_str()) == Some("fps_tick"));
+    let configured_cameras = parse_config_camera_names(&config_text);
+    let latest_fps = latest_fps_event(&events);
     let cameras = latest_fps
         .and_then(|event| event.get("cameras"))
         .cloned()
@@ -1217,6 +2108,80 @@ fn mobile_status_json(
         .and_then(|event| event.get("event"))
         .and_then(|value| value.as_str())
         .unwrap_or("-");
+    let mut field_checks = Vec::new();
+    let runtime_ready = runtime_ready_status(&runtime);
+    field_checks.push(field_check(
+        "runtime_prepared",
+        "Runtime prepared",
+        if runtime_ready { "ok" } else { "fail" },
+        if runtime_ready {
+            "all runtime files ready".to_string()
+        } else {
+            "setup incomplete".to_string()
+        },
+        format!(
+            "venv={} config={} model={} tracker={}",
+            runtime.venv_exists,
+            runtime.config_exists,
+            runtime.model_exists,
+            runtime.tracker_exists
+        ),
+    ));
+    let config_targets = parse_config_targets(&config_text);
+    match serde_yaml::from_str::<serde_yaml::Value>(&config_text) {
+        Ok(_) if config_targets.is_empty() => field_checks.push(field_check(
+            "config_valid",
+            "Config YAML",
+            "fail",
+            "valid YAML, no usable RTSP targets".to_string(),
+            "Camera URLs may still contain placeholders.".to_string(),
+        )),
+        Ok(_) => field_checks.push(field_check(
+            "config_valid",
+            "Config YAML",
+            "ok",
+            format!("{} camera target(s)", config_targets.len()),
+            "YAML parsed and RTSP hosts were extracted.".to_string(),
+        )),
+        Err(err) => field_checks.push(field_check(
+            "config_valid",
+            "Config YAML",
+            "fail",
+            "invalid YAML".to_string(),
+            err.to_string(),
+        )),
+    }
+    field_checks.push(field_check(
+        "tracker_process",
+        "Tracker process",
+        if process.running { "ok" } else { "warn" },
+        if process.running {
+            "running".to_string()
+        } else {
+            "stopped".to_string()
+        },
+        "Mobile Start launches the same tracker workflow as the desktop app.".to_string(),
+    ));
+    field_checks.extend(operational_field_checks(
+        &process,
+        &configured_cameras,
+        &events,
+        mobile_running,
+    ));
+    let field_ok_count = field_checks
+        .iter()
+        .filter(|check| check.status == "ok")
+        .count();
+    let field_warn_count = field_checks
+        .iter()
+        .filter(|check| check.status == "warn")
+        .count();
+    let field_fail_count = field_checks
+        .iter()
+        .filter(|check| check.status == "fail")
+        .count();
+    let start_blockers = start_preflight_blockers(&runtime, &process, &config_text);
+    let start_allowed = start_blockers.is_empty();
     serde_json::json!({
         "ok": true,
         "generated_at": now_label(),
@@ -1226,13 +2191,19 @@ fn mobile_status_json(
             "osc_rate": osc_rate,
             "latest_event": latest_event,
             "log_count": logs.len(),
-            "event_count": events.len()
+            "event_count": events.len(),
+            "field_ok_count": field_ok_count,
+            "field_warn_count": field_warn_count,
+            "field_fail_count": field_fail_count,
+            "start_allowed": start_allowed,
+            "start_blockers": start_blockers
         },
         "runtime": runtime,
         "process": process,
         "configured_cameras": configured_cameras,
         "cameras": cameras,
         "projections": projections,
+        "field_checks": field_checks,
         "events": events,
         "logs": logs
     })
@@ -1240,17 +2211,17 @@ fn mobile_status_json(
 
 fn mobile_status_for_app(app: &AppHandle) -> Result<JsonValue, String> {
     let runtime = get_runtime_status(app.clone())?;
-    let configured_cameras = fs::read_to_string(config_path(app)?)
-        .map(|config| parse_config_camera_names(&config))
-        .unwrap_or_default();
+    let config_text = fs::read_to_string(config_path(app)?).unwrap_or_default();
     let state = app.state::<AppState>();
     let process = inspect_tracker_state(&state)?;
+    let mobile_running = mobile_server_status(app).running;
     Ok(mobile_status_json(
         runtime,
         process,
-        configured_cameras,
+        config_text,
         snapshot_events(&state, MOBILE_API_EVENT_LIMIT),
         snapshot_logs(&state, MOBILE_API_LOG_LIMIT),
+        mobile_running,
     ))
 }
 
@@ -1532,18 +2503,46 @@ fn handle_mobile_connection(mut stream: TcpStream, app: AppHandle) {
                     Err(err) => write_json_error(&mut stream, "500 Internal Server Error", &err),
                 },
                 ("POST", "/api/start") => {
-                    let result = spawn_tracker_with_config(
-                        app.clone(),
-                        &state,
-                        match config_path(&app) {
-                            Ok(path) => path,
-                            Err(err) => {
-                                write_json_error(&mut stream, "500 Internal Server Error", &err);
-                                return;
-                            }
-                        },
-                        false,
-                    );
+                    let runtime = match get_runtime_status(app.clone()) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            write_json_error(&mut stream, "500 Internal Server Error", &err);
+                            return;
+                        }
+                    };
+                    let config = match config_path(&app) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            write_json_error(&mut stream, "500 Internal Server Error", &err);
+                            return;
+                        }
+                    };
+                    let config_text = match fs::read_to_string(&config) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            write_json_error(
+                                &mut stream,
+                                "409 Conflict",
+                                &format!(
+                                    "Start blocked: config.yaml is missing or unreadable: {err}"
+                                ),
+                            );
+                            return;
+                        }
+                    };
+                    let process = match inspect_tracker_state(&state) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            write_json_error(&mut stream, "500 Internal Server Error", &err);
+                            return;
+                        }
+                    };
+                    if let Err(err) = ensure_mobile_start_allowed(&runtime, &process, &config_text)
+                    {
+                        write_json_error(&mut stream, "409 Conflict", &err);
+                        return;
+                    }
+                    let result = spawn_tracker_with_config(app.clone(), &state, config, false);
                     match result {
                         Ok(_) => match mobile_status_for_app(&app) {
                             Ok(value) => write_json_response(&mut stream, "200 OK", value),
@@ -1913,6 +2912,7 @@ fn mobile_page_html() -> &'static str {
         <div class="tile"><span>osc</span><b id="osc">-</b></div>
         <div class="tile"><span>cameras</span><b id="cameras">-</b></div>
         <div class="tile"><span>latest</span><b id="latest">-</b></div>
+        <div class="tile"><span>gate</span><b id="gate">-</b></div>
       </div>
     </section>
     <section class="card preview-card">
@@ -1932,6 +2932,7 @@ fn mobile_page_html() -> &'static str {
         <span>rotate phone for landscape</span>
       </div>
     </section>
+    <section class="card"><h2>field gate</h2><div id="fieldRows" class="card-body"></div></section>
     <section class="card"><h2>cameras</h2><div id="cameraRows" class="card-body"></div></section>
     <section class="card"><h2>events</h2><div id="events" class="card-body feed"></div></section>
     <section class="card"><h2>stdout/stderr</h2><div id="logs" class="card-body feed"></div></section>
@@ -2088,6 +3089,12 @@ fn mobile_page_html() -> &'static str {
       }
       return cameras.map(cam => `<div class="row"><span>${esc(cam.name)}</span><b>${num(cam.fps)} fps / age ${num(cam.frame_age_s)}s / reconnects ${esc(cam.reconnects ?? 0)}</b></div>`).join("");
     }
+    function renderFieldRows(checks) {
+      if (!Array.isArray(checks) || !checks.length) {
+        return "<p class='label'>No field checks yet.</p>";
+      }
+      return checks.map(check => `<div class="row"><span>${esc(check.status)}</span><b>${esc(check.label)} · ${esc(check.meta)}</b></div>`).join("");
+    }
     function renderFeed(items, kind) {
       if (!Array.isArray(items) || !items.length) {
         return "<div class='feed-item'>No entries yet.</div>";
@@ -2109,11 +3116,13 @@ fn mobile_page_html() -> &'static str {
       document.getElementById("osc").textContent = `${num(data.summary?.osc_rate)}/s`;
       document.getElementById("cameras").textContent = String(data.summary?.camera_count ?? 0);
       document.getElementById("latest").textContent = data.summary?.latest_event || "-";
+      document.getElementById("gate").textContent = data.summary?.start_allowed ? "ready" : (running ? "running" : `${data.summary?.field_fail_count ?? 0} fail`);
+      document.getElementById("fieldRows").innerHTML = renderFieldRows(data.field_checks);
       document.getElementById("cameraRows").innerHTML = renderRows(data.cameras);
       document.getElementById("events").innerHTML = renderFeed(data.events, "event");
       document.getElementById("logs").innerHTML = renderFeed(data.logs, "log");
       syncPreviewCameras(data);
-      document.getElementById("start").disabled = running || busy;
+      document.getElementById("start").disabled = !data.summary?.start_allowed || busy;
       document.getElementById("stop").disabled = !running || busy;
       dashError.classList.add("hidden");
     }
@@ -2289,6 +3298,219 @@ cameras:
         assert_eq!(report.target_count, 2);
     }
 
+    fn temp_ops_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "reolink-ops-{label}-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("temp ops dir should be created");
+        path
+    }
+
+    #[test]
+    fn ops_day_format_uses_civil_dates() {
+        assert_eq!(ops_day_from_epoch_day(0), "1970-01-01");
+        assert_eq!(
+            ops_day_from_epoch_day(epoch_day_from_unix_seconds(1_684_108_800, 0)),
+            "2023-05-15"
+        );
+        assert_eq!(parse_utc_offset_seconds("+0900"), Some(32_400));
+        assert_eq!(parse_utc_offset_seconds("-0530"), Some(-19_800));
+    }
+
+    #[test]
+    fn ops_append_stores_raw_fps_tick_with_metadata() {
+        let root = temp_ops_dir("append");
+        let event = serde_json::json!({
+            "event": "fps_tick",
+            "ts": 100.0,
+            "cameras": [{"name": "cam0", "fps": 12.5}],
+            "projections": [{"id": "corridor", "active": [1]}]
+        });
+
+        let path =
+            append_ops_event_to_dir(&root, &event, 0, 101.5).expect("ops append should succeed");
+        let line = fs::read_to_string(&path).expect("ops file should be readable");
+        let stored = serde_json::from_str::<JsonValue>(line.trim())
+            .expect("ops line should stay valid json");
+
+        assert_eq!(
+            stored.pointer("/event").and_then(|item| item.as_str()),
+            Some("fps_tick")
+        );
+        assert_eq!(
+            stored
+                .pointer("/cameras/0/name")
+                .and_then(|item| item.as_str()),
+            Some("cam0")
+        );
+        assert_eq!(
+            stored
+                .pointer("/projections/0/active/0")
+                .and_then(|item| item.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            stored.get("_ops_saved_at_s").and_then(|item| item.as_f64()),
+            Some(101.5)
+        );
+        assert_eq!(
+            stored.get("_ops_saved_day").and_then(|item| item.as_str()),
+            Some("1970-01-01")
+        );
+        fs::remove_dir_all(&root).expect("temp ops dir should be removable");
+    }
+
+    #[test]
+    fn ops_prune_keeps_only_retention_window() {
+        let root = temp_ops_dir("prune");
+        fs::write(root.join("1970-01-01.jsonl"), "{}\n").expect("old file should be written");
+        fs::write(root.join("1970-01-02.jsonl"), "{}\n").expect("cutoff file should be written");
+        fs::write(root.join("1970-01-31.jsonl"), "{}\n").expect("current file should be written");
+
+        prune_ops_dir(&root, 30).expect("ops prune should succeed");
+
+        assert!(!root.join("1970-01-01.jsonl").exists());
+        assert!(root.join("1970-01-02.jsonl").exists());
+        assert!(root.join("1970-01-31.jsonl").exists());
+        fs::remove_dir_all(&root).expect("temp ops dir should be removable");
+    }
+
+    #[test]
+    fn ops_summary_handles_empty_malformed_and_valid_lines() {
+        let root = temp_ops_dir("summary");
+        let path = root.join("2026-05-10.jsonl");
+        fs::write(
+            &path,
+            r#"{"event":"fps_tick","ts":10.0,"cameras":[{"name":"cam0","fps":12.0,"osc_rate":4.0,"reconnects":2,"frame_age_s":1.0}],"projections":[{"id":"corridor","active":[1,2]}]}
+not-json
+{"event":"fps_tick","ts":12.0,"cameras":[{"name":"cam0","fps":8.0,"osc_rate":6.0,"reconnects":5,"frame_age_s":3.0}],"projections":[{"id":"corridor","active":[1]}]}
+"#,
+        )
+        .expect("summary file should be written");
+
+        let summary = read_ops_summary_from_path(&path, "2026-05-10")
+            .expect("summary should tolerate malformed lines");
+
+        assert_eq!(summary.event_count, 3);
+        assert_eq!(summary.valid_event_count, 2);
+        assert_eq!(summary.malformed_count, 1);
+        assert_eq!(summary.first_ts, Some(10.0));
+        assert_eq!(summary.last_ts, Some(12.0));
+        assert_eq!(summary.cameras.len(), 1);
+        assert_eq!(summary.cameras[0].name, "cam0");
+        assert_eq!(summary.cameras[0].fps_avg, Some(10.0));
+        assert_eq!(summary.cameras[0].fps_min, Some(8.0));
+        assert_eq!(summary.cameras[0].reconnect_delta, 3);
+        assert_eq!(summary.cameras[0].frame_age_warn_count, 1);
+        assert_eq!(summary.cameras[0].osc_rate_avg, Some(5.0));
+        assert_eq!(summary.projections[0].active_count_avg, Some(1.5));
+        assert_eq!(summary.projections[0].active_count_max, 2);
+        assert_eq!(summary.osc_rate_avg, Some(5.0));
+        assert_eq!(summary.projection_active_count_avg, Some(1.5));
+        assert_eq!(summary.projection_active_count_max, 2);
+        assert_eq!(summary.series.len(), 2);
+        fs::remove_dir_all(&root).expect("temp ops dir should be removable");
+    }
+
+    fn ready_runtime() -> RuntimeStatus {
+        RuntimeStatus {
+            app_data_dir: "/tmp/app".to_string(),
+            runtime_dir: "/tmp/app/runtime".to_string(),
+            engine_dir: "/tmp/app/runtime/engine".to_string(),
+            config_path: "/tmp/app/runtime/config.yaml".to_string(),
+            python_path: "/tmp/app/runtime/.venv/bin/python".to_string(),
+            venv_exists: true,
+            config_exists: true,
+            model_exists: true,
+            tracker_exists: true,
+            uv_path: Some("/usr/local/bin/uv".to_string()),
+        }
+    }
+
+    fn running_process() -> ProcessStatus {
+        ProcessStatus {
+            running: true,
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn tracker_event_recent_check_marks_stale_running_tracker_as_fail() {
+        let process = running_process();
+        let fresh = vec![serde_json::json!({"event": "fps_tick", "ts": 100.0})];
+        let stale = vec![serde_json::json!({"event": "fps_tick", "ts": 80.0})];
+
+        let fresh_check = tracker_event_recent_check(&process, &fresh, 103.0);
+        let stale_check = tracker_event_recent_check(&process, &stale, 103.0);
+
+        assert_eq!(fresh_check.status, "ok");
+        assert_eq!(stale_check.status, "fail");
+    }
+
+    #[test]
+    fn camera_frame_fresh_check_warns_then_fails_by_age_threshold() {
+        let process = running_process();
+        let warn_event = serde_json::json!({
+            "event": "fps_tick",
+            "cameras": [{"name": "cam0", "frame_age_s": CAMERA_FRAME_WARN_S + 0.2}]
+        });
+        let fail_event = serde_json::json!({
+            "event": "fps_tick",
+            "cameras": [{"name": "cam0", "frame_age_s": CAMERA_FRAME_FAIL_S + 0.2}]
+        });
+
+        let warn = camera_frame_fresh_check(&process, Some(&warn_event));
+        let fail = camera_frame_fresh_check(&process, Some(&fail_event));
+
+        assert_eq!(warn.status, "warn");
+        assert_eq!(fail.status, "fail");
+    }
+
+    #[test]
+    fn osc_activity_check_fails_running_tracker_with_zero_rate() {
+        let process = running_process();
+        let silent_event = serde_json::json!({
+            "event": "fps_tick",
+            "cameras": [{"name": "cam0", "osc_rate": 0.0}]
+        });
+        let active_event = serde_json::json!({
+            "event": "fps_tick",
+            "cameras": [{"name": "cam0", "osc_rate": 2.0}]
+        });
+
+        let silent = osc_activity_check(&process, Some(&silent_event));
+        let active = osc_activity_check(&process, Some(&active_event));
+
+        assert_eq!(silent.status, "fail");
+        assert_eq!(active.status, "ok");
+    }
+
+    #[test]
+    fn mobile_start_preflight_blocks_setup_and_config_failures() {
+        let mut runtime = ready_runtime();
+        runtime.venv_exists = false;
+        let process = ProcessStatus {
+            running: false,
+            exit_code: None,
+        };
+        let placeholder_config = r#"
+cameras:
+  - name: cam0
+    url: rtsp://admin:<password>@<camera-ip>:554/h264Preview_01_sub
+"#;
+
+        let err = ensure_mobile_start_allowed(&runtime, &process, placeholder_config)
+            .expect_err("setup and placeholder config should block mobile start");
+        assert!(err.contains("runtime setup is incomplete"));
+        assert!(err.contains("config has no usable RTSP camera URLs"));
+    }
+
     #[test]
     fn mobile_token_validation_requires_exact_header_value() {
         assert!(mobile_token_matches("123456", Some("123456")));
@@ -2327,25 +3549,11 @@ cameras:
 
     #[test]
     fn mobile_status_json_includes_runtime_process_camera_event_and_log_shape() {
-        let runtime = RuntimeStatus {
-            app_data_dir: "/tmp/app".to_string(),
-            runtime_dir: "/tmp/app/runtime".to_string(),
-            engine_dir: "/tmp/app/runtime/engine".to_string(),
-            config_path: "/tmp/app/runtime/config.yaml".to_string(),
-            python_path: "/tmp/app/runtime/.venv/bin/python".to_string(),
-            venv_exists: true,
-            config_exists: true,
-            model_exists: true,
-            tracker_exists: true,
-            uv_path: Some("/usr/local/bin/uv".to_string()),
-        };
-        let process = ProcessStatus {
-            running: true,
-            exit_code: None,
-        };
+        let runtime = ready_runtime();
+        let process = running_process();
         let events = vec![serde_json::json!({
             "event": "fps_tick",
-            "ts": 1.0,
+            "ts": now_seconds_f64(),
             "cameras": [
                 {"name": "cam0", "fps": 12.0, "osc_rate": 9.5, "reconnects": 0, "frame_age_s": 0.1},
                 {"name": "cam1", "fps": 11.0, "osc_rate": 8.5, "reconnects": 1, "frame_age_s": 0.2}
@@ -2356,14 +3564,15 @@ cameras:
             stream: "stdout".to_string(),
             line: "ready".to_string(),
         }];
+        let config = r#"
+cameras:
+  - name: cam0
+    url: rtsp://admin:%21pass@192.168.1.20:554/h264Preview_01_sub
+  - name: cam1
+    url: rtsp://admin:%21pass@192.168.1.21:554/h264Preview_01_sub
+"#;
 
-        let value = mobile_status_json(
-            runtime,
-            process,
-            vec!["cam0".to_string(), "cam1".to_string()],
-            events,
-            logs,
-        );
+        let value = mobile_status_json(runtime, process, config.to_string(), events, logs, true);
         assert_eq!(value.get("ok").and_then(|item| item.as_bool()), Some(true));
         assert_eq!(
             value
@@ -2386,6 +3595,25 @@ cameras:
         );
         assert_eq!(
             value
+                .pointer("/summary/field_fail_count")
+                .and_then(|item| item.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            value
+                .pointer("/summary/start_allowed")
+                .and_then(|item| item.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            value
+                .pointer("/summary/start_blockers")
+                .and_then(|item| item.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            value
                 .pointer("/process/running")
                 .and_then(|item| item.as_bool()),
             Some(true)
@@ -2396,6 +3624,10 @@ cameras:
             .is_some());
         assert!(value
             .get("events")
+            .and_then(|item| item.as_array())
+            .is_some());
+        assert!(value
+            .get("field_checks")
             .and_then(|item| item.as_array())
             .is_some());
         assert!(value.get("logs").and_then(|item| item.as_array()).is_some());
@@ -3226,7 +4458,7 @@ fn run_field_checks(
     checks.push(field_check(
         "runtime_prepared",
         "Runtime prepared",
-        if runtime_ready { "ok" } else { "warn" },
+        if runtime_ready { "ok" } else { "fail" },
         if runtime_ready {
             "all runtime files ready".to_string()
         } else {
@@ -3245,7 +4477,7 @@ fn run_field_checks(
         Ok(_) if targets.is_empty() => checks.push(field_check(
             "config_valid",
             "Config YAML",
-            "warn",
+            "fail",
             "valid YAML, no usable RTSP targets".to_string(),
             "Camera URLs may still contain placeholders.".to_string(),
         )),
@@ -3269,7 +4501,7 @@ fn run_field_checks(
         checks.push(field_check(
             "camera_routes",
             "Camera routes",
-            "warn",
+            "fail",
             "no camera hosts".to_string(),
             "Save real RTSP URLs in config.yaml, then run checks again.".to_string(),
         ));
@@ -3291,7 +4523,7 @@ fn run_field_checks(
             if route_failures.is_empty() {
                 "ok"
             } else {
-                "warn"
+                "fail"
             },
             if route_failures.is_empty() {
                 format!("{} route(s) resolved", targets.len())
@@ -3320,6 +4552,16 @@ fn run_field_checks(
             "stopped".to_string()
         },
         "Start or Preview launches the current tracker workflow.".to_string(),
+    ));
+
+    let configured_cameras = parse_config_camera_names(&config_text);
+    let mobile_running = mobile_server_status(&app).running;
+    let events = snapshot_events(&state, MOBILE_API_EVENT_LIMIT);
+    checks.extend(operational_field_checks(
+        &process,
+        &configured_cameras,
+        &events,
+        mobile_running,
     ));
 
     checks.push(field_check(
@@ -3354,12 +4596,28 @@ fn get_mobile_server_status(app: AppHandle) -> MobileServerStatus {
     mobile_server_status(&app)
 }
 
+#[tauri::command]
+fn list_ops_days(app: AppHandle) -> Result<Vec<OpsDay>, String> {
+    discover_ops_days(&ops_dir(&app)?, Some(current_local_epoch_day()))
+}
+
+#[tauri::command]
+fn read_ops_summary(app: AppHandle, day: String) -> Result<OpsSummary, String> {
+    let root = ops_dir(&app)?;
+    let path = ops_day_path(&root, day.trim())?;
+    read_ops_summary_from_path(&path, day.trim())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
-            start_mobile_server(app.handle().clone());
+            let handle = app.handle().clone();
+            if let Ok(root) = ops_dir(&handle) {
+                let _ = prune_ops_dir(&root, current_local_epoch_day());
+            }
+            start_mobile_server(handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3377,7 +4635,9 @@ pub fn run() {
             collect_network_report,
             run_field_checks,
             read_projection_snapshot,
-            get_mobile_server_status
+            get_mobile_server_status,
+            list_ops_days,
+            read_ops_summary
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
