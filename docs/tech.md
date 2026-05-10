@@ -20,6 +20,9 @@
 - `OPENCV_FFMPEG_CAPTURE_OPTIONS`는 반드시 `cv2` import 전에 설정해야 합니다.
 - `CamWorker`는 각자 dedicated `YOLO` instance를 가집니다. tracker state가 model instance 단위이기 때문입니다.
 - primary OSC output은 raw image-space 좌표가 아니라 공유 projection UV 좌표입니다.
+- TouchDesigner lane 분리를 위해 primary 좌표 payload는 유지하고
+  `/proj/<projection_id>/person_zones` metadata를 추가로 보냅니다.
+  `zone_code`는 `0=floor`, `1=body_catch`, `2=stair_relaxed`입니다.
 - `detection_filter`는 YOLO raw box를 OSC/fusion 이벤트로 넘기기 전에 confidence,
   bbox 크기/비율, 짧은 confirm window를 적용합니다. 현장 영상에서 가방이나 경계부
   1프레임 오검출이 actor로 승격되는 것을 줄이는 레이어입니다.
@@ -39,7 +42,9 @@
   가로로 넓거나 짧은 bbox를 완화해 actor 후보로 승격합니다. 위치는 기존 homography의
   `u`를 쓰고 `relaxed_presence_v`가 있으면 그 projection v를 고정값으로 씁니다.
   값이 없으면 `v`만 projection rect 안으로 clamp하며, dispatch 판정도 `u` 중심으로만
-  수행합니다. `stair_catch_points`는 같은 의미의 입력 alias입니다.
+  수행합니다. `stair_catch_points`는 같은 의미의 입력 alias입니다. 이 경로에서 생성된
+  fused actor는 `source_zone=stair_relaxed`로 유지되어 TouchDesigner가 보행자와 다른
+  y lane으로 remap할 수 있습니다.
 - 같은 projection을 공유하는 카메라들의 `dispatch_uv` slice는 겹치지 않아야 합니다. 겹치면 count가 부풀 수 있습니다.
 - cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 중앙 hand-off나 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
 - `fusion.relaxed_hold_s`가 0보다 크면 계단/착석자 relaxed polygon에서 생성된 actor만 detection drop 이후 더 오래 held로 남습니다. 일반 바닥 보행자 hold 정책은 그대로 둡니다.

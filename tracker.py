@@ -7,12 +7,14 @@ Usage:
 
 TouchDesigner minimal OSC schema (default, when osc.td_minimal: true):
     /proj/<projection_id>/active                [gid, gid, ...]
+    /proj/<projection_id>/person_zones          [gid, zone_code, gid, zone_code, ...]
     /proj/<projection_id>/xy                    [gid, x, y, gid, x, y, ...]
     /proj/<projection_id>/uv                    [gid, u, v, gid, u, v, ...]
     /proj/<projection_id>/persons/count         int
 
 Person-keyed debug OSC schema (when osc.td_minimal: false and osc.person_level: true):
     /proj/<projection_id>/person/<gid>          [u, v, vx, vy, conf, (u_px, v_px)?]
+    /proj/<projection_id>/person/<gid>/source_zone [zone_code, zone_name]
     /proj/<projection_id>/person/<gid>/lost     []
     /proj/<projection_id>/persons               [gid, gid, ...]
     /proj/<projection_id>/persons/count         int
@@ -77,6 +79,12 @@ from region import (
 PERSON_CLASS_ID = 0  # COCO
 TAURI_APP_IDENTIFIER = "com.taeyang.reolink-tracker"
 CONFIG_RELOAD_INTERVAL_S = 0.5
+SOURCE_ZONE_CODES = {
+    "floor": 0,
+    "body_catch": 1,
+    "stair_relaxed": 2,
+}
+SOURCE_ZONE_NAMES = {code: name for name, code in SOURCE_ZONE_CODES.items()}
 
 
 class ConfigError(ValueError):
@@ -621,6 +629,12 @@ class CamWorker:
                         else is_inside_uv((u, v), reg.dispatch_uv)
                     )
                     region_hits.append((reg.id, u, v, in_dispatch))
+                    if relaxed:
+                        source_zone = "stair_relaxed"
+                    elif caught:
+                        source_zone = "body_catch"
+                    else:
+                        source_zone = "floor"
                     person_events.append(PersonEvent(
                         projection_id=reg.projection_id,
                         cam_name=self.cam.name,
@@ -631,6 +645,7 @@ class CamWorker:
                         t=now,
                         dispatching=in_dispatch,
                         relaxed=relaxed,
+                        source_zone=source_zone,
                     ))
                     if in_dispatch:
                         if self.raw_per_cam:
@@ -1176,11 +1191,11 @@ def _emit_person_osc(
     """Send person-keyed OSC for the current frame.
 
     In the default TouchDesigner-minimal mode, each projection emits `/active`,
-    `/xy`, `/uv`, and a compatibility `/persons/count`. `/xy` is packed as
-    gid/x/y triples so TD can build one instancing table without dynamic
-    per-person addresses. x/y are projection video pixels when `pixel_size` is
-    configured; otherwise they fall back to normalized UV. `/uv` is always
-    normalized 0..1 and mirrors the same gid order.
+    `/person_zones`, `/xy`, `/uv`, and a compatibility `/persons/count`. `/xy`
+    is packed as gid/x/y triples so TD can build one instancing table without
+    dynamic per-person addresses. x/y are projection video pixels when
+    `pixel_size` is configured; otherwise they fall back to normalized UV.
+    `/uv` is always normalized 0..1 and mirrors the same gid order.
 
     When `person_level` is enabled, the older richer person/lost/list addresses
     are also emitted. This is intentionally additive so a TD patch that cannot
@@ -1196,9 +1211,14 @@ def _emit_person_osc(
         for pid, plist in by_proj.items():
             proj = projections.get(pid)
             gids = sorted(p.gid for p in plist)
+            zone_args = []
             xy_args = []
             uv_args = []
             for p in sorted(plist, key=lambda person: person.gid):
+                zone_args.extend([
+                    p.gid,
+                    _source_zone_code(getattr(p, "source_zone", "floor")),
+                ])
                 if proj is not None and proj.pixel_size is not None:
                     pw, ph = proj.pixel_size
                     x, y = p.u * pw, p.v * ph
@@ -1207,10 +1227,11 @@ def _emit_person_osc(
                 xy_args.extend([p.gid, x, y])
                 uv_args.extend([p.gid, p.u, p.v])
             osc.send_message(f"/proj/{pid}/active", gids)
+            osc.send_message(f"/proj/{pid}/person_zones", zone_args)
             osc.send_message(f"/proj/{pid}/xy", xy_args)
             osc.send_message(f"/proj/{pid}/uv", uv_args)
             osc.send_message(f"/proj/{pid}/persons/count", len(gids))
-            sent += 4
+            sent += 5
         if person_level:
             sent += _emit_person_level_osc(
                 osc,
@@ -1251,7 +1272,12 @@ def _emit_person_level_osc(
                 pw, ph = proj.pixel_size
                 args.extend([p.u * pw, p.v * ph])
             osc.send_message(f"/proj/{pid}/person/{p.gid}", args)
-            sent += 1
+            zone_name = _source_zone_name(getattr(p, "source_zone", "floor"))
+            osc.send_message(
+                f"/proj/{pid}/person/{p.gid}/source_zone",
+                [_source_zone_code(zone_name), zone_name],
+            )
+            sent += 2
         gids = sorted(p.gid for p in plist)
         osc.send_message(f"/proj/{pid}/persons", gids)
         sent += 1
@@ -1259,6 +1285,17 @@ def _emit_person_level_osc(
             osc.send_message(f"/proj/{pid}/persons/count", len(gids))
             sent += 1
     return sent
+
+
+def _source_zone_name(value: object) -> str:
+    zone = str(value or "floor")
+    if zone in SOURCE_ZONE_CODES:
+        return zone
+    return "floor"
+
+
+def _source_zone_code(value: object) -> int:
+    return SOURCE_ZONE_CODES[_source_zone_name(value)]
 
 
 def _emit_zone_osc(osc: SimpleUDPClient, update: ZoneUpdate) -> int:

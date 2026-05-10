@@ -29,6 +29,7 @@ class PersonEvent:
     t: float  # monotonic seconds
     dispatching: bool = True
     relaxed: bool = False
+    source_zone: str = "floor"
 
 
 @dataclass
@@ -48,6 +49,7 @@ class Person:
     state: str = "fresh"  # "fresh" when coordinates updated this tick, else "held"
     source: tuple[str, int] = ("", -1)  # (cam_name, track_id) currently feeding this gid
     relaxed: bool = False
+    source_zone: str = "floor"
 
 
 @dataclass
@@ -297,6 +299,24 @@ def _held_presence(held_s: float, release_after_s: float) -> float:
     return max(0.0, min(1.0, 1.0 - held_s / release_after_s))
 
 
+def _event_source_zone(ev: PersonEvent) -> str:
+    """Normalize detector-source zones for downstream lane mapping."""
+    if ev.relaxed:
+        return "stair_relaxed"
+    if ev.source_zone == "body_catch":
+        return "body_catch"
+    return "floor"
+
+
+def _source_zone_priority(ev: PersonEvent) -> int:
+    zone = _event_source_zone(ev)
+    if zone == "stair_relaxed":
+        return 2
+    if zone == "body_catch":
+        return 1
+    return 0
+
+
 class PersonTracker:
     """Stitches per-cam track events into stable global person IDs.
 
@@ -504,8 +524,8 @@ class PersonTracker:
         Region overlap during calibration can produce multiple events for the
         same `(cam, track_id)`. Fusion identity is source-keyed, so processing
         duplicates as independent new sources can spawn duplicate gids. Prefer
-        dispatching observations over projection-only observations; otherwise
-        keep the higher-confidence observation.
+        dispatching observations over projection-only observations, then
+        source-zone specificity, then confidence.
         """
         by_src: dict[tuple[str, int], PersonEvent] = {}
         for ev in events:
@@ -517,8 +537,13 @@ class PersonTracker:
             if ev.dispatching and not cur.dispatching:
                 by_src[src] = ev
                 continue
-            if ev.dispatching == cur.dispatching and ev.conf >= cur.conf:
-                by_src[src] = ev
+            if ev.dispatching == cur.dispatching:
+                ev_priority = _source_zone_priority(ev)
+                cur_priority = _source_zone_priority(cur)
+                if ev_priority > cur_priority or (
+                    ev_priority == cur_priority and ev.conf >= cur.conf
+                ):
+                    by_src[src] = ev
         return list(by_src.values())
 
     def drain_lost_gids(self) -> list[LostPerson]:
@@ -619,6 +644,7 @@ class PersonTracker:
             state="fresh",
             source=src,
             relaxed=ev.relaxed,
+            source_zone=_event_source_zone(ev),
         )
         self._source_to_gid[src] = gid
         return gid
@@ -706,6 +732,7 @@ class PersonTracker:
         p.last_seen_t = now
         p.state = "fresh"
         p.relaxed = p.relaxed or ev.relaxed
+        p.source_zone = _event_source_zone(ev)
 
     def _update_held_person(self, gid: int, ev: PersonEvent, now: float) -> None:
         self._update_person(gid, ev, now)
@@ -723,6 +750,7 @@ class PersonTracker:
         p.vy *= 0.8
         p.state = "held"
         p.relaxed = p.relaxed or ev.relaxed
+        p.source_zone = _event_source_zone(ev)
 
     def _pending_hold_s(self, person: Person) -> float:
         if person.relaxed and self.relaxed_hold_s > 0.0:
@@ -1316,6 +1344,38 @@ if __name__ == "__main__":
         and gone == []
         and lost_end == [LostPerson("corridor", 1)],
         f"persons={persons}, still_held={still_held}, lost_mid={lost_mid}, gone={gone}, lost_end={lost_end}",
+    )
+
+    # (v) Source-zone metadata follows the current detector path while the
+    # primary UV payload remains unchanged.
+    pt = PersonTracker(hand_off_window_s=0.5)
+    persons = pt.update(
+        [PersonEvent("corridor", "cam0", 5, 0.30, 0.50, 0.9, 0.0)],
+        [],
+        0.0,
+    )
+    floor_zone = persons[0].source_zone if persons else ""
+    persons = pt.update(
+        [
+            PersonEvent(
+                "corridor",
+                "cam0",
+                5,
+                0.31,
+                0.50,
+                0.9,
+                0.1,
+                relaxed=True,
+            )
+        ],
+        [],
+        0.1,
+    )
+    stair_zone = persons[0].source_zone if persons else ""
+    _check(
+        "(v) relaxed detector path tags source_zone for TD lanes",
+        floor_zone == "floor" and stair_zone == "stair_relaxed",
+        f"floor={floor_zone}, stair={stair_zone}",
     )
 
     sys.exit(1 if failed else 0)

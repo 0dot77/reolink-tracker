@@ -113,6 +113,7 @@ repo-local `config.yaml` 대신 앱에서 저장한 `runtime/config.yaml`을 우
 | 주소 | 인자 | 송신 시점 |
 |---|---|---|
 | `/proj/<projection_id>/active` | `[gid, ...]` | 활성 gid 목록, heartbeat마다 |
+| `/proj/<projection_id>/person_zones` | `[gid, zone_code, gid, zone_code, ...]` | actor source zone, heartbeat마다 |
 | `/proj/<projection_id>/xy` | `[gid, x, y, gid, x, y, ...]` | 활성 person 위치, heartbeat마다 |
 | `/proj/<projection_id>/uv` | `[gid, u, v, gid, u, v, ...]` | 활성 person UV 위치, heartbeat마다 |
 | `/proj/<projection_id>/persons/count` | int | heartbeat마다 |
@@ -122,6 +123,11 @@ repo-local `config.yaml` 대신 앱에서 저장한 `runtime/config.yaml`을 우
 못하거나 pixel/UV 단위가 헷갈릴 때는 `/uv` 또는 `person_level: true`의
 `/proj/<projection_id>/person/<gid>` 스트림으로 확인합니다.
 
+`/person_zones`는 좌표 payload를 바꾸지 않고 TD가 actor lane을 분기할 수 있게 하는
+보조 metadata입니다. `zone_code`는 `0=floor`, `1=body_catch`, `2=stair_relaxed`입니다.
+계단/착석자처럼 `relaxed_presence_points`에서 승격된 actor는 `stair_relaxed`로 나가며,
+TD에서는 이 코드로 보행자와 착석자의 y lane을 따로 remap할 수 있습니다.
+
 ### Person-keyed debug (`osc.td_minimal: false`)
 
 `gid`는 cross-camera fusion이 만드는 global person ID입니다. 한 사람이 cam0 dispatch 슬라이스에서 cam2, cam1 같은 다음 dispatch 슬라이스로 넘어가도 같은 `gid`가 유지되도록 fusion 레이어가 hand-off를 stitch 합니다 (UV 거리 + 시간 윈도우 기반). 중앙 hand-off 또는 짧은 detection drop 중에는 gid가 `held` 상태로 남고, 마지막 좌표를 유지한 채 `/persons` active 목록에 계속 포함됩니다.
@@ -129,6 +135,7 @@ repo-local `config.yaml` 대신 앱에서 저장한 `runtime/config.yaml`을 우
 | 주소 | 인자 | 송신 시점 |
 |---|---|---|
 | `/proj/<projection_id>/person/<gid>` | `u, v, vx, vy, conf` (`pixel_size`가 있으면 `u_px, v_px` 추가) | 활성 person마다 매 프레임 |
+| `/proj/<projection_id>/person/<gid>/source_zone` | `zone_code, zone_name` | 활성 person마다 매 프레임 |
 | `/proj/<projection_id>/person/<gid>/lost` | 없음 | hand-off 윈도우(기본 0.4 s) 안에 다른 카메라가 받지 못하면 한 번 |
 | `/proj/<projection_id>/persons` | `[gid, ...]` | 활성 gid 목록(fresh + held), 매 프레임 |
 | `/proj/<projection_id>/persons/count` | int | 매 프레임 |
@@ -244,6 +251,12 @@ OSC In DAT
 ```
 
 `/persons/count`로 인원 수를 그대로 받고, `/persons` 배열로 현재 살아있는 gid 목록을 동기화합니다. 기본값에서는 완전히 lost된 gid를 재사용하므로, TD 테이블/채널 수는 총 방문자 수가 아니라 동시 점유 피크에 가깝게 유지됩니다.
+
+이 저장소의 `touchdesigner/person_table_receiver.py`는 기본 minimal `/uv` 수신기에
+`/person_zones`를 병합합니다. 출력 `person_table`은 숫자 컬럼
+`gid, tx, ty, tz, active, zone_code`를 쓰며, 기본값으로 `zone_code=2`
+(`stair_relaxed`)만 `tz` offset을 받아 기존 XZ plane 인스턴싱에서 보행자 lane과
+분리됩니다. 필요하면 파일 상단의 `STAIR_TZ_OFFSET`을 설치 TD 좌표계에 맞게 조정합니다.
 
 ### Raw per-cam wildcard (디버깅용)
 

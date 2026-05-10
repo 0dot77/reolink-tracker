@@ -1,7 +1,7 @@
 """Live OSC inspector for tracker.py.
 
 Subscribes to the default TouchDesigner-minimal schema (`/proj/<pid>/active`,
-`/xy`, `/uv`, `/persons/count`) plus the person-keyed debug schema
+`/person_zones`, `/xy`, `/uv`, `/persons/count`) plus the person-keyed debug schema
 (`/persons`, `/person/<gid>/lost`) and prints a compact rolling view so you can
 eyeball gid stability during a live test without TouchDesigner.
 
@@ -28,9 +28,17 @@ from pythonosc import dispatcher, osc_server
 ACTIVE_RE = re.compile(r"^/proj/([^/]+)/active$")
 XY_RE = re.compile(r"^/proj/([^/]+)/xy$")
 UV_RE = re.compile(r"^/proj/([^/]+)/uv$")
+PERSON_ZONES_RE = re.compile(r"^/proj/([^/]+)/person_zones$")
 COUNT_RE = re.compile(r"^/proj/([^/]+)/persons/count$")
 PERSONS_RE = re.compile(r"^/proj/([^/]+)/persons$")
 LOST_RE = re.compile(r"^/proj/([^/]+)/person/(\d+)/lost$")
+SOURCE_ZONE_RE = re.compile(r"^/proj/([^/]+)/person/(\d+)/source_zone$")
+
+ZONE_NAMES = {
+    0: "floor",
+    1: "body_catch",
+    2: "stair_relaxed",
+}
 
 
 class State:
@@ -39,6 +47,7 @@ class State:
         self.last_count: dict[str, int] = {}
         self.last_xy_triples: dict[str, int] = {}
         self.last_uv_triples: dict[str, int] = {}
+        self.last_person_zones: dict[str, dict[int, int]] = {}
         self.ever_seen: dict[str, set[int]] = defaultdict(set)
         self.lost_total: dict[str, int] = defaultdict(int)
         self.start = time.monotonic()
@@ -132,6 +141,43 @@ def _on_uv(addr: str, *args) -> None:
     print(f"[{_ts()}] proj={pid}  /uv triples={triples}{mismatch}")
 
 
+def _zone_name(code: int) -> str:
+    return ZONE_NAMES.get(code, "floor")
+
+
+def _on_person_zones(addr: str, *args) -> None:
+    m = PERSON_ZONES_RE.match(addr)
+    if not m:
+        return
+    pid = m.group(1)
+    zones: dict[int, int] = {}
+    malformed = len(args) % 2 != 0
+    for i in range(0, len(args) - 1, 2):
+        zones[int(args[i])] = int(args[i + 1])
+    if zones == state.last_person_zones.get(pid) and not malformed:
+        return
+    state.last_person_zones[pid] = zones
+    rendered = ", ".join(
+        f"{gid}:{_zone_name(code)}" for gid, code in sorted(zones.items())
+    )
+    suffix = "  MALFORMED" if malformed else ""
+    print(f"[{_ts()}] proj={pid}  /person_zones {{{rendered}}}{suffix}")
+
+
+def _on_source_zone(addr: str, *args) -> None:
+    m = SOURCE_ZONE_RE.match(addr)
+    if not m or not args:
+        return
+    pid, gid = m.group(1), int(m.group(2))
+    zone_code = int(args[0])
+    zones = dict(state.last_person_zones.get(pid, {}))
+    zones[gid] = zone_code
+    if zones == state.last_person_zones.get(pid):
+        return
+    state.last_person_zones[pid] = zones
+    print(f"[{_ts()}] proj={pid}  gid={gid} source_zone={_zone_name(zone_code)}")
+
+
 def _on_count(addr: str, *args) -> None:
     m = COUNT_RE.match(addr)
     if not m or not args:
@@ -187,6 +233,8 @@ def main() -> None:
     disp.map("/proj/*/active", _on_active)
     disp.map("/proj/*/xy", _on_xy)
     disp.map("/proj/*/uv", _on_uv)
+    disp.map("/proj/*/person_zones", _on_person_zones)
+    disp.map("/proj/*/person/*/source_zone", _on_source_zone)
     disp.map("/proj/*/persons/count", _on_count)
     disp.map("/proj/*/person/*/lost", _on_lost)
     disp.map("/proj/*/persons", _on_persons)
