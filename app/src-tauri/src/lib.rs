@@ -111,6 +111,7 @@ struct RegionInfo {
     min_bbox_height_px: Option<f64>,
     body_catch_points: Vec<Vec<f64>>,
     relaxed_presence_points: Vec<Vec<f64>>,
+    relaxed_presence_uv: Vec<f64>,
     relaxed_presence_margin_uv: Option<f64>,
     relaxed_presence_min_confidence: Option<f64>,
     relaxed_presence_v: Option<f64>,
@@ -167,6 +168,7 @@ struct SaveCalibrationMappingRequest {
     region_id: String,
     projection_uv: Option<[f64; 4]>,
     dispatch_uv: Option<[f64; 4]>,
+    relaxed_presence_uv: Option<[f64; 4]>,
     relaxed_presence_v: Option<f64>,
 }
 
@@ -423,6 +425,16 @@ fn yaml_optional_f64(value: Option<&serde_yaml::Value>) -> Option<f64> {
     value.and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
 }
 
+fn validate_unit_rect(rect: [f64; 4], label: &str) -> Result<[f64; 4], String> {
+    if rect.iter().any(|value| !(0.0..=1.0).contains(value)) {
+        return Err(format!("{label} must stay inside 0..1"));
+    }
+    if rect[0] >= rect[2] || rect[1] >= rect[3] {
+        return Err(format!("{label} must satisfy min < max"));
+    }
+    Ok(rect)
+}
+
 fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String> {
     let parsed: serde_yaml::Value =
         serde_yaml::from_str(config).map_err(|err| format!("YAML validation failed: {err}"))?;
@@ -510,6 +522,7 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
                                 .get("relaxed_presence_min_confidence")
                                 .or_else(|| region.get("stair_catch_min_confidence")),
                         ),
+                        relaxed_presence_uv: yaml_number_vec(region.get("relaxed_presence_uv")),
                         relaxed_presence_v: yaml_optional_f64(region.get("relaxed_presence_v")),
                     });
                 }
@@ -790,11 +803,14 @@ fn calibration_mapping_config_text(
     let region = region
         .as_mapping_mut()
         .ok_or_else(|| "target region entry must be a YAML mapping".to_string())?;
+    let has_relaxed_presence_points = region
+        .get("relaxed_presence_points")
+        .and_then(|value| value.as_sequence())
+        .map(|points| !points.is_empty())
+        .unwrap_or(false);
 
     if let Some(projection_uv) = request.projection_uv {
-        if projection_uv[0] >= projection_uv[2] || projection_uv[1] >= projection_uv[3] {
-            return Err("projection_uv must satisfy min < max".to_string());
-        }
+        let projection_uv = validate_unit_rect(projection_uv, "projection_uv")?;
         region.insert(
             serde_yaml::Value::String("projection_uv".to_string()),
             serde_yaml::to_value(projection_uv)
@@ -802,9 +818,7 @@ fn calibration_mapping_config_text(
         );
     }
     if let Some(dispatch_uv) = request.dispatch_uv {
-        if dispatch_uv[0] >= dispatch_uv[2] || dispatch_uv[1] >= dispatch_uv[3] {
-            return Err("dispatch_uv must satisfy min < max".to_string());
-        }
+        let dispatch_uv = validate_unit_rect(dispatch_uv, "dispatch_uv")?;
         if let Some(projection_uv) = request.projection_uv {
             if dispatch_uv[0] < projection_uv[0]
                 || dispatch_uv[1] < projection_uv[1]
@@ -818,6 +832,20 @@ fn calibration_mapping_config_text(
             serde_yaml::Value::String("dispatch_uv".to_string()),
             serde_yaml::to_value(dispatch_uv)
                 .map_err(|err| format!("failed to serialize dispatch_uv: {err}"))?,
+        );
+    }
+    if let Some(relaxed_presence_uv) = request.relaxed_presence_uv {
+        if !has_relaxed_presence_points {
+            return Err(
+                "relaxed_presence_uv requires relaxed_presence_points on the target region"
+                    .to_string(),
+            );
+        }
+        let relaxed_presence_uv = validate_unit_rect(relaxed_presence_uv, "relaxed_presence_uv")?;
+        region.insert(
+            serde_yaml::Value::String("relaxed_presence_uv".to_string()),
+            serde_yaml::to_value(relaxed_presence_uv)
+                .map_err(|err| format!("failed to serialize relaxed_presence_uv: {err}"))?,
         );
     }
     if let Some(relaxed_presence_v) = request.relaxed_presence_v {
@@ -1064,6 +1092,7 @@ cameras:
         projection_id: corridor
         projection_uv: [0.0, 0.0, 0.55, 1.0]
         dispatch_uv: [0.0, 0.0, 0.5, 1.0]
+        relaxed_presence_uv: [0.05, 0.2, 0.45, 0.9]
         min_bbox_height_px: 24
         relaxed_presence_points: [[100, 80], [320, 80], [300, 150], [120, 150]]
         relaxed_presence_margin_uv: 0.1
@@ -1084,6 +1113,10 @@ cameras:
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
         assert_eq!(snapshot.regions[1].camera, "cam2");
         assert_eq!(snapshot.regions[1].dispatch_uv, vec![0.4, 0.0, 0.6, 1.0]);
+        assert_eq!(
+            snapshot.regions[0].relaxed_presence_uv,
+            vec![0.05, 0.2, 0.45, 0.9]
+        );
         assert_eq!(snapshot.regions[0].relaxed_presence_points.len(), 4);
         assert_eq!(
             snapshot.regions[0].relaxed_presence_min_confidence,
@@ -1298,12 +1331,14 @@ cameras:
         projection_id: corridor
         projection_uv: [0.32, 0.0, 0.68, 1.0]
         dispatch_uv: [0.4, 0.0, 0.6, 1.0]
+        relaxed_presence_points: [[400, 280], [1120, 280], [1120, 420], [400, 420]]
 "#;
         let request = SaveCalibrationMappingRequest {
             camera_name: "cam2".to_string(),
             region_id: "center_band".to_string(),
             projection_uv: Some([0.30, 0.0, 0.70, 1.0]),
             dispatch_uv: Some([0.40, 0.0, 0.60, 1.0]),
+            relaxed_presence_uv: Some([0.32, 0.2, 0.58, 0.82]),
             relaxed_presence_v: Some(0.35),
         };
         let text = calibration_mapping_config_text(config, &request)
@@ -1333,8 +1368,70 @@ cameras:
             vec![0.30, 0.0, 0.70, 1.0]
         );
         assert_eq!(
+            yaml_number_vec(cam2_region.get("relaxed_presence_uv")),
+            vec![0.32, 0.2, 0.58, 0.82]
+        );
+        assert_eq!(
             yaml_optional_f64(cam2_region.get("relaxed_presence_v")),
             Some(0.35)
+        );
+    }
+
+    #[test]
+    fn calibration_mapping_rejects_invalid_relaxed_presence_uv() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam2
+    url: /tmp/cam2.mp4
+    regions:
+      - id: center_band
+        projection_id: corridor
+        projection_uv: [0.32, 0.0, 0.68, 1.0]
+        dispatch_uv: [0.4, 0.0, 0.6, 1.0]
+        relaxed_presence_points: [[400, 280], [1120, 280], [1120, 420], [400, 420]]
+"#;
+        let request = SaveCalibrationMappingRequest {
+            camera_name: "cam2".to_string(),
+            region_id: "center_band".to_string(),
+            projection_uv: None,
+            dispatch_uv: None,
+            relaxed_presence_uv: Some([0.75, 0.2, 0.25, 0.8]),
+            relaxed_presence_v: None,
+        };
+        let err = calibration_mapping_config_text(config, &request)
+            .expect_err("invalid relaxed_presence_uv should fail");
+        assert_eq!(err, "relaxed_presence_uv must satisfy min < max");
+    }
+
+    #[test]
+    fn calibration_mapping_rejects_relaxed_presence_uv_without_stair_points() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam2
+    url: /tmp/cam2.mp4
+    regions:
+      - id: center_band
+        projection_id: corridor
+        projection_uv: [0.32, 0.0, 0.68, 1.0]
+        dispatch_uv: [0.4, 0.0, 0.6, 1.0]
+"#;
+        let request = SaveCalibrationMappingRequest {
+            camera_name: "cam2".to_string(),
+            region_id: "center_band".to_string(),
+            projection_uv: None,
+            dispatch_uv: None,
+            relaxed_presence_uv: Some([0.32, 0.2, 0.58, 0.82]),
+            relaxed_presence_v: None,
+        };
+        let err = calibration_mapping_config_text(config, &request)
+            .expect_err("relaxed_presence_uv without points should fail");
+        assert_eq!(
+            err,
+            "relaxed_presence_uv requires relaxed_presence_points on the target region"
         );
     }
 }

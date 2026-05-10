@@ -484,7 +484,17 @@ class CamWorker:
         if not reg.body_catch_points:
             return False
         if not accepted:
-            if reason != "low-conf":
+            if reason == "too-small":
+                if reg.min_bbox_height_px <= 0:
+                    return False
+                x1, y1, x2, y2 = (float(v) for v in box)
+                bbox_h = y2 - y1
+                bbox_area = (x2 - x1) * bbox_h
+                if bbox_h < reg.min_bbox_height_px:
+                    return False
+                if bbox_area < self.detection_filter.relaxed_min_bbox_area_px:
+                    return False
+            elif reason != "low-conf":
                 return False
             if reg.body_catch_min_confidence <= 0.0 or conf < reg.body_catch_min_confidence:
                 return False
@@ -610,10 +620,15 @@ class CamWorker:
                     if not inside_projection and caught:
                         u, v = _clamp_uv_to_rect((u, v), reg.projection_uv)
                     elif relaxed:
+                        if reg.relaxed_presence_H is not None:
+                            u, v = project((foot_x, foot_y), reg.relaxed_presence_H)
+                            if reg.relaxed_presence_uv is not None:
+                                u, v = _clamp_uv_to_rect((u, v), reg.relaxed_presence_uv)
                         if reg.relaxed_presence_v is not None:
                             v = reg.relaxed_presence_v
                         else:
-                            u, v = _clamp_v_to_rect((u, v), reg.projection_uv)
+                            clamp_rect = reg.relaxed_presence_uv or reg.projection_uv
+                            u, v = _clamp_v_to_rect((u, v), clamp_rect)
                     if (
                         not caught
                         and not relaxed
@@ -769,6 +784,15 @@ def _require_uv_rect(value: object, label: str) -> tuple[float, float, float, fl
         return tuple(float(v) for v in rect)
     except (TypeError, ValueError) as ex:
         raise ConfigError(f"{label} must contain numeric values") from ex
+
+
+def _optional_uv_rect(
+    value: object,
+    label: str,
+) -> Optional[tuple[float, float, float, float]]:
+    if value in (None, ""):
+        return None
+    return _require_uv_rect(value, label)
 
 
 def _optional_points(value: object, label: str) -> list[tuple[float, float]]:
@@ -943,6 +967,15 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
             "stair_catch_points",
             f"{label} {rid}",
         )
+        relaxed_presence_uv = _optional_uv_rect(
+            r.get("relaxed_presence_uv"),
+            f"{label} {rid}.relaxed_presence_uv",
+        )
+        if relaxed_presence_uv is not None:
+            _validate_unit_uv_rect(
+                relaxed_presence_uv,
+                f"{label} {rid}.relaxed_presence_uv",
+            )
         try:
             body_catch_margin_uv = max(float(r.get("body_catch_margin_uv", 0.0)), 0.0)
             body_catch_min_confidence = max(
@@ -974,6 +1007,16 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
         try:
             validate_dispatch(proj_uv, disp_uv)
             H = build_homography([tuple(p) for p in image_points], proj_uv)
+            relaxed_presence_H = None
+            if relaxed_presence_uv is not None:
+                if not relaxed_presence_points:
+                    raise ValueError(
+                        "relaxed_presence_uv requires relaxed_presence_points"
+                    )
+                relaxed_presence_H = build_homography(
+                    relaxed_presence_points,
+                    relaxed_presence_uv,
+                )
         except (TypeError, ValueError) as ex:
             raise ConfigError(f"{label} {rid}: {ex}") from ex
         regions.append(
@@ -988,10 +1031,12 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
                 body_catch_margin_uv=body_catch_margin_uv,
                 body_catch_min_confidence=body_catch_min_confidence,
                 relaxed_presence_points=relaxed_presence_points,
+                relaxed_presence_uv=relaxed_presence_uv,
                 relaxed_presence_margin_uv=relaxed_presence_margin_uv,
                 relaxed_presence_min_confidence=relaxed_presence_min_confidence,
                 relaxed_presence_v=relaxed_presence_v,
                 H=H,
+                relaxed_presence_H=relaxed_presence_H,
             )
         )
     return regions
@@ -1080,6 +1125,50 @@ def _validate_dispatch_overlaps(cams: list[CamCfg]) -> None:
                     )
 
 
+def _derive_handoff_u_edges(cams: list[CamCfg]) -> dict[str, list[float]]:
+    edges: dict[str, set[float]] = {}
+    for cam in cams:
+        for reg in cam.regions:
+            u0, _v0, u1, _v1 = reg.dispatch_uv
+            for edge in (u0, u1):
+                if 0.0 < edge < 1.0:
+                    edges.setdefault(reg.projection_id, set()).add(round(edge, 6))
+    return {pid: sorted(values) for pid, values in edges.items() if values}
+
+
+def _parse_handoff_u_edges(raw: object, label: str) -> dict[str, list[float]]:
+    mapping = _require_mapping(raw, label)
+    out: dict[str, list[float]] = {}
+    for projection_id, values in mapping.items():
+        seq = _require_sequence(values, f"{label}.{projection_id}")
+        edges: set[float] = set()
+        for idx, value in enumerate(seq):
+            try:
+                edge = float(value)
+            except (TypeError, ValueError) as ex:
+                raise ConfigError(
+                    f"{label}.{projection_id}[{idx}] must be a number"
+                ) from ex
+            if not 0.0 < edge < 1.0:
+                raise ConfigError(
+                    f"{label}.{projection_id}[{idx}] must satisfy 0 < u < 1, got {edge}"
+                )
+            edges.add(round(edge, 6))
+        if edges:
+            out[str(projection_id)] = sorted(edges)
+    return out
+
+
+def _handoff_u_edges_from_cfg(
+    fusion_cfg: dict,
+    cams: list[CamCfg],
+) -> dict[str, list[float]]:
+    raw = fusion_cfg.get("hold_handoff_u_edges")
+    if raw is not None:
+        return _parse_handoff_u_edges(raw, "fusion.hold_handoff_u_edges")
+    return _derive_handoff_u_edges(cams)
+
+
 def load_cfg(path: Path) -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)
@@ -1109,6 +1198,8 @@ def _region_to_cfg(region: Region) -> dict:
             [round(float(x), 1), round(float(y), 1)]
             for x, y in region.relaxed_presence_points
         ]
+        if region.relaxed_presence_uv is not None:
+            out["relaxed_presence_uv"] = [float(v) for v in region.relaxed_presence_uv]
         out["relaxed_presence_margin_uv"] = float(region.relaxed_presence_margin_uv)
         out["relaxed_presence_min_confidence"] = float(
             region.relaxed_presence_min_confidence
@@ -1386,14 +1477,22 @@ def main() -> int:
 
     fusion_cfg = cfg.get("fusion", {}) or {}
     miss_buffer_frames = max(int(fusion_cfg.get("miss_buffer_frames", 8)), 0)
+    match_uv_radius = float(fusion_cfg.get("match_uv_radius", 0.05))
+    hold_handoff_margin_uv = max(
+        float(fusion_cfg.get("hold_handoff_margin_uv", match_uv_radius)),
+        0.0,
+    )
+    handoff_u_edges = _handoff_u_edges_from_cfg(fusion_cfg, cams)
     fusion_enabled = td_minimal or person_level or zone_level
     if fusion_enabled:
         person_tracker = PersonTracker(
             hand_off_window_s=float(fusion_cfg.get("hand_off_window_s", 2.5)),
-            match_uv_radius=float(fusion_cfg.get("match_uv_radius", 0.05)),
+            match_uv_radius=match_uv_radius,
             velocity_alpha=float(fusion_cfg.get("velocity_alpha", 0.3)),
             position_alpha=float(fusion_cfg.get("position_alpha", 0.45)),
             hold_boundary_margin_uv=float(fusion_cfg.get("hold_boundary_margin_uv", 0.08)),
+            hold_handoff_margin_uv=hold_handoff_margin_uv,
+            hold_handoff_u_edges=handoff_u_edges,
             max_update_jump_uv=float(fusion_cfg.get("max_update_jump_uv", 0.0)),
             relaxed_hold_s=float(fusion_cfg.get("relaxed_hold_s", 3.0)),
             reuse_lost_gids=bool(fusion_cfg.get("reuse_lost_gids", True)),
@@ -1405,6 +1504,8 @@ def main() -> int:
             f"velocity_alpha={person_tracker.velocity_alpha} "
             f"position_alpha={person_tracker.position_alpha} "
             f"hold_boundary_margin_uv={person_tracker.hold_boundary_margin_uv} "
+            f"hold_handoff_margin_uv={person_tracker.hold_handoff_margin_uv} "
+            f"hold_handoff_u_edges={person_tracker.hold_handoff_u_edges} "
             f"max_update_jump_uv={person_tracker.max_update_jump_uv} "
             f"relaxed_hold_s={person_tracker.relaxed_hold_s} "
             f"reuse_lost_gids={person_tracker.reuse_lost_gids} "
@@ -1543,6 +1644,14 @@ def main() -> int:
                             projections,
                             workers,
                         )
+                        if person_tracker is not None:
+                            fusion_cfg = cfg.get("fusion", {}) or {}
+                            person_tracker.set_handoff_u_edges(
+                                _handoff_u_edges_from_cfg(
+                                    fusion_cfg,
+                                    [worker.cam for worker in workers],
+                                )
+                            )
                         last_config_mtime_ns = current_mtime_ns
                         print(
                             "config: live calibration reload applied "

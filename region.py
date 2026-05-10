@@ -48,10 +48,12 @@ class Region:
     body_catch_margin_uv: float = 0.0
     body_catch_min_confidence: float = 0.0
     relaxed_presence_points: list[tuple[float, float]] = field(default_factory=list)
+    relaxed_presence_uv: Optional[tuple[float, float, float, float]] = None
     relaxed_presence_margin_uv: float = 0.0
     relaxed_presence_min_confidence: float = 0.0
     relaxed_presence_v: Optional[float] = None
     H: np.ndarray = field(default=None, repr=False)    # 3x3, built at load time
+    relaxed_presence_H: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 def _is_convex_simple(pts: Sequence[tuple[float, float]]) -> bool:

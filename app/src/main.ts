@@ -73,6 +73,7 @@ type RegionInfo = {
   min_bbox_height_px: number | null;
   body_catch_points: number[][];
   relaxed_presence_points: number[][];
+  relaxed_presence_uv: number[];
   relaxed_presence_margin_uv: number | null;
   relaxed_presence_min_confidence: number | null;
   relaxed_presence_v: number | null;
@@ -126,6 +127,10 @@ type CalibrationMappingDraft = {
   dispatchUMax: string;
   dispatchVMin: string;
   dispatchVMax: string;
+  stairRelaxedUMin: string;
+  stairRelaxedUMax: string;
+  stairRelaxedVMin: string;
+  stairRelaxedVMax: string;
   stairFixedV: string;
 };
 
@@ -279,6 +284,10 @@ function isCalibrationMappingInputActive(): boolean {
     "dispatchUMax",
     "dispatchVMin",
     "dispatchVMax",
+    "stairRelaxedUMin",
+    "stairRelaxedUMax",
+    "stairRelaxedVMin",
+    "stairRelaxedVMax",
     "stairFixedV",
   ].includes(String(document.activeElement?.id ?? ""));
 }
@@ -912,6 +921,7 @@ function calibrationSection(): string {
   const frame = state.calibrationFrame;
   const projectionUv = normalizedUv(selectedRegion?.projection_uv, [0, 0, 1, 1]);
   const dispatchUv = normalizedUv(selectedRegion?.dispatch_uv, projectionUv);
+  const stairRelaxedUv = normalizedUv(selectedRegion?.relaxed_presence_uv, projectionUv);
   const stairV = selectedRegion?.relaxed_presence_v ?? null;
   const mappingKey = calibrationMappingKey(state.calibrationCamera, selectedRegion?.id ?? state.calibrationRegionId);
   const frameSrc = frame && hasTauriRuntime ? convertFileSrc(frame.path) : "";
@@ -966,6 +976,10 @@ function calibrationSection(): string {
             <label>Dispatch U max <small>right gid edge</small><input id="dispatchUMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchUMax", formatUvNumber(dispatchUv[2])))}"></label>
             <label>Dispatch V min <small>far/top gid row</small><input id="dispatchVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchVMin", formatUvNumber(dispatchUv[1])))}"></label>
             <label>Dispatch V max <small>near/bottom gid row</small><input id="dispatchVMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchVMax", formatUvNumber(dispatchUv[3])))}"></label>
+            <label>Stair U min <small>left relaxed warp edge</small><input id="stairRelaxedUMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedUMin", formatUvNumber(stairRelaxedUv[0])))}"></label>
+            <label>Stair U max <small>right relaxed warp edge</small><input id="stairRelaxedUMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedUMax", formatUvNumber(stairRelaxedUv[2])))}"></label>
+            <label>Stair V min <small>far/top relaxed warp row</small><input id="stairRelaxedVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedVMin", formatUvNumber(stairRelaxedUv[1])))}"></label>
+            <label>Stair V max <small>near/bottom relaxed warp row</small><input id="stairRelaxedVMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedVMax", formatUvNumber(stairRelaxedUv[3])))}"></label>
             <label>Stair fixed v <input id="stairFixedV" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairFixedV", stairV == null ? "" : formatUvNumber(stairV)))}" placeholder="optional"></label>
             <button class="btn primary" data-action="save-calibration-mapping" ${buttonDisabled(!selectedRegion)}>Save mapping</button>
           </div>
@@ -976,6 +990,7 @@ function calibrationSection(): string {
             <div class="row"><span class="k">points</span><span class="v">${escapeHtml(formatImagePoints(points))}</span></div>
             <div class="row"><span class="k">projection uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.projection_uv ?? []))}</span></div>
             <div class="row"><span class="k">dispatch uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.dispatch_uv ?? []))}</span></div>
+            <div class="row"><span class="k">stair relaxed uv</span><span class="v">${escapeHtml(formatUvRange(stairRelaxedUv))}</span></div>
             <div class="row"><span class="k">body catch</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.body_catch_points ?? []))}</span></div>
             <div class="row"><span class="k">stair mask</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.relaxed_presence_points ?? []))}</span></div>
             <div class="row"><span class="k">stair margin/conf</span><span class="v">${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_margin_uv))} / ${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_min_confidence))}</span></div>
@@ -2134,6 +2149,7 @@ function defaultCalibrationMappingDraft(key = currentCalibrationMappingKey()): C
   const region = selectedCalibrationRegion();
   const projectionUv = normalizedUv(region?.projection_uv, [0, 0, 1, 1]);
   const dispatchUv = normalizedUv(region?.dispatch_uv, projectionUv);
+  const stairRelaxedUv = normalizedUv(region?.relaxed_presence_uv, projectionUv);
   return {
     key,
     projectionUMin: formatUvNumber(projectionUv[0]),
@@ -2144,6 +2160,10 @@ function defaultCalibrationMappingDraft(key = currentCalibrationMappingKey()): C
     dispatchUMax: formatUvNumber(dispatchUv[2]),
     dispatchVMin: formatUvNumber(dispatchUv[1]),
     dispatchVMax: formatUvNumber(dispatchUv[3]),
+    stairRelaxedUMin: formatUvNumber(stairRelaxedUv[0]),
+    stairRelaxedUMax: formatUvNumber(stairRelaxedUv[2]),
+    stairRelaxedVMin: formatUvNumber(stairRelaxedUv[1]),
+    stairRelaxedVMax: formatUvNumber(stairRelaxedUv[3]),
     stairFixedV: region?.relaxed_presence_v == null ? "" : formatUvNumber(region.relaxed_presence_v),
   };
 }
@@ -2477,6 +2497,7 @@ cameras:
           min_bbox_height_px: 24,
           body_catch_points: [],
           relaxed_presence_points: [],
+          relaxed_presence_uv: [],
           relaxed_presence_margin_uv: 0,
           relaxed_presence_min_confidence: null,
           relaxed_presence_v: null,
@@ -2491,6 +2512,7 @@ cameras:
           min_bbox_height_px: 24,
           body_catch_points: [[150, 80], [1080, 90], [1100, 260], [140, 250]],
           relaxed_presence_points: [[405, 280], [1115, 292], [1133, 416], [338, 390]],
+          relaxed_presence_uv: [0.24, 0.56, 0.74, 0.92],
           relaxed_presence_margin_uv: 0.12,
           relaxed_presence_min_confidence: 0.12,
           relaxed_presence_v: null,
@@ -2505,6 +2527,7 @@ cameras:
           min_bbox_height_px: 24,
           body_catch_points: [],
           relaxed_presence_points: [],
+          relaxed_presence_uv: [],
           relaxed_presence_margin_uv: 0.1,
           relaxed_presence_min_confidence: 0.12,
           relaxed_presence_v: null,
@@ -2740,6 +2763,7 @@ async function handleAction(action: string): Promise<void> {
       }
       const projectionUv = normalizedUv(region.projection_uv, [0, 0, 1, 1]);
       const dispatchUv = normalizedUv(region.dispatch_uv, projectionUv);
+      const stairRelaxedUv = normalizedUv(region.relaxed_presence_uv, projectionUv);
       projectionUv[0] = readUnitInput("projectionUMin", projectionUv[0]);
       projectionUv[2] = readUnitInput("projectionUMax", projectionUv[2]);
       projectionUv[1] = readUnitInput("projectionVMin", projectionUv[1]);
@@ -2766,12 +2790,23 @@ async function handleAction(action: string): Promise<void> {
         dispatchUv[1] = projectionUv[1];
         dispatchUv[3] = projectionUv[3];
       }
+      stairRelaxedUv[0] = readUnitInput("stairRelaxedUMin", stairRelaxedUv[0]);
+      stairRelaxedUv[2] = readUnitInput("stairRelaxedUMax", stairRelaxedUv[2]);
+      stairRelaxedUv[1] = readUnitInput("stairRelaxedVMin", stairRelaxedUv[1]);
+      stairRelaxedUv[3] = readUnitInput("stairRelaxedVMax", stairRelaxedUv[3]);
+      if (stairRelaxedUv[0] >= stairRelaxedUv[2]) {
+        throw new Error("stair relaxed u min must be lower than u max.");
+      }
+      if (stairRelaxedUv[1] >= stairRelaxedUv[3]) {
+        throw new Error("stair relaxed v min must be lower than v max.");
+      }
       await invoke("save_calibration_mapping", {
         request: {
           cameraName: state.calibrationCamera,
           regionId: region.id,
           projectionUv,
           dispatchUv,
+          relaxedPresenceUv: region.relaxed_presence_points?.length ? stairRelaxedUv : undefined,
           relaxedPresenceV: readOptionalUnitInput("stairFixedV"),
         },
       });

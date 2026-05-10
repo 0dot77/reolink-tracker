@@ -48,6 +48,13 @@ fusion:
   # track이 끊겼을 때 held 상태를 유지할 projection edge margin.
   # 0.08이면 UV 가장자리 8% 안쪽에서만 held로 남고, 중앙 miss는 즉시 lost 처리한다.
   hold_boundary_margin_uv: 0.08
+  # cam0 -> cam2 -> cam1 같은 내부 dispatch 경계에서는 중앙이라도 짧게 held를 허용한다.
+  # 기본 edge 목록은 각 region.dispatch_uv의 내부 u0/u1에서 자동 산출된다.
+  # 끊김이 남으면 0.08까지 올리고, 경계 ghost가 늘면 0.04로 낮춘다. 0이면 비활성화.
+  hold_handoff_margin_uv: 0.06
+  # 자동 산출 대신 직접 지정하고 싶을 때만 사용:
+  # hold_handoff_u_edges:
+  #   corridor: [0.40, 0.60]
   # 같은 gid의 다음 관측점이 이 UV 거리보다 멀면 순간이동으로 보고 새 gid로 분리한다.
   # 바닥 인터랙션에서는 OSC actor가 프로젝션 면을 갑자기 가로지르는 것을 막는 안전장치다.
   # 0이면 비활성화. 0.08은 40m projection에서 약 3.2m 규모의 큰 점프를 차단한다.
@@ -141,11 +148,14 @@ cameras:
   #       body_catch_margin_uv: 0.35
   #       body_catch_min_confidence: 0.12
   #       # 계단/착석자 전용 완화 polygon. viewer에서는 s 키로 기존 floor region 위에
-  #       # 따로 그릴 수 있다. 이 polygon은 UV 변환용이 아니라 relaxed detection mask다.
+  #       # 따로 그릴 수 있다.
   #       relaxed_presence_points: [[150, 120], [780, 120], [760, 260], [160, 260]]
+  #       # 선택 사항: relaxed_presence_points 4점을 계단 전용 projection UV rect로
+  #       # 다시 투영한다. 좌우 카메라의 사다리꼴 오차가 보이면 이 rect를 조정한다.
+  #       relaxed_presence_uv: [0.45, 0.15, 1.0, 0.35]
   #       relaxed_presence_margin_uv: 0.10
   #       relaxed_presence_min_confidence: 0.12
-  #       # 선택 사항: 계단/착석자 actor는 floor homography v 대신 이 projection v를 사용한다.
+  #       # 선택 사항: 계단/착석자 actor는 warp 결과 v 대신 이 projection v를 사용한다.
   #       relaxed_presence_v: 0.35
   #       # 같은 의미의 호환 alias: stair_catch_points
   #       min_bbox_height_px: 24

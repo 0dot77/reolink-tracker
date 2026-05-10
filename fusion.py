@@ -317,6 +317,21 @@ def _source_zone_priority(ev: PersonEvent) -> int:
     return 0
 
 
+def _normalize_handoff_u_edges(
+    edges: dict[str, list[float]],
+) -> dict[str, tuple[float, ...]]:
+    out: dict[str, tuple[float, ...]] = {}
+    for projection_id, values in edges.items():
+        clean: set[float] = set()
+        for edge in values:
+            value = float(edge)
+            if 0.0 < value < 1.0:
+                clean.add(value)
+        if clean:
+            out[str(projection_id)] = tuple(sorted(clean))
+    return out
+
+
 class PersonTracker:
     """Stitches per-cam track events into stable global person IDs.
 
@@ -348,6 +363,8 @@ class PersonTracker:
         velocity_max_dt_s: float = 1.0,
         velocity_predict_max_dt_s: float = 1.0,
         hold_boundary_margin_uv: float = 0.0,
+        hold_handoff_margin_uv: float = 0.0,
+        hold_handoff_u_edges: Optional[dict[str, list[float]]] = None,
         max_update_jump_uv: float = 0.0,
         relaxed_hold_s: float = 0.0,
         reuse_lost_gids: bool = True,
@@ -366,6 +383,13 @@ class PersonTracker:
         # the projection edge. Interior misses become immediate lost events so
         # downstream visuals do not show a ghost in the middle of the floor.
         self.hold_boundary_margin_uv = max(0.0, min(float(hold_boundary_margin_uv), 0.5))
+        # Optional internal hand-off bands. These keep gid state alive around
+        # dispatch slice boundaries while still suppressing unrelated interior
+        # ghosts when hold_boundary_margin_uv is enabled.
+        self.hold_handoff_margin_uv = max(0.0, min(float(hold_handoff_margin_uv), 0.5))
+        self.hold_handoff_u_edges = _normalize_handoff_u_edges(
+            hold_handoff_u_edges or {}
+        )
         # Optional teleport guard. When enabled, a fresh observation that would
         # move an existing gid farther than this UV distance is treated as a
         # new person instead of dragging the OSC actor across the floor.
@@ -553,15 +577,26 @@ class PersonTracker:
         self._just_lost = []
         return out
 
+    def set_handoff_u_edges(self, edges: dict[str, list[float]]) -> None:
+        self.hold_handoff_u_edges = _normalize_handoff_u_edges(edges)
+
     def _allows_held(self, person: Person) -> bool:
         margin = self.hold_boundary_margin_uv
         if margin <= 0.0:
             return True
-        return (
+        if (
             person.u <= margin
             or person.u >= 1.0 - margin
             or person.v <= margin
             or person.v >= 1.0 - margin
+        ):
+            return True
+        handoff_margin = self.hold_handoff_margin_uv
+        if handoff_margin <= 0.0:
+            return False
+        return any(
+            abs(person.u - edge) <= handoff_margin
+            for edge in self.hold_handoff_u_edges.get(person.projection_id, ())
         )
 
     def _best_pending_match(
@@ -1318,6 +1353,31 @@ if __name__ == "__main__":
         "(t) edge miss remains held inside hand-off window",
         len(persons) == 1 and persons[0].state == "held" and lost == [],
         f"persons={persons}, lost={lost}",
+    )
+
+    # (t2) The edge gate also allows configured internal dispatch boundaries.
+    # This is the cam0 -> cam2 -> cam1 case: the projection middle should not
+    # linger generally, but the hand-off u boundaries should stay pending briefly.
+    pt = PersonTracker(
+        hand_off_window_s=1.0,
+        hold_boundary_margin_uv=0.1,
+        hold_handoff_margin_uv=0.05,
+        hold_handoff_u_edges={"corridor": [0.4, 0.6]},
+    )
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.41, 0.50, 0.9, 0.0)], [], 0.0)
+    persons = pt.update([], [("cam0", 5)], 0.1)
+    lost = pt.drain_lost_gids()
+    persons = pt.update(
+        [PersonEvent("corridor", "cam2", 8, 0.43, 0.50, 0.9, 0.2)],
+        [],
+        0.2,
+    )
+    _check(
+        "(t2) internal hand-off edge remains held and stitches",
+        {p.gid for p in persons} == {1}
+        and pt._source_to_gid.get(("cam2", 8)) == 1
+        and lost == [],
+        f"persons={persons}, lost={lost}, source_map={pt._source_to_gid}",
     )
 
     # (u) Relaxed/stair actors can linger longer than normal walk actors.

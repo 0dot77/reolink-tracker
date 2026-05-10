@@ -35,20 +35,24 @@
 - camera region의 `body_catch_points`는 발점 투영용 homography를 대체하지 않습니다.
   bbox가 이 보조 polygon과 겹치고 foot UV가 projection rect 근처에 있으면 낮은
   confidence/경계 밖 foot을 살려 projection rect로 clamp합니다. OSC 위치 계산은 계속
-  `image_points`의 바닥 homography를 사용합니다. 단, 낮은 confidence 완화는 bbox
-  크기/비율 필터와 confirm window를 통과한 detection에만 적용합니다.
+  `image_points`의 바닥 homography를 사용합니다. 낮은 confidence 완화는 bbox
+  크기/비율 필터와 confirm window를 통과한 detection에만 적용합니다. `too-small`
+  rejection은 region의 `min_bbox_height_px`와 relaxed area floor를 통과한 경우에만
+  body catch가 구제할 수 있어, 중앙 원거리 보행자처럼 작게 잡히는 bbox를 살립니다.
 - camera region의 `relaxed_presence_points`는 계단/착석자용 별도 image polygon입니다.
   `image_points`는 UV 변환용 기준 영역으로 유지하고, relaxed polygon은 그 안에서만
-  가로로 넓거나 짧은 bbox를 완화해 actor 후보로 승격합니다. 위치는 기존 homography의
-  `u`를 쓰고 `relaxed_presence_v`가 있으면 그 projection v를 고정값으로 씁니다.
-  값이 없으면 `v`만 projection rect 안으로 clamp하며, dispatch 판정도 `u` 중심으로만
-  수행합니다. `stair_catch_points`는 같은 의미의 입력 alias입니다. 이 경로에서 생성된
+  가로로 넓거나 짧은 bbox를 완화해 actor 후보로 승격합니다. `relaxed_presence_uv`가 있으면
+  relaxed polygon 4점을 계단 전용 projection UV rect로 매핑해 좌우 카메라의 사다리꼴 오차를
+  보정합니다. 값이 없으면 기존 homography의 `u`를 씁니다. `relaxed_presence_v`가 있으면
+  최종 projection v를 고정값으로 씁니다. 값이 없으면 `v`만 계단 전용 rect 또는 projection
+  rect 안으로 clamp하며, dispatch 판정도 `u` 중심으로만 수행합니다.
+  `stair_catch_points`는 같은 의미의 입력 alias입니다. 이 경로에서 생성된
   fused actor는 `source_zone=stair_relaxed`로 유지되어 TouchDesigner가 보행자와 다른
   y lane으로 remap할 수 있습니다.
 - 같은 projection을 공유하는 카메라들의 `dispatch_uv` slice는 겹치지 않아야 합니다. 겹치면 count가 부풀 수 있습니다.
 - cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 중앙 hand-off나 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
 - `fusion.relaxed_hold_s`가 0보다 크면 계단/착석자 relaxed polygon에서 생성된 actor만 detection drop 이후 더 오래 held로 남습니다. 일반 바닥 보행자 hold 정책은 그대로 둡니다.
-- `fusion.hold_boundary_margin_uv`가 0보다 크면 held gid는 projection 가장자리 근처에서만 active로 남습니다. 중앙에서 track을 놓친 경우에는 ghost actor가 남지 않도록 즉시 `/lost` 처리합니다.
+- `fusion.hold_boundary_margin_uv`가 0보다 크면 held gid는 projection 가장자리 근처에서만 active로 남습니다. 단, `fusion.hold_handoff_margin_uv`가 0보다 크면 각 `dispatch_uv` 내부 u 경계 근처에서도 hand-off용 held를 허용합니다. 중앙에서 track을 놓친 경우에는 ghost actor가 남지 않도록 즉시 `/lost` 처리하되, cam0 -> cam2 -> cam1 slice 경계의 짧은 결손은 흡수합니다.
 - `fusion.reuse_lost_gids` 기본값은 `true`입니다. 완전히 lost된 gid는 작은 번호부터 재사용해서 TouchDesigner OSC 채널/테이블이 총 방문자 수만큼 계속 커지지 않게 합니다.
 - `interaction_zones`는 projection별 UV rectangle입니다. fused person이 zone 안에 있으면 zone-local 좌표와 dwell/presence를 별도 OSC stream으로 내보내며, 카메라별 calibration `regions`와 섞지 않습니다.
 - `/person/<gid>/lost`는 gid가 마지막으로 속한 projection에만 송신합니다. cross-projection broadcast cleanup은 더 이상 하지 않습니다.
