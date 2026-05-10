@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 #[derive(Default)]
 struct AppState {
     child: Mutex<Option<Child>>,
+    active_config: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -229,6 +230,36 @@ fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
             "failed to copy {} to {}: {err}",
             src.display(),
             dst.display()
+        )
+    })
+}
+
+fn write_text_atomically(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.yaml");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    fs::write(&tmp_path, content)
+        .map_err(|err| format!("failed to write {}: {err}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        format!(
+            "failed to replace {} with {}: {err}",
+            path.display(),
+            tmp_path.display()
         )
     })
 }
@@ -509,24 +540,34 @@ fn video_test_config_text(
         return Err("config cameras[] is empty".to_string());
     }
 
-    let target_name = camera_name.unwrap_or("cam1");
-    let index = cameras
-        .iter()
-        .position(|camera| {
-            camera
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map(|name| name == target_name)
-                .unwrap_or(false)
-        })
-        .unwrap_or(0);
+    let requested_name = camera_name.map(str::trim).filter(|name| !name.is_empty());
+    let index = if let Some(target_name) = requested_name {
+        cameras
+            .iter()
+            .position(|camera| {
+                camera
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(|name| name == target_name)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| format!("camera not found in config: {target_name}"))?
+    } else {
+        0
+    };
+    let target_name = cameras[index]
+        .get("name")
+        .and_then(|value| value.as_str())
+        .or(requested_name)
+        .unwrap_or("camera")
+        .to_string();
 
     let camera = cameras[index]
         .as_mapping_mut()
         .ok_or_else(|| "target camera entry must be a YAML mapping".to_string())?;
     camera.insert(
         serde_yaml::Value::String("name".to_string()),
-        serde_yaml::Value::String(target_name.to_string()),
+        serde_yaml::Value::String(target_name),
     );
     camera.insert(
         serde_yaml::Value::String("url".to_string()),
@@ -590,21 +631,26 @@ fn camera_url_from_config(
     if cameras.is_empty() {
         return Err("config cameras[] is empty".to_string());
     }
-    let target_name = camera_name.unwrap_or("cam0");
-    let camera = cameras
-        .iter()
-        .find(|camera| {
-            camera
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map(|name| name == target_name)
-                .unwrap_or(false)
-        })
-        .unwrap_or(&cameras[0]);
+    let requested_name = camera_name.map(str::trim).filter(|name| !name.is_empty());
+    let camera = if let Some(target_name) = requested_name {
+        cameras
+            .iter()
+            .find(|camera| {
+                camera
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(|name| name == target_name)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| format!("camera not found in config: {target_name}"))?
+    } else {
+        &cameras[0]
+    };
     let name = camera
         .get("name")
         .and_then(|value| value.as_str())
-        .unwrap_or(target_name)
+        .or(requested_name)
+        .unwrap_or("camera")
         .to_string();
     let url = camera
         .get("url")
@@ -813,6 +859,9 @@ fn inspect_tracker_state(state: &AppState) -> Result<ProcessStatus, String> {
             .map_err(|err| format!("failed to inspect tracker: {err}"))?
         {
             *guard = None;
+            if let Ok(mut active_config) = state.active_config.lock() {
+                *active_config = None;
+            }
             return Ok(ProcessStatus {
                 running: false,
                 exit_code: status.code(),
@@ -971,12 +1020,15 @@ cameras:
     url: rtsp://admin:%21pass@192.168.1.20:554/h264Preview_01_sub
   - name: cam1
     url: rtsp://admin:%21pass@192.168.1.21:554/h264Preview_01_sub
+  - name: cam2
+    url: rtsp://admin:%21pass@192.168.1.22:554/h264Preview_01_sub
 "#;
         assert_eq!(
             parse_config_targets(config),
             vec![
                 ("cam0".to_string(), "192.168.1.20".to_string()),
-                ("cam1".to_string(), "192.168.1.21".to_string())
+                ("cam1".to_string(), "192.168.1.21".to_string()),
+                ("cam2".to_string(), "192.168.1.22".to_string())
             ]
         );
     }
@@ -1016,13 +1068,22 @@ cameras:
         relaxed_presence_points: [[100, 80], [320, 80], [300, 150], [120, 150]]
         relaxed_presence_margin_uv: 0.1
         relaxed_presence_min_confidence: 0.12
+  - name: cam2
+    regions:
+      - id: center
+        projection_id: corridor
+        projection_uv: [0.32, 0.0, 0.68, 1.0]
+        dispatch_uv: [0.4, 0.0, 0.6, 1.0]
+        min_bbox_height_px: 24
 "#;
         let snapshot = parse_projection_snapshot(config).expect("snapshot should parse");
-        assert_eq!(snapshot.camera_count, 1);
+        assert_eq!(snapshot.camera_count, 2);
         assert_eq!(snapshot.projections[0].id, "corridor");
         assert_eq!(snapshot.projections[0].zones[0].id, "center");
         assert_eq!(snapshot.regions[0].camera, "cam0");
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
+        assert_eq!(snapshot.regions[1].camera, "cam2");
+        assert_eq!(snapshot.regions[1].dispatch_uv, vec![0.4, 0.0, 0.6, 1.0]);
         assert_eq!(snapshot.regions[0].relaxed_presence_points.len(), 4);
         assert_eq!(
             snapshot.regions[0].relaxed_presence_min_confidence,
@@ -1046,6 +1107,9 @@ cameras:
   - name: cam1
     url: rtsp://admin:%21pass@192.168.1.21:554/h264Preview_01_sub
     regions: []
+  - name: cam2
+    url: rtsp://admin:%21pass@192.168.1.22:554/h264Preview_01_sub
+    regions: []
 "#;
         let text =
             video_test_config_text(config, Path::new("/tmp/test-camera-1.mp4"), Some("cam1"))
@@ -1063,6 +1127,10 @@ cameras:
         assert_eq!(
             cameras[1].get("url").and_then(|value| value.as_str()),
             Some("/tmp/test-camera-1.mp4")
+        );
+        assert_eq!(
+            cameras[2].get("url").and_then(|value| value.as_str()),
+            Some("rtsp://admin:%21pass@192.168.1.22:554/h264Preview_01_sub")
         );
         let osc = parsed.get("osc").expect("osc should exist");
         assert_eq!(
@@ -1157,6 +1225,117 @@ cameras:
             .expect("relaxed points should exist");
         assert_eq!(relaxed.len(), 4);
         assert_eq!(yaml_number_vec(relaxed.first()), vec![100.0, 80.0]);
+    }
+
+    #[test]
+    fn calibration_config_adds_cam2_floor_region() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam0
+    url: /tmp/cam0.mp4
+    regions: []
+  - name: cam2
+    url: /tmp/cam2.mp4
+    regions: []
+"#;
+        let request = SaveCalibrationPointsRequest {
+            camera_name: "cam2".to_string(),
+            region_id: Some("center_band".to_string()),
+            image_points: vec![[180.0, 120.0], [1040.0, 120.0], [1080.0, 560.0], [150.0, 560.0]],
+            point_kind: Some("floor".to_string()),
+        };
+        let text = calibration_config_text(config, &request).expect("cam2 floor should save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let cameras = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .expect("cameras should exist");
+        let cam2 = cameras
+            .iter()
+            .find(|camera| camera.get("name").and_then(|value| value.as_str()) == Some("cam2"))
+            .expect("cam2 should exist");
+        let region = cam2
+            .get("regions")
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .expect("cam2 region should exist");
+        assert_eq!(region.get("id").and_then(|value| value.as_str()), Some("center_band"));
+        assert_eq!(
+            region.get("projection_id").and_then(|value| value.as_str()),
+            Some("corridor")
+        );
+        assert_eq!(
+            yaml_number_vec(
+                region
+                    .get("image_points")
+                    .and_then(|value| value.as_sequence())
+                    .and_then(|points| points.first())
+            ),
+            vec![180.0, 120.0]
+        );
+    }
+
+    #[test]
+    fn calibration_mapping_updates_cam2_without_touching_other_cameras() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam0
+    url: /tmp/cam0.mp4
+    regions:
+      - id: near
+        projection_id: corridor
+        projection_uv: [0.0, 0.0, 0.48, 1.0]
+        dispatch_uv: [0.0, 0.0, 0.4, 1.0]
+  - name: cam2
+    url: /tmp/cam2.mp4
+    regions:
+      - id: center_band
+        projection_id: corridor
+        projection_uv: [0.32, 0.0, 0.68, 1.0]
+        dispatch_uv: [0.4, 0.0, 0.6, 1.0]
+"#;
+        let request = SaveCalibrationMappingRequest {
+            camera_name: "cam2".to_string(),
+            region_id: "center_band".to_string(),
+            projection_uv: Some([0.30, 0.0, 0.70, 1.0]),
+            dispatch_uv: Some([0.40, 0.0, 0.60, 1.0]),
+            relaxed_presence_v: Some(0.35),
+        };
+        let text = calibration_mapping_config_text(config, &request)
+            .expect("cam2 mapping should save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let cameras = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .expect("cameras should exist");
+        let cam0_region = cameras[0]
+            .get("regions")
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .expect("cam0 region should exist");
+        let cam2_region = cameras[1]
+            .get("regions")
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .expect("cam2 region should exist");
+        assert_eq!(
+            yaml_number_vec(cam0_region.get("dispatch_uv")),
+            vec![0.0, 0.0, 0.4, 1.0]
+        );
+        assert_eq!(
+            yaml_number_vec(cam2_region.get("projection_uv")),
+            vec![0.30, 0.0, 0.70, 1.0]
+        );
+        assert_eq!(
+            yaml_optional_f64(cam2_region.get("relaxed_presence_v")),
+            Some(0.35)
+        );
     }
 }
 
@@ -1254,8 +1433,7 @@ fn save_config(app: AppHandle, request: SaveConfigRequest) -> Result<(), String>
     serde_yaml::from_str::<serde_yaml::Value>(&request.content)
         .map_err(|err| format!("YAML validation failed: {err}"))?;
     let path = config_path(&app)?;
-    fs::write(&path, request.content)
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))
+    write_text_atomically(&path, &request.content)
 }
 
 fn ensure_tracker_not_running(state: &AppState) -> Result<(), String> {
@@ -1272,8 +1450,19 @@ fn ensure_tracker_not_running(state: &AppState) -> Result<(), String> {
             return Err("tracker is already running".to_string());
         }
         *guard = None;
+        if let Ok(mut active_config) = state.active_config.lock() {
+            *active_config = None;
+        }
     }
     Ok(())
+}
+
+fn active_config_path(state: &AppState) -> Option<PathBuf> {
+    state
+        .active_config
+        .lock()
+        .ok()
+        .and_then(|active_config| active_config.clone())
 }
 
 fn spawn_tracker_with_config(
@@ -1301,7 +1490,7 @@ fn spawn_tracker_with_config(
     cmd.current_dir(runtime_dir(&app)?)
         .arg(&tracker)
         .arg("--config")
-        .arg(config)
+        .arg(&config)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if show_preview {
@@ -1323,6 +1512,9 @@ fn spawn_tracker_with_config(
         .lock()
         .map_err(|_| "tracker process lock poisoned".to_string())?;
     *guard = Some(child);
+    if let Ok(mut active_config) = state.active_config.lock() {
+        *active_config = Some(config);
+    }
     Ok(ProcessStatus {
         running: true,
         exit_code: None,
@@ -1355,8 +1547,7 @@ fn start_video_test(
     let test_config = runtime_dir(&app)?.join("video-test-config.yaml");
     let test_config_text =
         video_test_config_text(&config_text, &video_path, request.camera_name.as_deref())?;
-    fs::write(&test_config, test_config_text)
-        .map_err(|err| format!("failed to write {}: {err}", test_config.display()))?;
+    write_text_atomically(&test_config, &test_config_text)?;
 
     spawn_tracker_with_config(app, &state, test_config, request.show_preview)
 }
@@ -1448,27 +1639,47 @@ print(f"{width} {height}")
 #[tauri::command]
 fn save_calibration_points(
     app: AppHandle,
+    state: tauri::State<AppState>,
     request: SaveCalibrationPointsRequest,
 ) -> Result<(), String> {
     let config = config_path(&app)?;
     let config_text = fs::read_to_string(&config)
         .map_err(|err| format!("failed to read runtime config: {err}"))?;
     let next_config = calibration_config_text(&config_text, &request)?;
-    fs::write(&config, next_config)
-        .map_err(|err| format!("failed to write {}: {err}", config.display()))
+    write_text_atomically(&config, &next_config)?;
+
+    if let Some(active_config) = active_config_path(&state) {
+        if active_config != config && active_config.exists() {
+            let active_text = fs::read_to_string(&active_config)
+                .map_err(|err| format!("failed to read active tracker config: {err}"))?;
+            let next_active_config = calibration_config_text(&active_text, &request)?;
+            write_text_atomically(&active_config, &next_active_config)?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn save_calibration_mapping(
     app: AppHandle,
+    state: tauri::State<AppState>,
     request: SaveCalibrationMappingRequest,
 ) -> Result<(), String> {
     let config = config_path(&app)?;
     let config_text = fs::read_to_string(&config)
         .map_err(|err| format!("failed to read runtime config: {err}"))?;
     let next_config = calibration_mapping_config_text(&config_text, &request)?;
-    fs::write(&config, next_config)
-        .map_err(|err| format!("failed to write {}: {err}", config.display()))
+    write_text_atomically(&config, &next_config)?;
+
+    if let Some(active_config) = active_config_path(&state) {
+        if active_config != config && active_config.exists() {
+            let active_text = fs::read_to_string(&active_config)
+                .map_err(|err| format!("failed to read active tracker config: {err}"))?;
+            let next_active_config = calibration_mapping_config_text(&active_text, &request)?;
+            write_text_atomically(&active_config, &next_active_config)?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1478,6 +1689,9 @@ fn stop_tracker(state: tauri::State<AppState>) -> Result<ProcessStatus, String> 
         .lock()
         .map_err(|_| "tracker process lock poisoned".to_string())?;
     if let Some(mut child) = guard.take() {
+        if let Ok(mut active_config) = state.active_config.lock() {
+            *active_config = None;
+        }
         let _ = child.kill();
         let status = child
             .wait()
@@ -1486,6 +1700,9 @@ fn stop_tracker(state: tauri::State<AppState>) -> Result<ProcessStatus, String> 
             running: false,
             exit_code: status.code(),
         });
+    }
+    if let Ok(mut active_config) = state.active_config.lock() {
+        *active_config = None;
     }
     Ok(ProcessStatus {
         running: false,
@@ -1632,7 +1849,7 @@ fn run_field_checks(
             },
         ));
 
-        for (_, host) in targets.iter().take(2) {
+        for (_, host) in &targets {
             checks.push(rtsp_port_probe(host));
         }
     }

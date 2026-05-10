@@ -54,6 +54,12 @@
   가 있으면 그것을 우선 사용합니다. 앱에서 저장한 영역이 tracker, Preview, `$sim`에
   항상 반영되어야 합니다.
 - Tauri Preview/Start는 tracker 실행 전에 엔진 파일을 앱 런타임 디렉터리로 동기화합니다.
+- Tauri dev 앱을 띄우거나 앞으로 가져올 때 앱 이름을 추측하지 않습니다.
+  `reolink-tracker-app` 또는 `Reolink Tracker` 이름으로 `osascript tell application ...`
+  activate를 시도하면 macOS 등록 이름과 달라 실패할 수 있습니다. 활성화가 필요하면
+  우선 bundle id `com.taeyang.reolink-tracker` 기준으로 시도하고, 그래도 실패하면
+  Computer Use/list_apps나 창 상태 확인으로 실제 실행 여부를 확인합니다. 실패한 앱 이름으로
+  반복 activate하지 않습니다.
 - `tracker.py`에는 `detection_filter`가 추가되어 confidence, bbox 크기, bbox 비율,
   짧은 confirm window를 통과한 detection만 이벤트로 승격합니다.
 - `fusion.py`에는 `position_alpha` 기반 fused person 좌표 smoothing과 stair relaxed

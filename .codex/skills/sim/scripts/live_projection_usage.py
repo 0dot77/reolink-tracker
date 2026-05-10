@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record live cam0/cam1 and render reference-style projection usage simulation."""
+"""Record live configured cameras and render projection usage simulation."""
 
 from __future__ import annotations
 
@@ -48,6 +48,18 @@ def gid_color(gid: int) -> tuple[int, int, int]:
     return tuple(int(v) for v in rng.integers(80, 255, 3))
 
 
+def camera_color(index: int) -> tuple[int, int, int]:
+    colors = [
+        (255, 190, 40),
+        (80, 255, 80),
+        (255, 110, 110),
+        (110, 190, 255),
+        (230, 110, 255),
+        (255, 255, 120),
+    ]
+    return colors[index % len(colors)]
+
+
 def uv_to_px(u: float, v: float) -> tuple[int, int]:
     x = int(round(max(0.0, min(0.999, float(u))) * PROJ_W))
     y = int(round(max(0.0, min(0.999, float(v))) * PROJ_H))
@@ -64,7 +76,7 @@ def record_live_clips(
     caps: list[cv2.VideoCapture | None] = []
     writers: list[cv2.VideoWriter | None] = []
     results: dict[str, dict[str, Any]] = {}
-    cameras = cfg.get("cameras", [])[:2]
+    cameras = cfg.get("cameras", [])
 
     for idx, cam in enumerate(cameras):
         name = cam.get("name", f"cam{idx}")
@@ -112,7 +124,7 @@ def record_live_clips(
         caps.append(cap)
         writers.append(writer)
 
-    if len(results) < 2 or not all(item.get("ok") for item in results.values()):
+    if len(results) != len(cameras) or not all(item.get("ok") for item in results.values()):
         for cap in caps:
             if cap is not None:
                 cap.release()
@@ -180,10 +192,21 @@ def make_sim_config(
             "confirm_window_s": 0.8,
         },
     )
-    for cam in cfg.get("cameras", [])[:2]:
-        cam["url"] = record_results[cam.get("name")]["path"]
-    cfg["cameras"] = cfg.get("cameras", [])[:2]
+    cameras = []
+    for idx, cam in enumerate(cfg.get("cameras", [])):
+        name = cam.get("name", f"cam{idx}")
+        if name not in record_results or not record_results[name].get("ok"):
+            continue
+        cam["url"] = record_results[name]["path"]
+        cameras.append(cam)
+    cfg["cameras"] = cameras
     return cfg
+
+
+def resolve_processing_params(cfg: dict[str, Any], args: argparse.Namespace) -> tuple[int, float]:
+    imgsz = int(args.imgsz) if args.imgsz is not None else int(cfg.get("imgsz", 640))
+    conf = float(args.conf) if args.conf is not None else float(cfg.get("conf", 0.35))
+    return imgsz, conf
 
 
 def parse_runtime(cfg: dict[str, Any]) -> tuple[dict[str, Any], PersonTracker, list[tr.CamWorker]]:
@@ -222,10 +245,10 @@ def draw_camera(frame: np.ndarray, worker: tr.CamWorker, overlays: list, cam_idx
     h, w = frame.shape[:2]
     panel = cv2.resize(frame, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
     sx, sy = CAM_W / w, CAM_H / h
-    region_colors = [(255, 190, 40), (80, 255, 80)]
+    region_color = camera_color(cam_idx)
     for reg in worker.cam.regions:
         pts = np.array([(int(x * sx), int(y * sy)) for x, y in reg.image_points], np.int32)
-        cv2.polylines(panel, [pts], True, region_colors[cam_idx % 2], 3, cv2.LINE_AA)
+        cv2.polylines(panel, [pts], True, region_color, 3, cv2.LINE_AA)
         if reg.body_catch_points:
             catch = np.array([(int(x * sx), int(y * sy)) for x, y in reg.body_catch_points], np.int32)
             cv2.polylines(panel, [catch], True, (255, 80, 220), 1, cv2.LINE_AA)
@@ -241,6 +264,31 @@ def draw_camera(frame: np.ndarray, worker: tr.CamWorker, overlays: list, cam_idx
         cv2.putText(panel, f"{tid}:{conf:.2f}", (p0[0], max(14, p0[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
     cv2.putText(panel, worker.cam.name, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
     return panel
+
+
+def draw_camera_strip(cam_panels: list[np.ndarray]) -> np.ndarray:
+    if not cam_panels:
+        return np.full((CAM_H, VIDEO_W, 3), (8, 10, 12), np.uint8)
+    cols = len(cam_panels)
+    tile_w = max(1, VIDEO_W // cols)
+    strip = np.full((CAM_H, VIDEO_W, 3), (8, 10, 12), np.uint8)
+    x = 0
+    for idx, panel in enumerate(cam_panels):
+        next_x = VIDEO_W if idx == cols - 1 else min(VIDEO_W, x + tile_w)
+        resized = cv2.resize(panel, (next_x - x, CAM_H), interpolation=cv2.INTER_AREA)
+        strip[:, x:next_x] = resized
+        if idx > 0:
+            cv2.line(strip, (x, 0), (x, CAM_H), (45, 50, 55), 1, cv2.LINE_AA)
+        x = next_x
+    return strip
+
+
+def source_sample_text(workers: list[tr.CamWorker], metrics: dict[str, Any]) -> str:
+    source_samples = metrics["source_samples"]
+    names = [worker.cam.name for worker in workers]
+    extras = sorted(name for name in source_samples if name not in names)
+    parts = [f"{name}={source_samples.get(name, 0)}" for name in names + extras]
+    return " ".join(parts) if parts else "none"
 
 
 def draw_usage_panel(
@@ -278,9 +326,8 @@ def draw_usage_panel(
     for gy in range(GRID_H + 1):
         y = int(round(gy * cell_h))
         cv2.line(panel, (0, y), (PROJ_W, y), (54, 64, 60), 1, cv2.LINE_AA)
-    colors = [(255, 190, 40), (80, 255, 80)]
     for ci, worker in enumerate(workers):
-        color = colors[ci % 2]
+        color = camera_color(ci)
         for reg in worker.cam.regions:
             for rect, thickness in [(reg.projection_uv, 1), (reg.dispatch_uv, 2)]:
                 x0, y0 = uv_to_px(rect[0], rect[1])
@@ -308,7 +355,7 @@ def draw_usage_panel(
     lines = [
         f"projection usage simulation frame={frame_idx}",
         f"active={len(persons)} fresh={sum(1 for p in persons if p.state == 'fresh')} used_cells={used}/{GRID_W * GRID_H} ({used / (GRID_W * GRID_H) * 100:.1f}%)",
-        f"left_samples={metrics['source_samples'].get('cam0', 0)} right_samples={metrics['source_samples'].get('cam1', 0)} center_overlap_samples={metrics['center_overlap_samples']}",
+        f"sources {source_sample_text(workers, metrics)} center_overlap_samples={metrics['center_overlap_samples']}",
     ]
     y = 28
     for line in lines:
@@ -336,17 +383,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out_root) / f"live-{stamp}-20s-usage"
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_video = out_dir / "cam0-cam1-20s-projection-usage.mp4"
+    output_video = out_dir / "all-cameras-20s-projection-usage.mp4"
     summary_path = out_dir / "summary.json"
     sim_config_path = out_dir / "sim-config.yaml"
 
     print(json.dumps({"status": "recording", "out_dir": str(out_dir)}, ensure_ascii=False), flush=True)
     record_results = record_live_clips(base_cfg, out_dir, args.seconds, args.fps)
-    if len(record_results) < 2 or not all(item.get("ok") for item in record_results.values()):
+    if len(record_results) < 1 or not all(item.get("ok") for item in record_results.values()):
         raise RuntimeError(json.dumps(record_results, ensure_ascii=False, indent=2))
     print(json.dumps({"status": "processing", "record_results": record_results}, ensure_ascii=False), flush=True)
 
-    sim_cfg = make_sim_config(base_cfg, record_results, args.imgsz, args.conf)
+    sim_imgsz, sim_conf = resolve_processing_params(base_cfg, args)
+    sim_cfg = make_sim_config(base_cfg, record_results, sim_imgsz, sim_conf)
     sim_config_path.write_text(yaml.safe_dump(sim_cfg, sort_keys=False, allow_unicode=True))
     _projections, person_tracker, workers = parse_runtime(sim_cfg)
     caps = [cv2.VideoCapture(worker.cam.url) for worker in workers]
@@ -361,6 +409,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "active_frames": 0,
         "both_side_frames": 0,
+        "multi_source_frames": 0,
         "max_active_persons": 0,
         "fresh_samples": 0,
         "center_overlap_samples": 0,
@@ -385,8 +434,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for ci, (worker, frame) in enumerate(zip(workers, frames)):
             overlays, _regions, events, lost_sources = worker.step(
                 frame,
-                args.imgsz,
-                args.conf,
+                sim_imgsz,
+                sim_conf,
                 0.5,
                 sim_cfg.get("tracker", "botsort.yaml"),
                 frame_idx / source_fps,
@@ -400,14 +449,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metrics["max_active_persons"] = max(metrics["max_active_persons"], len(persons))
         metrics["fresh_samples"] += sum(1 for person in persons if person.state == "fresh")
         sources = {person.source[0] for person in persons}
-        if "cam0" in sources and "cam1" in sources:
+        if len(sources) >= 2:
+            metrics["multi_source_frames"] += 1
             metrics["both_side_frames"] += 1
         for person in persons:
             all_samples.append((person.u, person.v, person.gid))
             metrics["source_samples"][person.source[0]] = metrics["source_samples"].get(person.source[0], 0) + 1
             if 0.44 <= person.u <= 0.56:
                 metrics["center_overlap_samples"] += 1
-        canvas = np.vstack([np.hstack(cam_panels[:2]), draw_usage_panel(workers, persons, all_samples, trails, frame_idx, metrics)])
+        canvas = np.vstack([draw_camera_strip(cam_panels), draw_usage_panel(workers, persons, all_samples, trails, frame_idx, metrics)])
         writer.write(canvas)
         if frame_idx in {100, 200, 300}:
             path = out_dir / f"preview-frame-{frame_idx}.jpg"
@@ -435,12 +485,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_fps": source_fps,
         "processed_seconds": round(processed_frames / source_fps, 3),
         "runtime_seconds": time.time() - start,
-        "sim_conf": args.conf,
-        "sim_imgsz": args.imgsz,
+        "sim_conf": sim_conf,
+        "sim_imgsz": sim_imgsz,
+        "sim_conf_source": "cli" if args.conf is not None else "config",
+        "sim_imgsz_source": "cli" if args.imgsz is not None else "config",
         "active_frames": metrics["active_frames"],
         "active_frame_ratio": metrics["active_frames"] / max(1, processed_frames),
         "both_side_frames": metrics["both_side_frames"],
         "both_side_frame_ratio": metrics["both_side_frames"] / max(1, processed_frames),
+        "multi_source_frames": metrics["multi_source_frames"],
+        "multi_source_frame_ratio": metrics["multi_source_frames"] / max(1, processed_frames),
         "max_active_persons": metrics["max_active_persons"],
         "fresh_samples": metrics["fresh_samples"],
         "left_samples": metrics["source_samples"].get("cam0", 0),
@@ -478,8 +532,8 @@ def main() -> int:
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--fps", type=float, default=20.0)
-    parser.add_argument("--imgsz", type=int, default=960)
-    parser.add_argument("--conf", type=float, default=0.22)
+    parser.add_argument("--imgsz", type=int, default=None)
+    parser.add_argument("--conf", type=float, default=None)
     parser.add_argument("--out-root", default="/private/tmp/reolink-video-sim")
     args = parser.parse_args()
     run(args)

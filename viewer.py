@@ -157,6 +157,13 @@ def _gid_color(gid: int) -> tuple[int, int, int]:
     return palette[gid % len(palette)]
 
 
+def _camera_marker(name: str, index: int) -> str:
+    match = re.search(r"(\d+)$", name or "")
+    if match:
+        return match.group(1)
+    return str(index)
+
+
 def _lan_color(index: int, active: bool = True) -> tuple[int, int, int]:
     palette = [
         (95, 220, 255), (120, 255, 170), (255, 190, 120),
@@ -371,6 +378,60 @@ def _put_label(
     cv2.putText(img, text, org, _FONT, scale, color, thickness, cv2.LINE_AA)
 
 
+def _text_width(text: str, scale: float, thickness: int = 1) -> int:
+    return cv2.getTextSize(text, _FONT, scale, thickness)[0][0]
+
+
+def _ellipsize_text(
+    text: str,
+    max_width: int,
+    scale: float,
+    thickness: int = 1,
+) -> str:
+    if max_width <= 0 or _text_width(text, scale, thickness) <= max_width:
+        return text
+    suffix = "..."
+    if _text_width(suffix, scale, thickness) > max_width:
+        return ""
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        candidate = text[:mid].rstrip() + suffix
+        if _text_width(candidate, scale, thickness) <= max_width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo].rstrip() + suffix
+
+
+def _wrap_text(
+    text: str,
+    max_width: int,
+    scale: float,
+    max_lines: int,
+    thickness: int = 1,
+) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if not current or _text_width(candidate, scale, thickness) <= max_width:
+            current = candidate
+            continue
+        lines.append(current)
+        current = word
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    if not lines:
+        lines = [""]
+    if len(lines) == max_lines and words:
+        lines[-1] = _ellipsize_text(lines[-1], max_width, scale, thickness)
+    return lines
+
+
 def _draw_topology_box(
     img: np.ndarray,
     rect: tuple[int, int, int, int],
@@ -513,9 +574,10 @@ def _draw_hud(tile: np.ndarray, cam: CamFrame) -> None:
         f"{cam.name}  fps={cam.fps:.1f}  osc={cam.osc_rate:.1f}/s  "
         f"age={cam.frame_age_s:.1f}s  rc={cam.reconnects}"
     )
+    text = _ellipsize_text(text, max(40, tile.shape[1] - 18), 0.46, 1)
     (tw, th), base = cv2.getTextSize(text, _FONT, 0.5, 1)
     pad, H, W = 4, tile.shape[0], tile.shape[1]
-    x1, y1, x2, y2 = W - tw - 2 * pad - 4, 4, W - 4, 4 + th + base + 2 * pad
+    x1, y1, x2, y2 = max(4, W - tw - 2 * pad - 4), 4, W - 4, 4 + th + base + 2 * pad
     overlay = tile.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.5, tile, 0.5, 0, dst=tile)
@@ -759,16 +821,19 @@ def _render_uv_canvas(
 
         for ci, cam in enumerate(cams):
             color = _CAM_COLORS[ci % len(_CAM_COLORS)]
-            letter = (cam.name[:1].upper() if cam.name else "?")
+            marker = _camera_marker(cam.name, ci)
             for t in cam.tracks:
-                for rid, u, v, _ in t.region_hits:
+                for rid, u, v, in_dispatch in t.region_hits:
                     reg = reg_lookup.get((ci, rid))
                     if reg is None or reg.projection_id != proj_id:
                         continue
                     px = int(round(u * (cw - 1)))
                     py = int(round(v * (ch - 1)))
-                    cv2.circle(panel, (px, py), 5, color, -1, cv2.LINE_AA)
-                    cv2.putText(panel, letter, (px + 6, py + 4),
+                    if in_dispatch:
+                        cv2.circle(panel, (px, py), 6, color, -1, cv2.LINE_AA)
+                    else:
+                        cv2.circle(panel, (px, py), 6, color, 1, cv2.LINE_AA)
+                    cv2.putText(panel, marker, (px + 6, py + 4),
                                 _FONT, 0.4, color, 1, cv2.LINE_AA)
 
         for person in fused_persons:
@@ -929,6 +994,7 @@ def _render_region_panel(
         f"spawned={stats.get('spawned', 0)} handoff={stats.get('handoff', 0)} "
         f"lost={stats.get('lost', 0)}"
     )
+    summary = _ellipsize_text(summary, width - pad * 2, 0.38, 1)
     cv2.putText(panel, summary, (pad, y), _FONT, 0.4,
                 _C_PANEL_TEXT, 1, cv2.LINE_AA)
     y += line_h
@@ -939,6 +1005,7 @@ def _render_region_panel(
         y += line_h
 
     if edit_status:
+        edit_status = _ellipsize_text(edit_status, width - pad * 2, 0.4, 1)
         cv2.putText(panel, edit_status, (pad, y),
                     _FONT, 0.4, _C_REGION_FOCUS, 1, cv2.LINE_AA)
         y += line_h
@@ -961,6 +1028,7 @@ def _render_region_panel(
                 f"  gid {p.gid} {p.state} {src} "
                 f"uv={p.u:.2f},{p.v:.2f} spd={speed:.2f}"
             )
+            text = _ellipsize_text(text, width - pad * 2, 0.37, 1)
             cv2.putText(panel, text, (pad, y), _FONT, 0.37,
                         color, 1, cv2.LINE_AA)
             y += line_h
@@ -977,6 +1045,7 @@ def _render_region_panel(
         is_focus_cam = ci == focus_idx
         marker = ">" if is_focus_cam else " "
         header = f"{marker} [{ci + 1}] {cam.name}  ({len(cam.regions)})"
+        header = _ellipsize_text(header, width - pad * 2, 0.5, 2 if is_focus_cam else 1)
         cv2.putText(panel, header, (pad, y), _FONT, 0.5,
                     cam_color, 1 if not is_focus_cam else 2, cv2.LINE_AA)
         y += line_h
@@ -984,6 +1053,7 @@ def _render_region_panel(
             f"   {cam.fps:.1f}fps  {cam.osc_rate:.0f}/s  "
             f"age={cam.frame_age_s:.1f}s  rc={cam.reconnects}"
         )
+        cam_stats = _ellipsize_text(cam_stats, width - pad * 2, 0.4, 1)
         cv2.putText(panel, cam_stats, (pad, y), _FONT, 0.4,
                     _C_PANEL_DIM, 1, cv2.LINE_AA)
         y += line_h
@@ -1002,6 +1072,7 @@ def _render_region_panel(
                 f"{prefix} {reg.id} d=[{d[0]:.2f},{d[1]:.2f}->"
                 f"{d[2]:.2f},{d[3]:.2f}]"
             )
+            text = _ellipsize_text(text, width - pad * 2, 0.4, 1)
             text_color = _C_REGION_FOCUS if is_focus_reg else _C_PANEL_TEXT
             cv2.putText(panel, text, (pad, y), _FONT, 0.4,
                         text_color, 1, cv2.LINE_AA)
@@ -1286,18 +1357,26 @@ def _draw_dashboard_bar(
     degraded = stale or overlap_count > 0
     label = "DEGRADED" if degraded else "RUNNING"
     color = _C_WARN if degraded else _C_CLEAN
-    bar_h = 34
+    bar_h = 36
     overlay = canvas.copy()
     cv2.rectangle(overlay, (0, 0), (canvas.shape[1], bar_h), (12, 12, 12), -1)
-    cv2.addWeighted(overlay, 0.82, canvas, 0.18, 0, dst=canvas)
-    cv2.putText(canvas, label, (10, 23), _FONT, 0.65, color, 2, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.90, canvas, 0.10, 0, dst=canvas)
+    label_scale = 0.62
+    label_thickness = 2
+    cv2.putText(canvas, label, (10, 25), _FONT, label_scale, color,
+                label_thickness, cv2.LINE_AA)
     held = sum(1 for p in fused_persons if p.state == "held")
     text = (
         f"active={len(fused_persons)} held={held} "
         f"spawned={stats.get('spawned', 0)} handoff={stats.get('handoff', 0)} "
         f"lost={stats.get('lost', 0)} overlap={overlap_count}"
     )
-    cv2.putText(canvas, text, (140, 23), _FONT, 0.55,
+    label_w = _text_width(label, label_scale, label_thickness)
+    text_x = min(canvas.shape[1] - 20, max(140, 10 + label_w + 28))
+    cv2.line(canvas, (text_x - 12, 8), (text_x - 12, bar_h - 8),
+             (55, 55, 55), 1, cv2.LINE_AA)
+    text = _ellipsize_text(text, canvas.shape[1] - text_x - 12, 0.52, 1)
+    cv2.putText(canvas, text, (text_x, 24), _FONT, 0.52,
                 (230, 230, 230), 1, cv2.LINE_AA)
 
 
@@ -1351,9 +1430,9 @@ class Viewer:
         self._window_created = False
         self._window_failed = False
         self._topmost_pumped = False
-        self._info_panel_width = 280
+        self._info_panel_width = 360
         self._target_canvas_width = max(initial_window_size[0], 800)
-        self._min_cam_slots = 2
+        self._min_cam_slots = 3
         self._person_trails: dict[tuple[str, int], list[tuple[float, float]]] = {}
         self._trail_len = 48
         self._uv_panel_bounds: dict[str, tuple[int, int, int, int]] = {}
@@ -1907,30 +1986,47 @@ class Viewer:
     ) -> None:
         state_text = "[unsaved]" if self.dirty else "[saved]"
         state_color = _C_DIRTY if self.dirty else _C_CLEAN
-        first_line = f"{state_text}  {self.status}"
+        status_text = self.status
         if overlap_summary:
-            first_line += f"  | {overlap_summary}"
-        lines = [
-            first_line,
-            "region draw: projection top-left -> top-right -> bottom-right -> bottom-left | stair draw: 4 image points on selected region | zone draw: 2 UV corners",
-        ]
+            status_text += f" | {overlap_summary}"
         pad = 8
-        line_h = 20
-        y0 = canvas.shape[0] - line_h * len(lines) - pad * 2
+        scale = 0.46
+        line_h = 18
+        max_w = max(80, canvas.shape[1] - pad * 2)
+        (sw, _sh), _ = cv2.getTextSize(state_text, _FONT, scale, 1)
+        first_status_w = max(40, max_w - sw - 12)
+        status_lines = _wrap_text(status_text, first_status_w, scale, 2)
+        help_lines = [
+            "keys: d floor | s stair | z zone | e slices | v zone edit | [/] cycle/nudge | w save | Tab panel | q quit",
+        ]
+        if self.draw_mode:
+            help_lines.append(
+                "point order: top-left -> top-right -> bottom-right -> bottom-left"
+            )
+        help_lines = [
+            _ellipsize_text(line, max_w, 0.42, 1)
+            for line in help_lines
+        ]
+        total_lines = max(1, len(status_lines)) + len(help_lines)
+        y0 = canvas.shape[0] - line_h * total_lines - pad * 2
         overlay = canvas.copy()
         cv2.rectangle(overlay, (0, max(0, y0)), (canvas.shape[1], canvas.shape[0]),
                       (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, dst=canvas)
+        cv2.addWeighted(overlay, 0.78, canvas, 0.22, 0, dst=canvas)
         # State badge in its own colour, then the rest of the status text in white.
-        (sw, _sh), _ = cv2.getTextSize(state_text, _FONT, 0.5, 1)
-        cv2.putText(canvas, state_text, (pad, y0 + pad + line_h - 5),
-                    _FONT, 0.5, state_color, 1, cv2.LINE_AA)
-        rest = first_line[len(state_text):]
-        cv2.putText(canvas, rest, (pad + sw, y0 + pad + line_h - 5),
-                    _FONT, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
-        for i, line in enumerate(lines[1:], start=2):
-            cv2.putText(canvas, line, (pad, y0 + pad + line_h * i - 5),
-                        _FONT, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+        y = y0 + pad + line_h - 5
+        cv2.putText(canvas, state_text, (pad, y), _FONT, scale,
+                    state_color, 1, cv2.LINE_AA)
+        cv2.putText(canvas, status_lines[0], (pad + sw + 12, y),
+                    _FONT, scale, (235, 235, 235), 1, cv2.LINE_AA)
+        for line in status_lines[1:]:
+            y += line_h
+            cv2.putText(canvas, line, (pad + sw + 12, y), _FONT, scale,
+                        (235, 235, 235), 1, cv2.LINE_AA)
+        for line in help_lines:
+            y += line_h
+            cv2.putText(canvas, line, (pad, y), _FONT, 0.42,
+                        (190, 190, 190), 1, cv2.LINE_AA)
 
     def _current_lan_interfaces(self) -> list[LanInterfaceFrame]:
         now = time.monotonic()
@@ -1998,6 +2094,10 @@ class Viewer:
             blank = np.zeros((self.tile_size[1], self.tile_size[0], 3), dtype=np.uint8)
             cv2.putText(blank, "no cameras", (20, 40),
                         _FONT, 0.7, (200, 200, 200), 2)
+            blank = np.vstack([
+                blank,
+                np.zeros((96, blank.shape[1], 3), dtype=np.uint8),
+            ])
             self._draw_status(blank)
             try:
                 cv2.imshow(WINDOW_NAME, blank)
@@ -2122,6 +2222,10 @@ class Viewer:
                     f"overlap[{first_proj}]: {first_pair}"
                     + (f" (+{overlap_count - 1} more)" if overlap_count > 1 else "")
                 )
+            canvas = np.vstack([
+                canvas,
+                np.zeros((96, canvas.shape[1], 3), dtype=np.uint8),
+            ])
             self._draw_status(canvas, overlap_summary)
             _draw_dashboard_bar(canvas, cams, fused_persons, overlap_count, stats)
 
@@ -2335,7 +2439,7 @@ class Viewer:
 
 
 if __name__ == "__main__":
-    # Sanity loop: 2 fake cameras with synthetic gradient frames + 1 region each
+    # Sanity loop: 3 fake cameras with synthetic gradient frames + 1 region each
     # + a couple of fake track overlays. Hard cap at 30 frames so it cannot hang.
     from region import build_homography
 
@@ -2350,13 +2454,17 @@ if __name__ == "__main__":
 
     fw, fh = 800, 450
     img_pts_a = [(80, 80), (720, 80), (720, 380), (80, 380)]
+    img_pts_c = [(110, 85), (705, 90), (715, 370), (95, 370)]
     img_pts_b = [(120, 100), (700, 100), (700, 360), (120, 360)]
     reg_a = Region("near_half", "corridor", img_pts_a,
-                   (0.0, 0.0, 0.55, 1.0), (0.0, 0.0, 0.50, 1.0),
-                   H=build_homography(img_pts_a, (0.0, 0.0, 0.55, 1.0)))
+                   (0.0, 0.0, 0.48, 1.0), (0.0, 0.0, 0.40, 1.0),
+                   H=build_homography(img_pts_a, (0.0, 0.0, 0.48, 1.0)))
+    reg_c = Region("center_band", "corridor", img_pts_c,
+                   (0.32, 0.0, 0.68, 1.0), (0.40, 0.0, 0.60, 1.0),
+                   H=build_homography(img_pts_c, (0.32, 0.0, 0.68, 1.0)))
     reg_b = Region("far_half", "corridor", img_pts_b,
-                   (0.45, 0.0, 1.0, 1.0), (0.50, 0.0, 1.0, 1.0),
-                   H=build_homography(img_pts_b, (0.45, 0.0, 1.0, 1.0)))
+                   (0.52, 0.0, 1.0, 1.0), (0.60, 0.0, 1.0, 1.0),
+                   H=build_homography(img_pts_b, (0.52, 0.0, 1.0, 1.0)))
 
     proj = {"corridor": Projection(id="corridor", pixel_size=(9600, 1080))}
     viewer = Viewer(proj)
@@ -2365,6 +2473,8 @@ if __name__ == "__main__":
                            [("near_half", 0.30, 0.55, True)])
     track_a2 = TrackOverlay(2, (540.0, 220.0, 600.0, 350.0), 0.61,
                             [("near_half", 0.52, 0.60, False)])
+    track_c = TrackOverlay(4, (360.0, 180.0, 440.0, 340.0), 0.77,
+                           [("center_band", 0.50, 0.52, True)])
     track_b = TrackOverlay(7, (420.0, 180.0, 500.0, 340.0), 0.74,
                            [("far_half", 0.62, 0.45, True)])
 
@@ -2373,6 +2483,8 @@ if __name__ == "__main__":
             cams = [
                 CamFrame("cam0", _gradient(fw, fh, i * 6), [track_a, track_a2],
                          [reg_a], fps=24.5, osc_rate=12.3, reconnects=0),
+                CamFrame("cam2", _gradient(fw, fh, 80 + i * 3), [track_c],
+                         [reg_c], fps=20.0, osc_rate=6.4, reconnects=0),
                 CamFrame("cam1", _gradient(fw, fh, 128 - i * 4), [track_b],
                          [reg_b], fps=23.8, osc_rate=8.1, reconnects=1),
             ]

@@ -420,23 +420,25 @@ class PersonTracker:
             if gid is None:
                 new_events.append(ev)
                 continue
-            if ev.dispatching:
-                if self._can_update_person(gid, ev):
+            if self._can_update_person(gid, ev):
+                if ev.dispatching:
                     self._update_person(gid, ev, now)
                     fresh.add(gid)
                 else:
-                    self._retire_person(gid)
-                    new_events.append(ev)
+                    self._update_held_person(gid, ev, now)
+            elif ev.dispatching:
+                self._retire_person(gid)
+                new_events.append(ev)
             else:
                 self._hold_person(gid, ev, now)
 
-        # New projection-only sources are ignored until they dispatch. New
-        # dispatch sources can claim a held active gid, then pending, else spawn.
+        # New projection-only sources may claim an existing gid in overlap
+        # zones, but only dispatching sources may spawn a new gid. This lets the
+        # best camera feed an existing actor without letting overlap create
+        # duplicate actors.
         claimed_pending: set[int] = set()
         claimed_active: set[int] = set()
         for ev in new_events:
-            if not ev.dispatching:
-                continue
             src = (ev.cam_name, ev.track_id)
             gid = self._best_active_match(ev, fresh | claimed_active)
             if gid is not None:
@@ -445,10 +447,13 @@ class PersonTracker:
                 self._source_to_gid[src] = gid
                 self._persons[gid].source = src
                 self._persons[gid].relaxed = self._persons[gid].relaxed or ev.relaxed
-                self._update_person(gid, ev, now)
+                if ev.dispatching:
+                    self._update_person(gid, ev, now)
+                    fresh.add(gid)
+                else:
+                    self._update_held_person(gid, ev, now)
                 self.handoff_count += 1
                 claimed_active.add(gid)
-                fresh.add(gid)
                 continue
             gid = self._best_pending_match(ev, claimed_pending)
             if gid is not None:
@@ -458,9 +463,14 @@ class PersonTracker:
                 self._source_to_gid[src] = gid
                 self._persons[gid].source = src
                 self._persons[gid].relaxed = self._persons[gid].relaxed or ev.relaxed
-                self._update_person(gid, ev, now)
+                if ev.dispatching:
+                    self._update_person(gid, ev, now)
+                    fresh.add(gid)
+                else:
+                    self._update_held_person(gid, ev, now)
                 self.handoff_count += 1
-                fresh.add(gid)
+                continue
+            if not ev.dispatching:
                 continue
             new_gid = self._spawn_person(src, ev, now)
             fresh.add(new_gid)
@@ -697,6 +707,12 @@ class PersonTracker:
         p.state = "fresh"
         p.relaxed = p.relaxed or ev.relaxed
 
+    def _update_held_person(self, gid: int, ev: PersonEvent, now: float) -> None:
+        self._update_person(gid, ev, now)
+        p = self._persons.get(gid)
+        if p is not None:
+            p.state = "held"
+
     def _hold_person(self, gid: int, ev: PersonEvent, now: float) -> None:
         p = self._persons.get(gid)
         if p is None:
@@ -748,6 +764,33 @@ if __name__ == "__main__":
         "(a) cam0->cam1 traversal keeps one gid",
         len(gids) == 1,
         f"gids={gids}",
+    )
+
+    # (a2) Three-camera traversal through a center camera keeps one gid.
+    pt = PersonTracker(hand_off_window_s=0.4, match_uv_radius=0.06)
+    t = 0.0
+    pt.update([PersonEvent("corridor", "cam0", 5, 0.38, 0.5, 0.9, t)], [], t)
+    t += 0.05
+    pt.update([], [("cam0", 5)], t)
+    t += 0.10
+    persons = pt.update(
+        [PersonEvent("corridor", "cam2", 8, 0.42, 0.5, 0.85, t)],
+        [],
+        t,
+    )
+    t += 0.05
+    pt.update([], [("cam2", 8)], t)
+    t += 0.10
+    persons = pt.update(
+        [PersonEvent("corridor", "cam1", 3, 0.47, 0.5, 0.85, t)],
+        [],
+        t,
+    )
+    gids = {p.gid for p in persons}
+    _check(
+        "(a2) cam0->cam2->cam1 traversal keeps one gid",
+        len(gids) == 1 and pt._source_to_gid.get(("cam1", 3)) == 1,
+        f"gids={gids}, source={pt._source_to_gid.get(('cam1', 3))}",
     )
 
     # (b) Two simultaneous people get distinct gids; one of them stitches at boundary.
@@ -1057,6 +1100,36 @@ if __name__ == "__main__":
         {p.gid for p in persons} == {1}
         and pt.spawned_count == 1
         and pt._source_to_gid.get(("cam0", 7)) == 1,
+        f"persons={[p.gid for p in persons]}, spawned={pt.spawned_count}",
+    )
+
+    # (m2) A projection-only overlap source can take over an existing gid, but
+    # a brand-new projection-only source cannot create a duplicate actor.
+    pt = PersonTracker(match_uv_radius=0.08)
+    t = 0.0
+    pt.update([PersonEvent("corridor", "cam0", 1, 0.40, 0.70, 0.90, t)], [], t)
+    t += 0.05
+    persons = pt.update(
+        [PersonEvent("corridor", "cam2", 9, 0.42, 0.70, 0.85, t, dispatching=False)],
+        [],
+        t,
+    )
+    _check(
+        "(m2) overlap projection-only source claims existing gid",
+        {p.gid for p in persons} == {1}
+        and pt.spawned_count == 1
+        and pt._source_to_gid.get(("cam2", 9)) == 1,
+        f"persons={[p.gid for p in persons]}, spawned={pt.spawned_count}, source={pt._source_to_gid}",
+    )
+    t += 0.05
+    persons = pt.update(
+        [PersonEvent("corridor", "cam1", 5, 0.90, 0.70, 0.90, t, dispatching=False)],
+        [],
+        t,
+    )
+    _check(
+        "(m3) unmatched projection-only source does not spawn",
+        {p.gid for p in persons} == {1} and pt.spawned_count == 1,
         f"persons={[p.gid for p in persons]}, spawned={pt.spawned_count}",
     )
 

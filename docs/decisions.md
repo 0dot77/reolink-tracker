@@ -43,3 +43,15 @@ macOS app data runtime으로 복사해 실행합니다.
 `relaxed_presence_points`를 추가해 그 polygon 안에서만 confidence/bbox 비율 기준을 완화합니다.
 OSC schema는 유지하고, 위치는 기존 homography에서 나온 `u`를 우선 쓰며 `v`만 projection
 범위 안으로 clamp합니다.
+
+## 2026-05-10: 중앙 사각지대는 cam2로 보강한다
+
+긴 복도 양끝의 `cam0`/`cam1`만으로 중앙 hand-off 구간을 보정하려 하면 멀리 있는 사람의
+bbox가 작고 foot point가 흔들려 바닥 homography를 무리하게 넓히게 됩니다.
+
+결정: 도면 중앙 위치의 `cam2`를 같은 `projection_id`에 추가하고, dispatch 담당 구간을
+`cam0 -> cam2 -> cam1` 세 slice로 나눕니다. `projection_uv`는 hand-off 후보를 위해
+살짝 겹치게 둘 수 있지만, `dispatch_uv`는 positive-area overlap 없이 맞닿게 둡니다.
+
+결과: OSC schema와 fusion 모델은 유지하면서 중앙부 actor 안정성을 카메라 배치로 해결합니다.
+앱 에디터와 시뮬레이션은 카메라 수를 2대로 가정하지 않고 configured cameras 전체를 다룹니다.

@@ -29,7 +29,7 @@ osc:
   legacy_image_space: false
 
 fusion:
-  # 같은 사람이 cam0 dispatch에서 cam1 dispatch로 넘어갈 때 gid를 유지하는 시간 윈도우.
+  # 같은 사람이 한 카메라 dispatch에서 다음 카메라 dispatch로 넘어갈 때 gid를 유지하는 시간 윈도우.
   # 길수록 occlusion이나 짧은 detection drop에 강하지만, 두 사람이 같은 자리를 빠르게 교차할
   # 때 ID가 섞일 가능성도 커짐. 기본 2.5 s는 BoT-SORT track_buffer + miss_buffer + 여유.
   hand_off_window_s: 2.5
@@ -94,6 +94,28 @@ cameras:
     url: rtsp://admin:<urlencoded-password>@<camera-ip>:554/h264Preview_01_sub
     osc_prefix: /cam/0
     regions: []
+
+  # 중앙 보강 cam2를 추가할 때의 권장 시작점입니다.
+  # projection_uv는 hand-off를 위해 서로 겹쳐도 되지만 dispatch_uv는 겹치면 안 됩니다.
+  # 예시 분담:
+  #   cam0 dispatch_uv [0.00, 0.0, 0.40, 1.0]
+  #   cam2 dispatch_uv [0.40, 0.0, 0.60, 1.0]
+  #   cam1 dispatch_uv [0.60, 0.0, 1.00, 1.0]
+  # - name: cam2
+  #   url: rtsp://admin:<urlencoded-password>@<center-camera-ip>:554/h264Preview_01_sub
+  #   osc_prefix: /cam/2
+  #   regions:
+  #     - id: center_band
+  #       projection_id: corridor
+  #       # 도면 중앙 카메라는 중앙 hand-off/사각지대 보강용입니다.
+  #       # 현장에서 앱 Calibration UI로 실제 바닥 4점을 다시 찍으세요.
+  #       image_points: [[180, 120], [1040, 120], [1080, 560], [150, 560]]
+  #       projection_uv: [0.32, 0.0, 0.68, 1.0]
+  #       dispatch_uv: [0.40, 0.0, 0.60, 1.0]
+  #       body_catch_points: [[150, 85], [1080, 90], [1100, 260], [140, 250]]
+  #       body_catch_margin_uv: 0.20
+  #       body_catch_min_confidence: 0.12
+  #       min_bbox_height_px: 24
 
   # - name: cam1
   #   url: rtsp://admin:<urlencoded-password>@<camera-ip>:554/h264Preview_01_sub

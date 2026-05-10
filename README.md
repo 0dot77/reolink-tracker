@@ -1,6 +1,6 @@
 # reolink-tracker
 
-Reolink 카메라 2대의 RTSP 스트림을 받아 YOLO26 사람 감지 + BoT-SORT 트래킹을 수행하고 OSC로 좌표를 내보내는 도구입니다. TouchDesigner, Max, Unity 같은 인터랙티브 설치 작업에서 낮은 지연 시간으로 사람 위치를 쓰기 위해 만들었습니다. 더 빠른 대안으로 ByteTrack도 선택할 수 있습니다.
+Reolink 카메라 여러 대의 RTSP 스트림을 받아 YOLO26 사람 감지 + BoT-SORT 트래킹을 수행하고 OSC로 좌표를 내보내는 도구입니다. TouchDesigner, Max, Unity 같은 인터랙티브 설치 작업에서 낮은 지연 시간으로 사람 위치를 쓰기 위해 만들었습니다. 더 빠른 대안으로 ByteTrack도 선택할 수 있습니다.
 
 ## 설치
 
@@ -104,7 +104,7 @@ repo-local `config.yaml` 대신 앱에서 저장한 `runtime/config.yaml`을 우
 
 ## OSC 스키마
 
-좌표는 `projection_id`로 식별되는 **공유 projection UV 공간**으로 송신됩니다. 같은 실제 바닥 프로젝션을 보는 카메라 2대는 같은 `projection_id`를 공유하며, 각 카메라가 내보내는 `(u, v)` 값은 서로 비교할 수 있습니다.
+좌표는 `projection_id`로 식별되는 **공유 projection UV 공간**으로 송신됩니다. 같은 실제 바닥 프로젝션을 보는 카메라들은 같은 `projection_id`를 공유하며, 각 카메라가 내보내는 `(u, v)` 값은 서로 비교할 수 있습니다.
 
 ### TouchDesigner minimal (권장, 기본 ON)
 
@@ -119,7 +119,7 @@ repo-local `config.yaml` 대신 앱에서 저장한 `runtime/config.yaml`을 우
 
 ### Person-keyed debug (`osc.td_minimal: false`)
 
-`gid`는 cross-camera fusion이 만드는 global person ID입니다. 한 사람이 cam0 dispatch 슬라이스에서 cam1 dispatch 슬라이스로 넘어가도 같은 `gid`가 유지되도록 fusion 레이어가 hand-off를 stitch 합니다 (UV 거리 + 시간 윈도우 기반). 중앙 hand-off 또는 짧은 detection drop 중에는 gid가 `held` 상태로 남고, 마지막 좌표를 유지한 채 `/persons` active 목록에 계속 포함됩니다.
+`gid`는 cross-camera fusion이 만드는 global person ID입니다. 한 사람이 cam0 dispatch 슬라이스에서 cam2, cam1 같은 다음 dispatch 슬라이스로 넘어가도 같은 `gid`가 유지되도록 fusion 레이어가 hand-off를 stitch 합니다 (UV 거리 + 시간 윈도우 기반). 중앙 hand-off 또는 짧은 detection drop 중에는 gid가 `held` 상태로 남고, 마지막 좌표를 유지한 채 `/persons` active 목록에 계속 포함됩니다.
 
 | 주소 | 인자 | 송신 시점 |
 |---|---|---|
@@ -266,7 +266,7 @@ region의 4개 `image_points`는 **projection-UV 방향** 기준으로 입력합
 top-left -> top-right -> bottom-right -> bottom-left
 ```
 
-이는 카메라 이미지에서 보이는 순서가 아니라 projection/world 기준 순서입니다. 그래서 서로 마주 보는 복도 카메라 2대가 거울처럼 반대로 보이더라도 같은 공유 UV 프레임으로 매핑할 수 있습니다.
+이는 카메라 이미지에서 보이는 순서가 아니라 projection/world 기준 순서입니다. 그래서 서로 마주 보거나 중앙에서 내려다보는 카메라들이 서로 다른 방향으로 보이더라도 같은 공유 UV 프레임으로 매핑할 수 있습니다.
 
 예시:
 
@@ -282,27 +282,27 @@ cameras:
         min_bbox_height_px: 24
 ```
 
-## 카메라 2대 캘리브레이션 절차
+## 다중 카메라 캘리브레이션 절차
 
-복도 양쪽 끝에 카메라 2대를 두고 같은 바닥 projection을 분담하게 만드는 표준 순서입니다. 두 카메라가 같은 `projection_id`를 공유하고, `projection_uv`는 겹쳐도 되지만 `dispatch_uv`는 절대 겹치면 안 됩니다(같은 사람이 두 OSC stream으로 동시에 나갑니다). Headless 실행에서도 같은 projection 안의 `dispatch_uv`가 positive-area로 겹치면 config error로 중단합니다. 경계가 정확히 닿기만 하는 것은 허용됩니다.
+복도 양쪽 끝 카메라에 중앙 보강 카메라(cam2)를 더해 같은 바닥 projection을 분담하게 만드는 표준 순서입니다. 모든 카메라가 같은 `projection_id`를 공유하고, `projection_uv`는 hand-off 후보를 위해 겹쳐도 되지만 `dispatch_uv`는 절대 겹치면 안 됩니다(같은 사람이 두 OSC stream으로 동시에 나갑니다). Headless 실행에서도 같은 projection 안의 `dispatch_uv`가 positive-area로 겹치면 config error로 중단합니다. 경계가 정확히 닿기만 하는 것은 허용됩니다.
 
-1. 먼저 `config.yaml`에 두 카메라가 모두 같은 `projection_id`를 쓰도록 항목을 만들어 둡니다 (`projections:` 아래에 `corridor` 같은 id를 한 번만 정의하고, 두 카메라 모두 그 id를 region에 씁니다).
+1. 먼저 `config.yaml`에 모든 카메라가 같은 `projection_id`를 쓰도록 항목을 만들어 둡니다 (`projections:` 아래에 `corridor` 같은 id를 한 번만 정의하고, 각 카메라가 그 id를 region에 씁니다).
 2. `python tracker.py --show`로 viewer를 띄우고 `1`로 cam0을 focus 합니다. 좌측 패널 상단이 `[saved]`인지 확인하고, `d` -> 카메라 화면에서 projection 기준으로 top-left -> top-right -> bottom-right -> bottom-left 순서로 4점을 클릭합니다. 이 카메라는 가까운 절반을 담당할 것이므로 4점은 카메라가 실제로 잘 보이는 가까운 영역만 둘러쌉니다.
 3. `w`로 일단 저장합니다. 새 region은 `projection_uv = [0.0, 0.0, 1.0, 1.0]`, `dispatch_uv`도 동일하게 만들어집니다. `[saved]`가 떠야 디스크에 반영된 상태입니다.
 4. 에디터에서 `config.yaml`의 cam0 region을 열어 분담 범위를 줄입니다. 예를 들어 cam0이 복도 왼쪽 절반이면 `projection_uv: [0.0, 0.0, 0.55, 1.0]`, `dispatch_uv: [0.0, 0.0, 0.50, 1.0]`로 바꿉니다. `projection_uv`는 살짝 더 넓게(0.55) 두고 `dispatch_uv`는 안전 마진(0.50)을 두면 카메라 끝부분 떨림이 송신에 영향을 덜 줍니다.
 5. cam1도 같은 방식으로 진행합니다. viewer에서 `2`로 focus를 옮긴 뒤 `d`로 region을 그립니다. 이 카메라는 마주 보는 방향이라 같은 바닥인데도 영상이 좌우 반전돼 보이지만, 4점 클릭 순서는 여전히 **projection-UV 기준** top-left -> top-right -> bottom-right -> bottom-left 입니다. cam0과 동일한 `projection_id`를 쓰도록 `config.yaml`을 정리합니다.
-6. cam1의 `projection_uv` / `dispatch_uv`는 cam0과 거울처럼 반대 슬라이스를 잡습니다. 예시 분할: cam0 `dispatch_uv [0.0, 0.0, 0.50, 1.0]`, cam1 `dispatch_uv [0.50, 0.0, 1.0, 1.0]`. 두 `dispatch_uv`의 u 경계가 정확히 같은 값이면 `dispatches_overlap`은 통과합니다(접하기만 하고 겹치지 않음).
-7. 저장 후 viewer를 다시 시작하면 좌측 패널에 두 카메라의 region 목록이 보이고, 상단 `overlap` 카운터가 `0`이어야 합니다. UV canvas 패널 좌하단에 빨간 경고가 뜨면 어떤 쌍의 `dispatch_uv`가 겹치는지 알려주므로 그 부분만 다시 분할 비율을 조정합니다.
-8. 마지막으로 사람이 한 명 복도 끝에서 끝까지 천천히 걸어가게 하고, `python tracker.py --show` dashboard에서 같은 `gid` 색상이 유지되는지 확인합니다. 중앙에서는 `held`가 짧게 보일 수 있지만 `/persons/count`가 0으로 떨어지거나 2로 부풀면 안 됩니다. 같은 사람이 양쪽에서 동시에 송신되는 구간이 있으면 `dispatch_uv`가 아직 겹치는 것이므로 4번~6번 단계로 돌아갑니다.
+6. cam2는 도면상 중앙 위치에서 중앙 hand-off/사각지대를 담당합니다. 시작점은 cam0 `dispatch_uv [0.00, 0.0, 0.40, 1.0]`, cam2 `dispatch_uv [0.40, 0.0, 0.60, 1.0]`, cam1 `dispatch_uv [0.60, 0.0, 1.00, 1.0]`입니다. `projection_uv`는 각각 조금 더 넓게 잡아 cam0->cam2->cam1 hand-off 후보를 남깁니다.
+7. 저장 후 viewer를 다시 시작하면 좌측 패널에 모든 카메라의 region 목록이 보이고, 상단 `overlap` 카운터가 `0`이어야 합니다. UV canvas 패널 좌하단에 빨간 경고가 뜨면 어떤 쌍의 `dispatch_uv`가 겹치는지 알려주므로 그 부분만 다시 분할 비율을 조정합니다.
+8. 마지막으로 사람이 한 명 복도 끝에서 끝까지 천천히 걸어가게 하고, `python tracker.py --show` dashboard에서 같은 `gid` 색상이 유지되는지 확인합니다. 중앙에서는 `held`가 짧게 보일 수 있지만 `/persons/count`가 0으로 떨어지거나 2로 부풀면 안 됩니다. 같은 사람이 여러 카메라에서 동시에 송신되는 구간이 있으면 `dispatch_uv`가 아직 겹치는 것이므로 4번~6번 단계로 돌아갑니다.
 
-## 카메라 2대 네트워크 구성
+## 다중 카메라 네트워크 구성
 
 도구는 `config.yaml`에 적힌 RTSP URL만 사용합니다. 카메라 IP는 고정된 프로젝트 값이 아니라 현재 공간의 네트워크에서 받은 값입니다. 장소를 옮기거나 직결/공유기 구성을 바꾸면 Reolink 앱, 공유기 DHCP 목록, 또는 `arp`로 IP를 다시 확인한 뒤 `config.yaml`을 갱신합니다.
 
 아래 중 하나를 선택하면 됩니다.
 
-1. **두 카메라를 라우터에 연결**: 추천 방식입니다. 두 카메라를 iPTIME LAN 포트에 꽂으면 DHCP로 `172.30.1.x` 대역 IP를 받고, Mac은 Wi-Fi나 LAN으로 접속합니다.
-2. **두 카메라를 스위치로 직접 연결**: Mac의 USB-Ethernet 어댑터에 작은 unmanaged 5-port switch를 연결합니다. Mac에서 DHCP를 제공해야 하므로 System Settings -> General -> Sharing -> Internet Sharing을 사용합니다. 이 경우 카메라는 보통 `192.168.2.x` 같은 주소를 받습니다.
+1. **카메라를 라우터에 연결**: 추천 방식입니다. 카메라를 iPTIME LAN 포트에 꽂으면 DHCP로 `172.30.1.x` 대역 IP를 받고, Mac은 Wi-Fi나 LAN으로 접속합니다.
+2. **카메라를 스위치로 직접 연결**: Mac의 USB-Ethernet 어댑터에 작은 unmanaged 5-port switch를 연결합니다. Mac에서 DHCP를 제공해야 하므로 System Settings -> General -> Sharing -> Internet Sharing을 사용합니다. 이 경우 카메라는 보통 `192.168.2.x` 같은 주소를 받습니다.
 3. **하나는 직접 연결, 하나는 Wi-Fi 경유**: 동작은 가능하지만 경로가 섞여 설정이 복잡해집니다.
 
 ## 지연 시간 튜닝

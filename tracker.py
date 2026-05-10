@@ -8,6 +8,7 @@ Usage:
 TouchDesigner minimal OSC schema (default, when osc.td_minimal: true):
     /proj/<projection_id>/active                [gid, gid, ...]
     /proj/<projection_id>/xy                    [gid, x, y, gid, x, y, ...]
+    /proj/<projection_id>/persons/count         int
 
 Person-keyed debug OSC schema (when osc.td_minimal: false and osc.person_level: true):
     /proj/<projection_id>/person/<gid>          [u, v, vx, vy, conf, (u_px, v_px)?]
@@ -74,6 +75,7 @@ from region import (
 
 PERSON_CLASS_ID = 0  # COCO
 TAURI_APP_IDENTIFIER = "com.taeyang.reolink-tracker"
+CONFIG_RELOAD_INTERVAL_S = 0.5
 
 
 class ConfigError(ValueError):
@@ -350,15 +352,22 @@ class CamWorker:
         self.fps_count = 0
         self.osc_count = 0
 
-    def update_regions(self, regions: list[Region]) -> None:
+    def update_regions(self, regions: list[Region], preserve_tracking: bool = False) -> None:
         """Replace active regions after operator edits in the viewer."""
+        previous_last_ids = self.last_ids
         self.cam.regions = regions
-        self.last_ids = {r.id: set() for r in regions}
-        self.last_ids[""] = set()
-        self.last_projection_tids = set()
-        self._tid_miss = {}
-        self._pending_detections = {}
-        self._confirmed_tids = set()
+        self.last_ids = {
+            r.id: set(previous_last_ids.get(r.id, set())) if preserve_tracking else set()
+            for r in regions
+        }
+        self.last_ids[""] = (
+            set(previous_last_ids.get("", set())) if preserve_tracking else set()
+        )
+        if not preserve_tracking:
+            self.last_projection_tids = set()
+            self._tid_miss = {}
+            self._pending_detections = {}
+            self._confirmed_tids = set()
 
     def _classify_detection(self, box: np.ndarray, conf: float) -> tuple[bool, str]:
         cfg = self.detection_filter
@@ -1115,22 +1124,66 @@ def save_cfg(path: Path, cfg: dict) -> None:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
 
+def _config_mtime_ns(path: Path) -> Optional[int]:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _reload_runtime_calibration(
+    config_path: Path,
+    projections: dict[str, Projection],
+    workers: list[CamWorker],
+) -> dict:
+    next_cfg = load_cfg(config_path)
+    next_projections = _parse_projections(next_cfg)
+    next_cams = _parse_cameras(next_cfg, next_projections)
+    next_detection_filter = _parse_detection_filter(next_cfg)
+    _validate_dispatch_overlaps(next_cams)
+
+    next_by_name = {cam.name: cam for cam in next_cams}
+    missing = [worker.cam.name for worker in workers if worker.cam.name not in next_by_name]
+    if missing:
+        raise ConfigError(
+            "live reload cannot remove active camera(s): " + ", ".join(sorted(missing))
+        )
+
+    # Keep the original dict object alive because the viewer and workers hold
+    # references to it, but replace its projection contents atomically from the
+    # Python process point of view.
+    projections.clear()
+    projections.update(next_projections)
+    for worker in workers:
+        worker.projections = projections
+        worker.detection_filter = next_detection_filter
+        worker.update_regions(
+            next_by_name[worker.cam.name].regions,
+            preserve_tracking=True,
+        )
+    return next_cfg
+
+
 def _emit_person_osc(
     osc: SimpleUDPClient,
     projections: dict[str, Projection],
     persons: list,
     lost_gids: list[LostPerson],
     td_minimal: bool,
+    person_level: bool = True,
 ) -> int:
     """Send person-keyed OSC for the current frame.
 
-    In the default TouchDesigner-minimal mode, each projection emits only
-    `/active` and `/xy`. `/xy` is packed as gid/x/y triples so TD can build one
-    instancing table without dynamic per-person addresses. x/y are projection
-    video pixels when `pixel_size` is configured; otherwise they fall back to
-    normalized UV.
+    In the default TouchDesigner-minimal mode, each projection emits `/active`,
+    `/xy`, and a compatibility `/persons/count`. `/xy` is packed as gid/x/y
+    triples so TD can build one instancing table without dynamic per-person
+    addresses. x/y are projection video pixels when `pixel_size` is configured;
+    otherwise they fall back to normalized UV.
 
-    In debug mode, the older richer person/lost/count addresses are emitted.
+    When `person_level` is enabled outside minimal mode, the older richer
+    person/lost/list addresses are emitted. Minimal mode keeps a single
+    coordinate source for TD to avoid mixing packed pixel coordinates with
+    person-level UV coordinates.
     Returns the number of OSC messages sent.
     """
     sent = 0
@@ -1151,8 +1204,37 @@ def _emit_person_osc(
                 xy_args.extend([p.gid, x, y])
             osc.send_message(f"/proj/{pid}/active", gids)
             osc.send_message(f"/proj/{pid}/xy", xy_args)
-            sent += 2
+            osc.send_message(f"/proj/{pid}/persons/count", len(gids))
+            sent += 3
+        if person_level and not td_minimal:
+            sent += _emit_person_level_osc(
+                osc,
+                projections,
+                by_proj,
+                lost_gids,
+                include_count=False,
+            )
         return sent
+    if not person_level:
+        return sent
+    sent += _emit_person_level_osc(
+        osc,
+        projections,
+        by_proj,
+        lost_gids,
+        include_count=True,
+    )
+    return sent
+
+
+def _emit_person_level_osc(
+    osc: SimpleUDPClient,
+    projections: dict[str, Projection],
+    by_proj: dict[str, list],
+    lost_gids: list[LostPerson],
+    include_count: bool,
+) -> int:
+    sent = 0
     for lost in lost_gids:
         osc.send_message(f"/proj/{lost.projection_id}/person/{lost.gid}/lost", [])
         sent += 1
@@ -1167,8 +1249,10 @@ def _emit_person_osc(
             sent += 1
         gids = sorted(p.gid for p in plist)
         osc.send_message(f"/proj/{pid}/persons", gids)
-        osc.send_message(f"/proj/{pid}/persons/count", len(gids))
-        sent += 2
+        sent += 1
+        if include_count:
+            osc.send_message(f"/proj/{pid}/persons/count", len(gids))
+            sent += 1
     return sent
 
 
@@ -1260,7 +1344,8 @@ def main() -> int:
 
     fusion_cfg = cfg.get("fusion", {}) or {}
     miss_buffer_frames = max(int(fusion_cfg.get("miss_buffer_frames", 8)), 0)
-    if person_level:
+    fusion_enabled = td_minimal or person_level or zone_level
+    if fusion_enabled:
         person_tracker = PersonTracker(
             hand_off_window_s=float(fusion_cfg.get("hand_off_window_s", 2.5)),
             match_uv_radius=float(fusion_cfg.get("match_uv_radius", 0.05)),
@@ -1392,6 +1477,8 @@ def main() -> int:
     last_osc_per_cam: dict[str, float] = {c.name: 0.0 for c in cams}
     last_fused_persons: list = []
     last_person_osc_mono = 0.0
+    last_config_mtime_ns = _config_mtime_ns(config_path)
+    last_config_reload_check = time.monotonic()
 
     try:
         while not stop_flag.is_set():
@@ -1399,6 +1486,36 @@ def main() -> int:
             frame_events: list[PersonEvent] = []
             frame_lost_sources: list[tuple[str, int]] = []
             now_mono = time.monotonic()
+
+            if now_mono - last_config_reload_check >= CONFIG_RELOAD_INTERVAL_S:
+                last_config_reload_check = now_mono
+                current_mtime_ns = _config_mtime_ns(config_path)
+                if (
+                    current_mtime_ns is not None
+                    and last_config_mtime_ns is not None
+                    and current_mtime_ns != last_config_mtime_ns
+                ):
+                    try:
+                        cfg = _reload_runtime_calibration(
+                            config_path,
+                            projections,
+                            workers,
+                        )
+                        last_config_mtime_ns = current_mtime_ns
+                        print(
+                            "config: live calibration reload applied "
+                            f"from {config_path}",
+                            flush=True,
+                        )
+                    except (OSError, yaml.YAMLError, ConfigError) as ex:
+                        last_config_mtime_ns = current_mtime_ns
+                        print(
+                            "config: live calibration reload skipped: "
+                            f"{ex}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+
             for grab, worker in zip(grabbers, workers):
                 frame, fidx, frame_ts = grab.get()
                 if frame is None or fidx == last_idx[grab.cam.name]:
@@ -1433,7 +1550,12 @@ def main() -> int:
                     last_fused_persons = persons
                     lost_gids = person_tracker.drain_lost_gids()
                 emitted = _emit_person_osc(
-                    osc, projections, persons, lost_gids, td_minimal
+                    osc,
+                    projections,
+                    persons,
+                    lost_gids,
+                    td_minimal,
+                    person_level=person_level,
                 )
                 if zone_level and zone_tracker is not None:
                     emitted += _emit_zone_osc(
