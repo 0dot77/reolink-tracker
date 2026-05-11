@@ -39,6 +39,8 @@ python tracker.py --show
 
 ## 현장 런처 앱
 
+<img src="app/src-tauri/icons/icon.png" alt="Reolink Tracker 앱 아이콘" width="96" align="right">
+
 macOS 현장 점검용 Tauri 앱은 이 저장소의 `app/` 하위 프로젝트입니다. 앱은 Python tracker를
 대체하지 않고 setup, config 편집, start/stop, preview 실행, 로그 확인, 네트워크 점검 UI만 제공합니다.
 
