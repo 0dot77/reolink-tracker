@@ -46,7 +46,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -73,7 +73,10 @@ from region import (
     dispatches_overlap,
     is_inside_uv,
     project,
+    validate_uv_quad,
     validate_dispatch,
+    warp_uv,
+    warp_uv_velocity,
 )
 
 PERSON_CLASS_ID = 0  # COCO
@@ -1006,6 +1009,19 @@ def _optional_alias_points(
     return _optional_points(entry.get(key), f"{label}.{key}")
 
 
+def _optional_uv_quad(
+    value: object,
+    label: str,
+) -> Optional[list[tuple[float, float]]]:
+    if value in (None, ""):
+        return None
+    points = _require_sequence(value, label)
+    try:
+        return validate_uv_quad(points, label)
+    except (TypeError, ValueError) as ex:
+        raise ConfigError(str(ex)) from ex
+
+
 def _require_field(entry: dict, key: str, label: str) -> object:
     if key not in entry or entry[key] in (None, ""):
         raise ConfigError(f"{label} is missing required field '{key}'")
@@ -1057,6 +1073,10 @@ def _parse_projections(cfg: dict) -> dict[str, Projection]:
             id=pid,
             pixel_size=tuple(ps) if ps else None,
             world_size_m=tuple(ws) if ws else None,
+            output_warp_points=_optional_uv_quad(
+                entry.get("output_warp_points"),
+                f"{label}.output_warp_points",
+            ),
             interaction_zones=_parse_interaction_zones(entry, pid, label),
         )
     return out
@@ -1404,6 +1424,44 @@ def _all_interaction_zones(
     for projection in projections.values():
         zones.extend(projection.interaction_zones)
     return zones
+
+
+def _warp_persons_for_output(
+    projections: dict[str, Projection],
+    persons: list,
+) -> list:
+    """Return output-facing person copies with projection output warp applied.
+
+    Fusion state stays in the unwarped shared UV space. OSC, telemetry, viewer
+    overlays, and interaction zones consume these copies so physical projection
+    correction does not feed back into hand-off matching.
+    """
+    out = []
+    for person in persons:
+        projection = projections.get(person.projection_id)
+        warp_points = projection.output_warp_points if projection is not None else None
+        warped_u, warped_v = (
+            warp_uv((person.u, person.v), warp_points)
+            if warp_points
+            else (person.u, person.v)
+        )
+        warped_vx, warped_vy = (
+            warp_uv_velocity((person.u, person.v), (person.vx, person.vy), warp_points)
+            if warp_points
+            else (person.vx, person.vy)
+        )
+        out.append(
+            replace(
+                person,
+                u=warped_u,
+                v=warped_v,
+                vx=warped_vx,
+                vy=warped_vy,
+                raw_u=person.u,
+                raw_v=person.v,
+            )
+        )
+    return out
 
 
 def save_cfg(path: Path, cfg: dict) -> None:
@@ -1893,13 +1951,15 @@ def main() -> int:
             ):
                 lost_gids: list[LostPerson] = []
                 if any_new or frame_lost_sources:
-                    persons = person_tracker.update(
+                    raw_persons = person_tracker.update(
                         frame_events, frame_lost_sources, now_mono
                     )
+                    persons = _warp_persons_for_output(projections, raw_persons)
                     last_fused_persons = persons
                     lost_gids = person_tracker.drain_lost_gids()
                 else:
-                    persons = person_tracker.update([], [], now_mono)
+                    raw_persons = person_tracker.update([], [], now_mono)
+                    persons = _warp_persons_for_output(projections, raw_persons)
                     last_fused_persons = persons
                     lost_gids = person_tracker.drain_lost_gids()
                 emitted = _emit_person_osc(
@@ -2038,6 +2098,8 @@ def main() -> int:
                                 "y": y,
                                 "u": p.u,
                                 "v": p.v,
+                                "raw_u": getattr(p, "raw_u", p.u),
+                                "raw_v": getattr(p, "raw_v", p.v),
                                 "state": p.state,
                                 "source": p.source,
                             }
@@ -2049,6 +2111,7 @@ def main() -> int:
                             "xy": xy_payload,
                             "uv": uv_payload,
                             "persons": persons_payload,
+                            "output_warp": bool(projection.output_warp_points),
                         }
                     )
                 print("  ".join(parts))
@@ -2059,6 +2122,18 @@ def main() -> int:
                             "ts": time.time(),
                             "cameras": camera_status,
                             "projections": projection_status,
+                            "settings": {
+                                "confirm_hits": detection_filter.confirm_hits,
+                                "confirm_window_s": detection_filter.confirm_window_s,
+                                "position_alpha": (
+                                    person_tracker.position_alpha
+                                    if person_tracker is not None
+                                    else None
+                                ),
+                                "heartbeat_interval_s": heartbeat_interval_s,
+                                "td_minimal": td_minimal,
+                                "person_level": person_level,
+                            },
                         },
                         separators=(",", ":"),
                     )

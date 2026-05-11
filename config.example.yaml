@@ -43,8 +43,8 @@ fusion:
   # 속도 EMA 가중치. 1.0이면 매 프레임 즉시 반영, 0에 가까우면 매우 부드러움.
   velocity_alpha: 0.3
   # 위치 EMA 가중치. 낮을수록 actor 위치가 부드럽지만 실제 움직임보다 늦게 따라온다.
-  # 0.45는 야간/원거리 검출 흔들림을 줄이기 위한 현장 기본값.
-  position_alpha: 0.45
+  # fast live 기본값 0.75는 약간의 jitter를 허용하고 OSC 반응을 더 빠르게 따라간다.
+  position_alpha: 0.75
   # track이 끊겼을 때 held 상태를 유지할 projection edge margin.
   # 0.08이면 UV 가장자리 8% 안쪽에서만 held로 남고, 중앙 miss는 즉시 lost 처리한다.
   hold_boundary_margin_uv: 0.08
@@ -68,6 +68,7 @@ fusion:
   # CamWorker가 하나의 tid를 lost_source로 fusion에 알리기 전까지 견디는 연속 결손 프레임 수.
   # 짧은 YOLO/BoT-SORT detection drop이 매번 새 gid를 만들지 않도록 흡수한다.
   # 0이면 결손 즉시 lost (legacy). 기본 8은 ≈ 400 ms @ 20 fps.
+  # 이 값은 사라짐/lost 반응만 바꾸며, 첫 등장 반응은 detection_filter confirm 값이 좌우한다.
   miss_buffer_frames: 8
 
 detection_filter:
@@ -89,13 +90,17 @@ detection_filter:
   relaxed_min_aspect_h_over_w: 0.45
   relaxed_max_aspect_h_over_w: 6.5
   relaxed_max_width_over_height: 2.4
-  confirm_hits: 3
-  confirm_window_s: 0.8
+  # fast live 기본값: 2 hit / 0.35 s. 더 낮추면 첫 반응은 빨라지지만 오검출 승격이 늘 수 있다.
+  confirm_hits: 2
+  confirm_window_s: 0.35
 
 projections:
   - id: corridor
     pixel_size: [9600, 1080]
     world_size_m: [40.0, 4.5]
+    # Output Warp: cross-camera fusion 이후 OSC/zone 평가 직전에 적용되는 최종 projection 보정.
+    # 순서: top-left, top-right, bottom-right, bottom-left. identity면 좌표를 바꾸지 않는다.
+    output_warp_points: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
     interaction_zones:
       - id: center
         uv_rect: [0.35, 0.15, 0.65, 0.85]

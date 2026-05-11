@@ -177,6 +177,7 @@ struct ProjectionInfo {
     id: String,
     pixel_size: Vec<f64>,
     world_size_m: Vec<f64>,
+    output_warp_points: Vec<Vec<f64>>,
     zones: Vec<ZoneInfo>,
 }
 
@@ -256,6 +257,13 @@ struct SaveCalibrationMappingRequest {
     dispatch_uv: Option<[f64; 4]>,
     relaxed_presence_uv: Option<[f64; 4]>,
     relaxed_presence_v: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveOutputWarpRequest {
+    projection_id: String,
+    output_warp_points: Vec<[f64; 2]>,
 }
 
 const MOBILE_TOKEN_HEADER: &str = "X-Reolink-Mobile-Token";
@@ -611,6 +619,46 @@ fn validate_unit_rect(rect: [f64; 4], label: &str) -> Result<[f64; 4], String> {
     Ok(rect)
 }
 
+fn validate_output_warp_points(points: &[[f64; 2]], label: &str) -> Result<Vec<[f64; 2]>, String> {
+    if points.len() != 4 {
+        return Err(format!("{label} must contain exactly 4 points"));
+    }
+    if points
+        .iter()
+        .flatten()
+        .any(|value| !(0.0..=1.0).contains(value))
+    {
+        return Err(format!("{label} must stay inside 0..1"));
+    }
+    if !is_convex_quad(points) {
+        return Err(format!("{label} must form a simple convex quadrilateral"));
+    }
+    Ok(points.to_vec())
+}
+
+fn is_convex_quad(points: &[[f64; 2]]) -> bool {
+    if points.len() != 4 {
+        return false;
+    }
+    let mut sign = 0_i32;
+    for idx in 0..4 {
+        let a = points[idx];
+        let b = points[(idx + 1) % 4];
+        let c = points[(idx + 2) % 4];
+        let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+        if cross.abs() <= 1e-9 {
+            return false;
+        }
+        let next_sign = if cross > 0.0 { 1 } else { -1 };
+        if sign == 0 {
+            sign = next_sign;
+        } else if sign != next_sign {
+            return false;
+        }
+    }
+    true
+}
+
 fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String> {
     let parsed: serde_yaml::Value =
         serde_yaml::from_str(config).map_err(|err| format!("YAML validation failed: {err}"))?;
@@ -646,6 +694,7 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
                             .to_string(),
                         pixel_size: yaml_number_vec(projection.get("pixel_size")),
                         world_size_m: yaml_number_vec(projection.get("world_size_m")),
+                        output_warp_points: yaml_points(projection.get("output_warp_points")),
                         zones,
                     }
                 })
@@ -1035,6 +1084,41 @@ fn calibration_mapping_config_text(
 
     serde_yaml::to_string(&config_value)
         .map_err(|err| format!("failed to serialize calibration config: {err}"))
+}
+
+fn output_warp_config_text(
+    config_text: &str,
+    request: &SaveOutputWarpRequest,
+) -> Result<String, String> {
+    let mut config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
+        .map_err(|err| format!("YAML validation failed: {err}"))?;
+    let projections = config_value
+        .get_mut("projections")
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "config is missing projections[]".to_string())?;
+    let projection = projections
+        .iter_mut()
+        .find(|projection| {
+            projection
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|id| id == request.projection_id)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("projection not found: {}", request.projection_id))?;
+    let projection = projection
+        .as_mapping_mut()
+        .ok_or_else(|| "target projection entry must be a YAML mapping".to_string())?;
+    let output_warp_points =
+        validate_output_warp_points(&request.output_warp_points, "output_warp_points")?;
+    projection.insert(
+        serde_yaml::Value::String("output_warp_points".to_string()),
+        serde_yaml::to_value(output_warp_points)
+            .map_err(|err| format!("failed to serialize output_warp_points: {err}"))?,
+    );
+
+    serde_yaml::to_string(&config_value)
+        .map_err(|err| format!("failed to serialize projection config: {err}"))
 }
 
 fn rtsp_host(url: &str) -> Option<String> {
@@ -3640,6 +3724,7 @@ projections:
   - id: corridor
     pixel_size: [9600, 1080]
     world_size_m: [40.0, 4.5]
+    output_warp_points: [[0.02, 0.0], [1.0, 0.02], [0.98, 1.0], [0.0, 0.98]]
     interaction_zones:
       - id: center
         uv_rect: [0.35, 0.15, 0.65, 0.85]
@@ -3666,6 +3751,10 @@ cameras:
         let snapshot = parse_projection_snapshot(config).expect("snapshot should parse");
         assert_eq!(snapshot.camera_count, 2);
         assert_eq!(snapshot.projections[0].id, "corridor");
+        assert_eq!(
+            snapshot.projections[0].output_warp_points[0],
+            vec![0.02, 0.0]
+        );
         assert_eq!(snapshot.projections[0].zones[0].id, "center");
         assert_eq!(snapshot.regions[0].camera, "cam0");
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
@@ -3998,6 +4087,70 @@ cameras:
         assert_eq!(
             err,
             "relaxed_presence_uv requires relaxed_presence_points on the target region"
+        );
+    }
+
+    #[test]
+    fn output_warp_config_updates_projection_without_touching_regions() {
+        let config = r#"
+projections:
+  - id: corridor
+    pixel_size: [9600, 1080]
+cameras:
+  - name: cam0
+    url: /tmp/cam0.mp4
+    regions:
+      - id: near
+        projection_id: corridor
+        projection_uv: [0.0, 0.0, 0.5, 1.0]
+        dispatch_uv: [0.0, 0.0, 0.5, 1.0]
+"#;
+        let request = SaveOutputWarpRequest {
+            projection_id: "corridor".to_string(),
+            output_warp_points: vec![[0.02, 0.01], [0.98, 0.03], [1.0, 0.97], [0.0, 0.99]],
+        };
+        let text = output_warp_config_text(config, &request).expect("warp should save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let projection = parsed
+            .get("projections")
+            .and_then(|value| value.as_sequence())
+            .and_then(|projections| projections.first())
+            .expect("projection should exist");
+        assert_eq!(
+            yaml_points(projection.get("output_warp_points"))[0],
+            vec![0.02, 0.01]
+        );
+        let region = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .and_then(|cameras| cameras.first())
+            .and_then(|camera| camera.get("regions"))
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .expect("region should remain");
+        assert_eq!(
+            yaml_number_vec(region.get("dispatch_uv")),
+            vec![0.0, 0.0, 0.5, 1.0]
+        );
+    }
+
+    #[test]
+    fn output_warp_config_rejects_invalid_quad() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras: []
+"#;
+        let request = SaveOutputWarpRequest {
+            projection_id: "corridor".to_string(),
+            output_warp_points: vec![[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+        };
+        let err =
+            output_warp_config_text(config, &request).expect_err("self-crossing warp should fail");
+        assert_eq!(
+            err,
+            "output_warp_points must form a simple convex quadrilateral"
         );
     }
 }
@@ -4366,6 +4519,29 @@ fn save_calibration_mapping(
     Ok(())
 }
 
+#[tauri::command]
+fn save_output_warp(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    request: SaveOutputWarpRequest,
+) -> Result<(), String> {
+    let config = config_path(&app)?;
+    let config_text = fs::read_to_string(&config)
+        .map_err(|err| format!("failed to read runtime config: {err}"))?;
+    let next_config = output_warp_config_text(&config_text, &request)?;
+    write_text_atomically(&config, &next_config)?;
+
+    if let Some(active_config) = active_config_path(&state) {
+        if active_config != config && active_config.exists() {
+            let active_text = fs::read_to_string(&active_config)
+                .map_err(|err| format!("failed to read active tracker config: {err}"))?;
+            let next_active_config = output_warp_config_text(&active_text, &request)?;
+            write_text_atomically(&active_config, &next_active_config)?;
+        }
+    }
+    Ok(())
+}
+
 fn stop_tracker_state(state: &AppState) -> Result<ProcessStatus, String> {
     let mut guard = state
         .child
@@ -4630,6 +4806,7 @@ pub fn run() {
             capture_calibration_frame,
             save_calibration_points,
             save_calibration_mapping,
+            save_output_warp,
             stop_tracker,
             tracker_status,
             collect_network_report,

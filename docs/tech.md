@@ -28,6 +28,10 @@
   1프레임 오검출이 actor로 승격되는 것을 줄이는 레이어입니다.
 - `fusion.position_alpha`는 fused person 좌표를 EMA로 부드럽게 합니다. OSC schema는
   유지하고 `(u, v)` 값만 완만하게 움직입니다.
+- `projections[].output_warp_points`는 cross-camera fusion 이후, OSC 송신과
+  `interaction_zones` 평가 직전에 적용하는 projection-level 4점 bilinear 보정입니다.
+  Floor UV/Camera Fit/fusion 상태에는 피드백하지 않고, TD는 기존 주소와 argument 순서로
+  보정된 위치값을 받습니다.
 - `fusion.max_update_jump_uv`가 0보다 크면 같은 `gid`의 다음 관측점이 지정 UV 거리보다
   멀리 튀는 경우 순간이동으로 보고 기존 gid를 lost 처리한 뒤 새 gid로 분리합니다.
   바닥 인터랙션에서 OSC actor가 프로젝션 면을 갑자기 가로지르는 것을 막기 위한

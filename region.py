@@ -23,6 +23,7 @@ class Projection:
     id: str
     pixel_size: Optional[tuple[int, int]] = None       # (w_px, h_px). None → no /px channel.
     world_size_m: Optional[tuple[float, float]] = None  # metadata only.
+    output_warp_points: Optional[list[tuple[float, float]]] = None
     interaction_zones: list["InteractionZone"] = field(default_factory=list)
 
 
@@ -149,6 +150,81 @@ def is_inside_uv(
     u, v = uv
     u0, v0, u1, v1 = rect
     return (u0 <= u <= u1) and (v0 <= v <= v1)
+
+
+def validate_uv_quad(
+    points: Sequence[Sequence[float]],
+    label: str = "uv_quad",
+) -> list[tuple[float, float]]:
+    """Validate 4 UV points ordered top-left, top-right, bottom-right, bottom-left."""
+    if len(points) != 4:
+        raise ValueError(f"{label} must contain exactly 4 points, got {len(points)}")
+    out: list[tuple[float, float]] = []
+    for idx, point in enumerate(points):
+        if len(point) != 2:
+            raise ValueError(f"{label}[{idx}] must contain [u, v]")
+        try:
+            u = float(point[0])
+            v = float(point[1])
+        except (TypeError, ValueError) as ex:
+            raise ValueError(f"{label}[{idx}] must contain numeric values") from ex
+        if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            raise ValueError(f"{label}[{idx}] must stay inside 0..1, got {(u, v)}")
+        out.append((u, v))
+    if not _is_convex_simple(out):
+        raise ValueError(f"{label} must form a simple convex quadrilateral: {out}")
+    return out
+
+
+def warp_uv(
+    uv: tuple[float, float],
+    output_warp_points: Optional[Sequence[tuple[float, float]]],
+) -> tuple[float, float]:
+    """Bilinearly map a final projection UV point through an output warp quad.
+
+    `output_warp_points` uses top-left, top-right, bottom-right, bottom-left
+    order. `None` or an empty sequence leaves the point unchanged.
+    """
+    if not output_warp_points:
+        return (float(uv[0]), float(uv[1]))
+    if len(output_warp_points) != 4:
+        raise ValueError(
+            f"output_warp_points must contain exactly 4 points, got {len(output_warp_points)}"
+        )
+    u = min(max(float(uv[0]), 0.0), 1.0)
+    v = min(max(float(uv[1]), 0.0), 1.0)
+    tl, tr, br, bl = output_warp_points
+    top_u = tl[0] * (1.0 - u) + tr[0] * u
+    top_v = tl[1] * (1.0 - u) + tr[1] * u
+    bottom_u = bl[0] * (1.0 - u) + br[0] * u
+    bottom_v = bl[1] * (1.0 - u) + br[1] * u
+    return (
+        top_u * (1.0 - v) + bottom_u * v,
+        top_v * (1.0 - v) + bottom_v * v,
+    )
+
+
+def warp_uv_velocity(
+    uv: tuple[float, float],
+    velocity_uv_s: tuple[float, float],
+    output_warp_points: Optional[Sequence[tuple[float, float]]],
+) -> tuple[float, float]:
+    """Map a UV velocity through the local derivative of the output warp."""
+    if not output_warp_points:
+        return (float(velocity_uv_s[0]), float(velocity_uv_s[1]))
+    if len(output_warp_points) != 4:
+        raise ValueError(
+            f"output_warp_points must contain exactly 4 points, got {len(output_warp_points)}"
+        )
+    u = min(max(float(uv[0]), 0.0), 1.0)
+    v = min(max(float(uv[1]), 0.0), 1.0)
+    vx, vy = (float(velocity_uv_s[0]), float(velocity_uv_s[1]))
+    tl, tr, br, bl = output_warp_points
+    du_u = (tr[0] - tl[0]) * (1.0 - v) + (br[0] - bl[0]) * v
+    du_v = (bl[0] - tl[0]) * (1.0 - u) + (br[0] - tr[0]) * u
+    dv_u = (tr[1] - tl[1]) * (1.0 - v) + (br[1] - bl[1]) * v
+    dv_v = (bl[1] - tl[1]) * (1.0 - u) + (br[1] - tr[1]) * u
+    return (du_u * vx + du_v * vy, dv_u * vx + dv_v * vy)
 
 
 def _point_in_rect(
@@ -345,5 +421,41 @@ if __name__ == "__main__":
         )
     except Exception as ex:
         _check("(d) bbox/polygon intersection handles edge crossing", False, f"raised {ex!r}")
+
+    # (e) Output warp identity leaves final projection UV unchanged.
+    try:
+        quad = validate_uv_quad(
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            "identity_output_warp",
+        )
+        warped = warp_uv((0.25, 0.75), quad)
+        _check(
+            "(e) identity output warp keeps UV",
+            abs(warped[0] - 0.25) < 1e-6 and abs(warped[1] - 0.75) < 1e-6,
+            f"warped={warped}",
+        )
+    except Exception as ex:
+        _check("(e) identity output warp keeps UV", False, f"raised {ex!r}")
+
+    # (f) Non-identity output warp moves a point before downstream zone tests.
+    try:
+        quad = validate_uv_quad(
+            [(0.20, 0.0), (1.0, 0.0), (1.0, 1.0), (0.20, 1.0)],
+            "shifted_output_warp",
+        )
+        raw = (0.10, 0.50)
+        warped = warp_uv(raw, quad)
+        warped_velocity = warp_uv_velocity(raw, (1.0, 0.0), quad)
+        zone = (0.25, 0.40, 0.35, 0.60)
+        _check(
+            "(f) output warp can move a point into an interaction zone",
+            not is_inside_uv(raw, zone)
+            and is_inside_uv(warped, zone)
+            and abs(warped_velocity[0] - 0.8) < 1e-6
+            and abs(warped_velocity[1]) < 1e-6,
+            f"raw={raw}, warped={warped}, velocity={warped_velocity}, zone={zone}",
+        )
+    except Exception as ex:
+        _check("(f) output warp can move a point into an interaction zone", False, f"raised {ex!r}")
 
     sys.exit(1 if failed else 0)

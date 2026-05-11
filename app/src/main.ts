@@ -120,6 +120,7 @@ type ProjectionInfo = {
   id: string;
   pixel_size: number[];
   world_size_m: number[];
+  output_warp_points: number[][];
   zones: Array<{ id: string; uv_rect: number[] }>;
 };
 
@@ -158,6 +159,8 @@ type ProjectionRuntime = {
     v: number;
     state?: string;
     source?: string;
+    rawU?: number;
+    rawV?: number;
   }>;
 };
 
@@ -335,6 +338,10 @@ let pendingWorkbenchRegionPersistKey: string | null = null;
 let pendingWorkbenchRegionPersistRefresh = false;
 let workbenchRegionPersistTimer: number | null = null;
 let workbenchRegionPersistInFlight = false;
+let pendingWorkbenchWarpPersistProjectionId: string | null = null;
+let pendingWorkbenchWarpPersistRefresh = false;
+let workbenchWarpPersistTimer: number | null = null;
+let workbenchWarpPersistInFlight = false;
 let workbenchCanvasEditStart: WorkbenchCanvasSize | null = null;
 
 function isConfigEditorActive(): boolean {
@@ -390,6 +397,13 @@ function latestFpsEvent(): TrackerEvent | undefined {
   return latestEvent("fps_tick");
 }
 
+function runtimeSettings(): Record<string, unknown> {
+  const settings = latestFpsEvent()?.settings;
+  return settings && typeof settings === "object" && !Array.isArray(settings)
+    ? (settings as Record<string, unknown>)
+    : {};
+}
+
 function cameraItems(): Record<string, unknown>[] {
   const fps = latestFpsEvent();
   return Array.isArray(fps?.cameras) ? (fps.cameras as Record<string, unknown>[]) : [];
@@ -422,6 +436,21 @@ function cameraRows(): string {
       </tr>`;
     })
     .join("");
+}
+
+function liveTuningPanel(): string {
+  const settings = runtimeSettings();
+  const confirmHits = Number(settings.confirm_hits);
+  const confirmWindow = Number(settings.confirm_window_s);
+  const positionAlpha = Number(settings.position_alpha);
+  const heartbeat = Number(settings.heartbeat_interval_s);
+  const oscRate = sumCameraNumber("osc_rate");
+  return `<div class="kv">
+    <div class="row"><span class="k">confirm</span><span class="v">${Number.isFinite(confirmHits) ? `${confirmHits}` : "-"} hits / ${Number.isFinite(confirmWindow) ? `${confirmWindow.toFixed(2)} s` : "-"}</span></div>
+    <div class="row"><span class="k">position alpha</span><span class="v">${Number.isFinite(positionAlpha) ? positionAlpha.toFixed(2) : "-"}</span></div>
+    <div class="row"><span class="k">heartbeat</span><span class="v">${Number.isFinite(heartbeat) ? `${heartbeat.toFixed(2)} s` : "-"}</span></div>
+    <div class="row"><span class="k">osc send rate</span><span class="v">${formatNumber(oscRate)} /s</span></div>
+  </div>`;
 }
 
 function render(): void {
@@ -740,6 +769,8 @@ function updateWorkbenchDrag(event: PointerEvent): void {
   setDraftHandle(drag.kind, drag.projectionId, drag.index, next);
   if (drag.kind === "region") {
     scheduleWorkbenchRegionPersist(drag.projectionId);
+  } else if (drag.kind === "warp") {
+    scheduleWorkbenchWarpPersist(drag.projectionId);
   }
   requestAnimationFrame(render);
 }
@@ -750,6 +781,9 @@ function endWorkbenchDrag(): void {
   if (ended?.kind === "region") {
     pendingWorkbenchRegionPersistKey = ended.projectionId;
     void flushWorkbenchRegionPersist(true);
+  } else if (ended?.kind === "warp") {
+    pendingWorkbenchWarpPersistProjectionId = ended.projectionId;
+    void flushWorkbenchWarpPersist(true);
   }
 }
 
@@ -761,6 +795,9 @@ function cancelWorkbenchDrag(): void {
   if (workbenchDrag.kind === "region") {
     pendingWorkbenchRegionPersistKey = workbenchDrag.projectionId;
     void flushWorkbenchRegionPersist(true);
+  } else if (workbenchDrag.kind === "warp") {
+    pendingWorkbenchWarpPersistProjectionId = workbenchDrag.projectionId;
+    void flushWorkbenchWarpPersist(true);
   }
   workbenchDrag = null;
   render();
@@ -805,6 +842,8 @@ function handleWorkbenchKeyDown(event: KeyboardEvent): void {
   setDraftHandle(selection.kind, projectionId, selection.index, next);
   if (selection.kind === "region") {
     scheduleWorkbenchRegionPersist(projectionId);
+  } else if (selection.kind === "warp") {
+    scheduleWorkbenchWarpPersist(projectionId);
   }
   render();
 }
@@ -870,6 +909,10 @@ function liveSection(): string {
           </table>
         </div>
       </article>
+      <article class="panel">
+        <div class="panel-head"><h3>live tuning</h3><span class="sub">effective tracker response settings</span></div>
+        <div class="panel-body">${liveTuningPanel()}</div>
+      </article>
     </section>
 
     <section class="metric-grid">
@@ -920,7 +963,7 @@ function projectionSection(): string {
         <span class="sub">${escapeHtml(projection?.id ?? "config projection")} · field pixel preview</span>
         <div class="actions">
           <button class="btn" data-action="projection-refresh" ${buttonDisabled()}>Reload</button>
-          <span class="pill ok">draft only</span>
+          <span class="pill ok">warp saved</span>
         </div>
       </div>
       <div class="workbench-toolbar">
@@ -971,6 +1014,7 @@ function projectionSection(): string {
       ${validationCard("projection config", projections.length ? `${projections.length}` : "none", projections.length ? "ok" : "warn", "read from config.yaml projections[]")}
       ${validationCard("calibrated regions", regions.length ? `${regions.length}` : "none", regions.length ? "ok" : "warn", "camera regions with projection_uv and dispatch_uv")}
       ${validationCard("interaction zones", zones.length ? `${zones.length}` : "none", zones.length ? "ok" : "warn", "read-only zone overlay from interaction_zones[]")}
+      ${validationCard("output warp", projection?.output_warp_points?.length === 4 ? "saved" : "identity", "ok", "projection-level output_warp_points")}
       ${validationCard("stair relaxed masks", regions.some((region) => region.relaxed_presence_points?.length) ? `${regions.filter((region) => region.relaxed_presence_points?.length).length}` : "none", regions.some((region) => region.relaxed_presence_points?.length) ? "ok" : "warn", "camera-image polygons used only for relaxed seated-person detection")}
       ${validationCard("live actors", String(projectionRuntimeItems().reduce((count, projection) => count + projection.active.length, 0)), "ok", "latest fps_tick projection active ids")}
     </section>
@@ -1369,15 +1413,15 @@ function workbenchModeGuide(mode: WorkbenchMode): string {
     },
     fit: {
       title: "Camera Fit",
-      body: "Select any camera region and drag its projection rect. Changes are saved live while dragging.",
+      body: "Set per-camera projection_uv and dispatch_uv ownership for observation, handoff, and gid creation.",
     },
     surface: {
       title: "Interactive Area",
-      body: "Edit the usable interactive surface only. Output warp is hidden while this target is active.",
+      body: "Inspect interaction_zones on the shared UV canvas without changing camera calibration.",
     },
     warp: {
       title: "Output Warp",
-      body: "Edit the final draft warp for raw actor points. Interactive area is hidden to avoid overlapping handles.",
+      body: "Move final fused actors to match the installed projection. Saves as projections[].output_warp_points.",
     },
   };
   return `<div class="mode-guide">
@@ -1646,7 +1690,7 @@ function workbenchReadout(projection: ProjectionInfo | undefined): string {
       ${selection?.kind === "region" ? `<p class="muted readout-note">Camera Fit saves live while dragging; release finalizes the config refresh.</p>` : state.workbenchView.mode === "surface" || state.workbenchView.mode === "warp" ? `<div class="inline-actions tight">
         <button class="btn" data-action="workbench-reset-surface">Reset surface</button>
         <button class="btn" data-action="workbench-reset-warp">Reset warp</button>
-      </div>` : ""}
+      </div>${state.workbenchView.mode === "warp" ? `<p class="muted readout-note">Output Warp saves live and the running tracker reloads it from config.</p>` : ""}` : ""}
     </div>
     <div class="readout-block">
       <h4>actors</h4>
@@ -1673,9 +1717,14 @@ function workbenchActorPairs(projectionId: string, warp: UvQuad): Array<{ raw: U
     .filter((person) => Number.isFinite(person.u) && Number.isFinite(person.v))
     .map((person) => {
       const raw = { u: clamp01(person.u), v: clamp01(person.v) };
+      const rawU = Number(person.rawU);
+      const rawV = Number(person.rawV);
+      const source = Number.isFinite(rawU) && Number.isFinite(rawV)
+        ? { u: clamp01(rawU), v: clamp01(rawV) }
+        : raw;
       return {
-        raw,
-        warped: bilinearQuad(raw, warp),
+        raw: source,
+        warped: bilinearQuad(source, warp),
         gid: person.gid,
         state: person.state,
       };
@@ -1689,6 +1738,21 @@ function identityQuad(): UvQuad {
     { u: 1, v: 1 },
     { u: 0, v: 1 },
   ];
+}
+
+function projectionById(projectionId: string): ProjectionInfo | undefined {
+  return (state.projection?.projections ?? []).find((projection) => projection.id === projectionId);
+}
+
+function outputWarpQuad(projection: ProjectionInfo | undefined): UvQuad {
+  const points = projection?.output_warp_points;
+  if (!points || points.length !== 4 || points.some((point) => point.length < 2)) {
+    return identityQuad();
+  }
+  return points.map((point) => ({
+    u: clamp01(Number(point[0])),
+    v: clamp01(Number(point[1])),
+  })) as UvQuad;
 }
 
 function rectToQuad(rect: number[]): UvQuad {
@@ -1727,7 +1791,11 @@ function draftQuad(kind: WorkbenchHandleKind, projectionId: string, region?: Reg
       ? state.draftUsableSurface
       : state.draftInteractionWarp;
   if (!store[projectionId]) {
-    store[projectionId] = region ? rectToQuad(normalizedUv(region.projection_uv, [0, 0, 1, 1])) : identityQuad();
+    store[projectionId] = region
+      ? rectToQuad(normalizedUv(region.projection_uv, [0, 0, 1, 1]))
+      : kind === "warp"
+        ? outputWarpQuad(projectionById(projectionId))
+        : identityQuad();
   }
   return store[projectionId];
 }
@@ -1875,6 +1943,69 @@ async function persistWorkbenchRegionFit(key: string, refreshAfterSave = true): 
         projectionUv,
         dispatchUv,
         relaxedPresenceV: region.relaxed_presence_v,
+      },
+    });
+    state.saved = true;
+    if (refreshAfterSave) {
+      await refreshConfig();
+      await refreshProjection();
+      requestRender();
+    }
+  } catch (error) {
+    state.error = String(error);
+    requestRender();
+  }
+}
+
+function scheduleWorkbenchWarpPersist(projectionId: string): void {
+  pendingWorkbenchWarpPersistProjectionId = projectionId;
+  if (workbenchWarpPersistTimer !== null) {
+    return;
+  }
+  workbenchWarpPersistTimer = window.setTimeout(() => {
+    workbenchWarpPersistTimer = null;
+    void flushWorkbenchWarpPersist(false);
+  }, 180);
+}
+
+async function flushWorkbenchWarpPersist(refreshAfterSave: boolean): Promise<void> {
+  pendingWorkbenchWarpPersistRefresh = pendingWorkbenchWarpPersistRefresh || refreshAfterSave;
+  if (workbenchWarpPersistTimer !== null) {
+    window.clearTimeout(workbenchWarpPersistTimer);
+    workbenchWarpPersistTimer = null;
+  }
+  if (workbenchWarpPersistInFlight) {
+    return;
+  }
+  const projectionId = pendingWorkbenchWarpPersistProjectionId;
+  pendingWorkbenchWarpPersistProjectionId = null;
+  if (!projectionId) {
+    pendingWorkbenchWarpPersistRefresh = false;
+    return;
+  }
+  const shouldRefresh = pendingWorkbenchWarpPersistRefresh;
+  pendingWorkbenchWarpPersistRefresh = false;
+  workbenchWarpPersistInFlight = true;
+  try {
+    await persistWorkbenchOutputWarp(projectionId, shouldRefresh);
+  } finally {
+    workbenchWarpPersistInFlight = false;
+    if (pendingWorkbenchWarpPersistProjectionId) {
+      scheduleWorkbenchWarpPersist(pendingWorkbenchWarpPersistProjectionId);
+    }
+  }
+}
+
+async function persistWorkbenchOutputWarp(projectionId: string, refreshAfterSave = true): Promise<void> {
+  const outputWarpPoints = draftQuad("warp", projectionId).map((point) => [
+    clamp01(point.u),
+    clamp01(point.v),
+  ]);
+  try {
+    await invoke("save_output_warp", {
+      request: {
+        projectionId,
+        outputWarpPoints,
       },
     });
     state.saved = true;
@@ -2069,6 +2200,8 @@ function projectionRuntimeItems(): ProjectionRuntime[] {
             v: Number(person.v),
             state: person.state ? String(person.state) : undefined,
             source: person.source ? String(person.source) : undefined,
+            rawU: Number(person.raw_u),
+            rawV: Number(person.raw_v),
           })).filter((person) => Number.isFinite(person.gid) && Number.isFinite(person.x) && Number.isFinite(person.y))
         : [],
     }))
@@ -2650,6 +2783,9 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
   if (command === "save_calibration_mapping") {
     return undefined as T;
   }
+  if (command === "save_output_warp") {
+    return undefined as T;
+  }
   if (command === "read_config") {
     return `model: yolo26n.pt
 device: mps
@@ -2779,6 +2915,7 @@ cameras:
           id: "corridor",
           pixel_size: [9600, 1080],
           world_size_m: [40, 4.5],
+          output_warp_points: [[0.02, 0], [0.98, 0.01], [1, 0.98], [0, 1]],
           zones: [{ id: "center", uv_rect: [0.35, 0.15, 0.65, 0.85] }],
         },
       ],
@@ -3263,8 +3400,11 @@ async function handleAction(action: string): Promise<void> {
       resetDraftQuad("surface", state.projection?.projections[0]?.id ?? "corridor");
       state.workbenchView.selectedHandle = null;
     } else if (action === "workbench-reset-warp") {
-      resetDraftQuad("warp", state.projection?.projections[0]?.id ?? "corridor");
+      const projectionId = state.projection?.projections[0]?.id ?? "corridor";
+      resetDraftQuad("warp", projectionId);
       state.workbenchView.selectedHandle = null;
+      pendingWorkbenchWarpPersistProjectionId = projectionId;
+      await flushWorkbenchWarpPersist(true);
     } else if (action === "save-config") {
       await invoke("save_config", { request: { content: state.config } });
       state.saved = true;
@@ -3452,11 +3592,17 @@ if (hasTauriRuntime) {
         xy: [1, 1728, 453.6, 2, 6912, 626.4],
         uv: [1, 0.18, 0.42, 2, 0.72, 0.58],
         persons: [
-          { gid: 1, x: 0.18, y: 0.42, u: 0.18, v: 0.42, state: "fresh" },
-          { gid: 2, x: 0.72, y: 0.58, u: 0.72, v: 0.58, state: "held" },
+          { gid: 1, x: 0.18, y: 0.42, u: 0.18, v: 0.42, raw_u: 0.16, raw_v: 0.42, state: "fresh" },
+          { gid: 2, x: 0.72, y: 0.58, u: 0.72, v: 0.58, raw_u: 0.71, raw_v: 0.58, state: "held" },
         ],
       },
     ],
+    settings: {
+      confirm_hits: 2,
+      confirm_window_s: 0.35,
+      position_alpha: 0.75,
+      heartbeat_interval_s: 0.1,
+    },
   });
 }
 
