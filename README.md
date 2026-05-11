@@ -62,6 +62,19 @@ repo-local `config.yaml` 대신 앱에서 저장한 `runtime/config.yaml`을 우
   --config <app-data>/runtime/config.yaml
 ```
 
+### 앱 아이콘과 macOS 릴리스 빌드
+
+GitHub Actions의 `release` workflow는 macOS runner에서 `npm run tauri:build`를 실행해
+`Reolink Tracker.app`을 번들링합니다. Tauri macOS 번들러는 앱 아이콘으로 `.icns` 파일을
+찾기 때문에 `app/src-tauri/icons/icon.icns`를 커밋 상태로 유지해야 합니다.
+`tauri.conf.json`의 `bundle.icon`에는 공용 PNG인 `icons/icon.png`와 macOS용
+`icons/icon.icns`가 함께 등록되어 있습니다.
+
+앱 아이콘을 바꿀 때는 1024x1024 PNG를 기준으로 아이콘을 다시 생성한 뒤, 최소한
+`app/src-tauri/icons/icon.png`, `app/src-tauri/icons/icon.icns`,
+`app/src-tauri/tauri.conf.json`의 아이콘 목록을 함께 확인합니다. `.icns`가 빠지면
+macOS 릴리스 빌드가 `Failed to create app icon: No matching IconType`에서 멈춥니다.
+
 `--show` 미리보기 키:
 
 - `q` 또는 `Esc`: 종료 (slice 편집 중에는 편집 모드만 빠져나옵니다)
