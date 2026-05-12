@@ -44,6 +44,7 @@ _C_EDIT_DISPATCH = (0, 255, 255)
 _C_ZONE = (255, 80, 220)
 _C_ZONE_EDIT = (255, 255, 255)
 _C_RELAXED = (60, 60, 255)
+_C_RELAXED_DISABLED = (95, 95, 140)
 _C_WARN = (60, 60, 240)
 _C_PANEL_BG = (28, 28, 28)
 _C_PANEL_TEXT = (220, 220, 220)
@@ -620,7 +621,8 @@ def _render_tile(
         if reg.relaxed_presence_points:
             relaxed_pts = np.array([(int(round(x * sx)), int(round(y * sy)))
                                     for (x, y) in reg.relaxed_presence_points], dtype=np.int32)
-            cv2.polylines(tile, [relaxed_pts], True, _C_RELAXED, 2, cv2.LINE_AA)
+            color = _C_RELAXED if reg.relaxed_presence_enabled else _C_RELAXED_DISABLED
+            cv2.polylines(tile, [relaxed_pts], True, color, 2, cv2.LINE_AA)
         u0, v0, u1, v1 = reg.projection_uv
         du0, dv0, du1, dv1 = reg.dispatch_uv
         label = (
@@ -795,7 +797,8 @@ def _render_uv_canvas(
                     f"d {reg.dispatch_uv[0]:.2f}-{reg.dispatch_uv[2]:.2f}"
                 )
                 if reg.relaxed_presence_points:
-                    label += f" stair m={reg.relaxed_presence_margin_uv:.2f}"
+                    stair_state = "stair" if reg.relaxed_presence_enabled else "stair off"
+                    label += f" {stair_state} m={reg.relaxed_presence_margin_uv:.2f}"
                 cv2.putText(panel, label, (px0 + 6, min(py1 - 6, py0 + 18)),
                             _FONT, 0.45, color, 1, cv2.LINE_AA)
 
@@ -1083,7 +1086,8 @@ def _render_region_panel(
                 f"d=[{d[0]:.2f}->{d[2]:.2f}]"
             )
             if reg.relaxed_presence_points:
-                text += f" stair m={reg.relaxed_presence_margin_uv:.2f}"
+                stair_state = "stair" if reg.relaxed_presence_enabled else "stair off"
+                text += f" {stair_state} m={reg.relaxed_presence_margin_uv:.2f}"
             text = _ellipsize_text(text, width - pad * 2, 0.4, 1)
             text_color = _C_REGION_FOCUS if is_focus_reg else _C_PANEL_TEXT
             cv2.putText(panel, text, (pad, y), _FONT, 0.4,
@@ -1635,6 +1639,7 @@ class Viewer:
             return
         updated = replace(
             reg,
+            relaxed_presence_enabled=True,
             relaxed_presence_points=list(self.draft_relaxed_points),
         )
         regions = [updated if r.id == reg.id else r for r in cam.regions]

@@ -48,6 +48,7 @@ class Region:
     body_catch_points: list[tuple[float, float]] = field(default_factory=list)
     body_catch_margin_uv: float = 0.0
     body_catch_min_confidence: float = 0.0
+    relaxed_presence_enabled: bool = True
     relaxed_presence_points: list[tuple[float, float]] = field(default_factory=list)
     relaxed_presence_uv: Optional[tuple[float, float, float, float]] = None
     relaxed_presence_margin_uv: float = 0.0

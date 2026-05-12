@@ -4,7 +4,8 @@
 
 - 기대 런타임은 Python 3.12입니다.
 - PyTorch/Ultralytics 휠은 Python 3.14에서 안정적이라고 가정하지 않습니다.
-- 구조는 의도적으로 single-process이며, 카메라당 RTSP reader thread 하나를 둡니다.
+- 구조는 의도적으로 single-process이며, 카메라당 RTSP reader thread와 선택적 YOLO
+  processing worker thread 하나를 둡니다.
 
 ## 주요 파일
 
@@ -19,6 +20,12 @@
 
 - `OPENCV_FFMPEG_CAPTURE_OPTIONS`는 반드시 `cv2` import 전에 설정해야 합니다.
 - `CamWorker`는 각자 dedicated `YOLO` instance를 가집니다. tracker state가 model instance 단위이기 때문입니다.
+- `processing.parallel=true`이면 카메라별 `CameraProcessor`가 YOLO/BoT-SORT 결과를
+  main loop로 넘기고, main loop만 cross-camera fusion과 OSC 송신을 수행합니다. 오래된
+  처리 결과보다 최신 좌표를 우선하기 위해 worker result queue는 최신 결과 위주로 교체됩니다.
+- `fps_tick` telemetry는 `track_step_ms_*`, `yolo_speed_ms`, frame age/drop count,
+  heartbeat count, main-loop `processing_ms`를 포함해 RTSP/YOLO/OSC 중 어느 구간이
+  좌표 지연을 만드는지 구분하는 데 사용합니다.
 - primary OSC output은 raw image-space 좌표가 아니라 공유 projection UV 좌표입니다.
 - TouchDesigner lane 분리를 위해 primary 좌표 payload는 유지하고
   `/proj/<projection_id>/person_zones` metadata를 추가로 보냅니다.
@@ -43,6 +50,18 @@
   크기/비율 필터와 confirm window를 통과한 detection에만 적용합니다. `too-small`
   rejection은 region의 `min_bbox_height_px`와 relaxed area floor를 통과한 경우에만
   body catch가 구제할 수 있어, 중앙 원거리 보행자처럼 작게 잡히는 bbox를 살립니다.
+- 카메라별 `body_catch_inference_crop.enabled`를 켜면 해당 카메라의
+  `body_catch_points`가 있는 region만 기준으로, `body_catch_points`와 `image_points`의
+  합집합을 crop해 YOLO 입력으로 사용합니다. 이는 cam2 같은 정면 보강 카메라에서 옆모습
+  보행자가 작게 잡히는 문제를 줄이기 위한 소프트웨어 ROI 줌입니다. YOLO bbox는 즉시 전체
+  프레임 좌표로 되돌린 뒤 기존 body-catch, homography, fusion 경로를 타므로 primary OSC
+  schema와 캘리브레이션 좌표계는 바뀌지 않습니다. 다만 중앙 crop이 실제 보행자 픽셀을
+  자르는 현장에서는 이 옵션을 끄고 cam0/cam1 분담을 먼저 조정합니다.
+- 카메라별 `tracking_enabled: false`는 해당 카메라를 preview/calibration-only로 둡니다.
+  FrameGrabber와 캘리브레이션 스냅샷은 유지하지만 YOLO 모델 로드, fusion source, OSC actor,
+  `dispatch_uv` overlap 검증에서는 제외합니다. Projection Workbench의 seam/dispatch 판단도
+  enabled camera만 기준으로 보므로 cam2를 끄고 cam0/cam1 중심의 `projection_uv`/`dispatch_uv`
+  구성을 잡을 수 있습니다.
 - camera region의 `relaxed_presence_points`는 계단/착석자용 별도 image polygon입니다.
   `image_points`는 UV 변환용 기준 영역으로 유지하고, relaxed polygon은 그 안에서만
   가로로 넓거나 짧은 bbox를 완화해 actor 후보로 승격합니다. `relaxed_presence_uv`가 있으면
@@ -50,13 +69,29 @@
   보정합니다. 값이 없으면 기존 homography의 `u`를 씁니다. `relaxed_presence_v`가 있으면
   최종 projection v를 고정값으로 씁니다. 값이 없으면 `v`만 계단 전용 rect 또는 projection
   rect 안으로 clamp하며, dispatch 판정도 `u` 중심으로만 수행합니다.
+  `relaxed_presence_enabled: false`이면 저장된 relaxed polygon/UV/fixed-v 값은 보존하지만
+  runtime은 이 경로를 없는 것처럼 취급해 `stair_relaxed` actor와 relaxed hold를 만들지 않습니다.
   `stair_catch_points`는 같은 의미의 입력 alias입니다. 이 경로에서 생성된
   fused actor는 `source_zone=stair_relaxed`로 유지되어 TouchDesigner가 보행자와 다른
   y lane으로 remap할 수 있습니다.
+- `preprocessing.clahe.enabled`가 true이면 `CamWorker.step()`에서 YOLO 추론 직전에 BGR을
+  LAB로 바꾸고 L 채널에 `cv2.createCLAHE(clipLimit, tileGridSize)`를 적용한 뒤 다시 BGR로
+  되돌립니다. 720p 기준 ~3-5 ms로 30 FPS 파이프라인에 영향이 사실상 없습니다. 야간 저조도
+  보강용이며, primary와 auxiliary 카메라 모두 동일하게 적용합니다.
+- 카메라별 `role`은 `primary`(기본) 또는 `auxiliary`입니다. auxiliary 카메라는 YOLO 추론은
+  수행하지만 `PersonTracker`에서 새 gid를 만들지 않고 sighting buffer로만 기여하며,
+  raw per-cam OSC도 송신하지 않습니다. `tracking_enabled: false`(YOLO 자체 비활성)와는
+  다른 축이며, `role: auxiliary` + `tracking_enabled: true` 조합으로 함께 씁니다.
+- `fusion.aux_match_uv_radius`와 `fusion.aux_match_time_window_s`는 primary에서 lost로
+  가려는 gid의 마지막 좌표와 auxiliary sighting 좌표가 이 UV 거리/시간 윈도우 안에 있을
+  때만 stitch해 lost 발송을 미룹니다. cross-projection 매칭은 차단됩니다.
+- `model_path`는 fine-tuned weight를 가리키며 비어 있으면 stock `yolo26n.pt` 다운로드 동작을
+  유지합니다. 사이트 fine-tuned weight의 권장 위치는 `models/site/best.pt`이며 `.gitignore`로
+  유지합니다.
 - 같은 projection을 공유하는 카메라들의 `dispatch_uv` slice는 겹치지 않아야 합니다. 겹치면 count가 부풀 수 있습니다.
-- cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 중앙 hand-off나 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
+- cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
 - `fusion.relaxed_hold_s`가 0보다 크면 계단/착석자 relaxed polygon에서 생성된 actor만 detection drop 이후 더 오래 held로 남습니다. 일반 바닥 보행자 hold 정책은 그대로 둡니다.
-- `fusion.hold_boundary_margin_uv`가 0보다 크면 held gid는 projection 가장자리 근처에서만 active로 남습니다. 단, `fusion.hold_handoff_margin_uv`가 0보다 크면 각 `dispatch_uv` 내부 u 경계 근처에서도 hand-off용 held를 허용합니다. 중앙에서 track을 놓친 경우에는 ghost actor가 남지 않도록 즉시 `/lost` 처리하되, cam0 -> cam2 -> cam1 slice 경계의 짧은 결손은 흡수합니다.
+- `fusion.hold_boundary_margin_uv`가 0보다 크면 held gid는 projection 가장자리 근처에서만 active로 남습니다. cam0 -> cam2 -> cam1 같은 내부 dispatch 경계에서 track을 놓친 경우에는 ghost actor가 남지 않도록 즉시 `/lost` 처리합니다. hand-off는 겹치는 `projection_uv`의 live observation과 fresh duplicate suppression으로 stitch합니다.
 - `fusion.reuse_lost_gids` 기본값은 `true`입니다. 완전히 lost된 gid는 작은 번호부터 재사용해서 TouchDesigner OSC 채널/테이블이 총 방문자 수만큼 계속 커지지 않게 합니다.
 - `interaction_zones`는 projection별 UV rectangle입니다. fused person이 zone 안에 있으면 zone-local 좌표와 dwell/presence를 별도 OSC stream으로 내보내며, 카메라별 calibration `regions`와 섞지 않습니다.
 - `/person/<gid>/lost`는 gid가 마지막으로 속한 projection에만 송신합니다. cross-projection broadcast cleanup은 더 이상 하지 않습니다.

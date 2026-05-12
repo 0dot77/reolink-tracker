@@ -10,6 +10,14 @@ imgsz: 640
 conf: 0.22
 tracker: botsort.yaml
 
+processing:
+  # 각 카메라 YOLO 처리를 별도 worker에서 돌려, 느린 카메라가 OSC heartbeat를 막지 않게 한다.
+  parallel: true
+  # 너무 오래된 RTSP frame은 늦은 좌표를 보내는 대신 버린다. 0이면 stale drop 비활성화.
+  max_frame_age_s: 1.0
+  # main loop가 소비하지 못한 worker 결과는 최신 결과만 남기고 교체한다.
+  result_queue_size: 4
+
 osc:
   host: 127.0.0.1
   port: 7000
@@ -22,15 +30,16 @@ osc:
   # uv는 항상 0..1 정규화 좌표입니다.
   # person_zones의 zone_code는 0=floor, 1=body_catch, 2=stair_relaxed입니다.
   td_minimal: true
-  # person_level: cross-camera fused stream. td_minimal=true여도 보조 디버그 주소를 추가 송신합니다.
+  # person_level: cross-camera fused debug stream. live TD에서는 td_minimal primary만으로 충분하면
+  # false를 권장합니다. 필요할 때만 /proj/<id>/person/<gid> 상세 row를 추가 송신합니다.
   # packed /xy를 TD에서 전부 unpack하기 어려울 때 /proj/<id>/person/<gid>를 받을 수 있습니다.
-  person_level: true
+  person_level: false
   # raw_per_cam: 카메라별 raw 트랙. td_minimal=true일 때는 자동으로 꺼집니다.
   raw_per_cam: false
   # zone_level: interaction_zones 상세 이벤트. td_minimal=true일 때는 자동으로 꺼집니다.
   zone_level: false
   # frame 입력이 잠깐 멈춰도 person/zone count heartbeat를 유지하는 주기.
-  heartbeat_interval_s: 0.1
+  heartbeat_interval_s: 0.05
   legacy_image_space: false
 
 fusion:
@@ -48,13 +57,12 @@ fusion:
   # track이 끊겼을 때 held 상태를 유지할 projection edge margin.
   # 0.08이면 UV 가장자리 8% 안쪽에서만 held로 남고, 중앙 miss는 즉시 lost 처리한다.
   hold_boundary_margin_uv: 0.08
-  # cam0 -> cam2 -> cam1 같은 내부 dispatch 경계에서는 중앙이라도 짧게 held를 허용한다.
-  # 기본 edge 목록은 각 region.dispatch_uv의 내부 u0/u1에서 자동 산출된다.
-  # 끊김이 남으면 0.08까지 올리고, 경계 ghost가 늘면 0.04로 낮춘다. 0이면 비활성화.
-  hold_handoff_margin_uv: 0.06
-  # 자동 산출 대신 직접 지정하고 싶을 때만 사용:
-  # hold_handoff_u_edges:
-  #   corridor: [0.40, 0.60]
+  # cam0 -> cam2 -> cam1 같은 내부 dispatch 경계에서 track이 끊기면 held로 붙잡지 않는다.
+  # hand-off는 overlap fresh/projection-only observation으로 stitch하고, 사라진 중앙 actor는 바로 lost 처리한다.
+  # 같은 사람을 cam0/cam2가 같은 프레임에 fresh dispatch로 동시에 잡으면,
+  # 이 거리 안의 cross-camera duplicate는 새 gid를 만들지 않고 기존 gid로 흡수한다.
+  # 너무 크게 잡으면 가까운 두 사람이 합쳐질 수 있으므로 0.03~0.05부터 시작한다.
+  overlap_duplicate_radius_uv: 0.04
   # 같은 gid의 다음 관측점이 이 UV 거리보다 멀면 순간이동으로 보고 새 gid로 분리한다.
   # 바닥 인터랙션에서는 OSC actor가 프로젝션 면을 갑자기 가로지르는 것을 막는 안전장치다.
   # 0이면 비활성화. 0.08은 40m projection에서 약 3.2m 규모의 큰 점프를 차단한다.
@@ -84,6 +92,7 @@ detection_filter:
   projection_inner_margin_uv: 0.0
   # relaxed_* 값은 region.relaxed_presence_points/stair_catch_points 안에서만 적용된다.
   # 계단 착석자처럼 bbox가 가로로 넓거나 짧게 잡히는 경우를 살리기 위한 별도 기준이다.
+  # region.relaxed_presence_enabled: false이면 저장된 계단 polygon은 보존하되 runtime에서 무시한다.
   relaxed_min_confidence: 0.12
   relaxed_min_bbox_height_px: 24
   relaxed_min_bbox_area_px: 500
@@ -110,17 +119,25 @@ cameras:
   - name: cam0
     url: rtsp://admin:<urlencoded-password>@<camera-ip>:554/h264Preview_01_sub
     osc_prefix: /cam/0
+    tracking_enabled: true
     regions: []
 
-  # 중앙 보강 cam2를 추가할 때의 권장 시작점입니다.
-  # projection_uv는 hand-off를 위해 서로 겹쳐도 되지만 dispatch_uv는 겹치면 안 됩니다.
+  # 정면 cam2가 옆모습 보행자를 안정적으로 잡지 못하면 기본은 preview/calibration-only로 둡니다.
+  # tracking_enabled: false이면 RTSP preview와 calibration frame은 유지하지만 YOLO/fusion/OSC actor와
+  # dispatch overlap 검증에서는 제외됩니다. 이 상태에서 cam0/cam1의 projection_uv/dispatch_uv를
+  # 넓혀 중앙 구간을 맡기는 구성이 현재 권장 시작점입니다.
   # 예시 분담:
-  #   cam0 dispatch_uv [0.00, 0.0, 0.40, 1.0]
-  #   cam2 dispatch_uv [0.40, 0.0, 0.60, 1.0]
-  #   cam1 dispatch_uv [0.60, 0.0, 1.00, 1.0]
+  #   cam0 dispatch_uv [0.00, 0.0, 0.50, 1.0]
+  #   cam1 dispatch_uv [0.50, 0.0, 1.00, 1.0]
   # - name: cam2
   #   url: rtsp://admin:<urlencoded-password>@<center-camera-ip>:554/h264Preview_01_sub
   #   osc_prefix: /cam/2
+  #   tracking_enabled: false
+  #   # crop은 현장 테스트용 옵션입니다. 중앙 구간 miss의 1차 대응은 cam0/cam1 dispatch 재분담이며,
+  #   # crop은 cam2 tracking을 다시 켜서 비교할 때만 사용합니다.
+  #   body_catch_inference_crop:
+  #     enabled: false
+  #     margin_px: 96
   #   regions:
   #     - id: center_band
   #       projection_id: corridor
@@ -137,6 +154,7 @@ cameras:
   # - name: cam1
   #   url: rtsp://admin:<urlencoded-password>@<camera-ip>:554/h264Preview_01_sub
   #   osc_prefix: /cam/1
+  #   tracking_enabled: true
   #   regions:
   #     - id: far_half
   #       projection_id: corridor
@@ -144,7 +162,7 @@ cameras:
   #       # top-left -> top-right -> bottom-right -> bottom-left
   #       image_points: [[150, 140], [770, 130], [790, 470], [130, 460]]
   #       projection_uv: [0.45, 0.0, 1.0, 1.0]
-  #       dispatch_uv: [0.50, 0.0, 1.0, 1.0]
+  #       dispatch_uv: [0.60, 0.0, 1.0, 1.0]
   #       # 선택 사항: 사람 몸통/bbox가 이 polygon과 겹치면 foot point가
   #       # 바닥 region 경계 밖으로 살짝 빠져도 projection rect로 clamp하여 살린다.
   #       # OSC 위치 계산은 여전히 image_points homography를 사용하고,
@@ -154,6 +172,7 @@ cameras:
   #       body_catch_min_confidence: 0.12
   #       # 계단/착석자 전용 완화 polygon. viewer에서는 s 키로 기존 floor region 위에
   #       # 따로 그릴 수 있다.
+  #       relaxed_presence_enabled: true
   #       relaxed_presence_points: [[150, 120], [780, 120], [760, 260], [160, 260]]
   #       # 선택 사항: relaxed_presence_points 4점을 계단 전용 projection UV rect로
   #       # 다시 투영한다. 좌우 카메라의 사다리꼴 오차가 보이면 이 rect를 조정한다.

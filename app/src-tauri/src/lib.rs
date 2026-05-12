@@ -1,15 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -19,6 +19,7 @@ struct AppState {
     logs: Mutex<VecDeque<LogEvent>>,
     events: Mutex<VecDeque<JsonValue>>,
     mobile_token: String,
+    mobile_auth: Mutex<HashMap<String, MobileAuthFailure>>,
     mobile_port: Mutex<Option<u16>>,
     mobile_error: Mutex<Option<String>>,
 }
@@ -31,6 +32,7 @@ impl Default for AppState {
             logs: Mutex::new(VecDeque::new()),
             events: Mutex::new(VecDeque::new()),
             mobile_token: generate_mobile_token(),
+            mobile_auth: Mutex::new(HashMap::new()),
             mobile_port: Mutex::new(None),
             mobile_error: Mutex::new(None),
         }
@@ -169,6 +171,9 @@ struct OpsSummary {
     osc_rate_avg: Option<f64>,
     projection_active_count_avg: Option<f64>,
     projection_active_count_max: u64,
+    heartbeat_interval_s_avg: Option<f64>,
+    processing_ms_avg: Option<f64>,
+    camera_timing_ms_avg: Option<f64>,
     series: Vec<OpsSeriesPoint>,
 }
 
@@ -190,6 +195,7 @@ struct ZoneInfo {
 #[derive(Debug, Clone, Serialize)]
 struct RegionInfo {
     camera: String,
+    tracking_enabled: bool,
     id: String,
     projection_id: String,
     image_points: Vec<Vec<f64>>,
@@ -197,6 +203,7 @@ struct RegionInfo {
     dispatch_uv: Vec<f64>,
     min_bbox_height_px: Option<f64>,
     body_catch_points: Vec<Vec<f64>>,
+    relaxed_presence_enabled: bool,
     relaxed_presence_points: Vec<Vec<f64>>,
     relaxed_presence_uv: Vec<f64>,
     relaxed_presence_margin_uv: Option<f64>,
@@ -205,7 +212,14 @@ struct RegionInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct CameraInfo {
+    name: String,
+    tracking_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ProjectionSnapshot {
+    cameras: Vec<CameraInfo>,
     projections: Vec<ProjectionInfo>,
     regions: Vec<RegionInfo>,
     camera_count: usize,
@@ -255,8 +269,16 @@ struct SaveCalibrationMappingRequest {
     region_id: String,
     projection_uv: Option<[f64; 4]>,
     dispatch_uv: Option<[f64; 4]>,
+    relaxed_presence_enabled: Option<bool>,
     relaxed_presence_uv: Option<[f64; 4]>,
     relaxed_presence_v: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveCameraTrackingRequest {
+    camera_name: String,
+    tracking_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +294,8 @@ const MOBILE_LOG_LIMIT: usize = 500;
 const MOBILE_EVENT_LIMIT: usize = 200;
 const MOBILE_API_LOG_LIMIT: usize = 80;
 const MOBILE_API_EVENT_LIMIT: usize = 80;
+const MOBILE_AUTH_FAILURE_LIMIT: u32 = 8;
+const MOBILE_AUTH_BACKOFF_S: u64 = 10;
 const MOBILE_PREVIEW_REQUEST_FILE: &str = ".request";
 const MOBILE_PREVIEW_MAX_WIDTH: &str = "640";
 const MOBILE_PREVIEW_INTERVAL_S: &str = "0.75";
@@ -285,16 +309,39 @@ const OPS_RETENTION_DAYS: i64 = 30;
 const OPS_SERIES_MAX_POINTS: usize = 360;
 const SECONDS_PER_DAY: i64 = 86_400;
 
+#[derive(Clone)]
+struct MobileAuthFailure {
+    count: u32,
+    blocked_until: Option<Instant>,
+}
+
 fn generate_mobile_token() -> String {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or_default()
-        ^ ((std::process::id() as u64) << 17);
-    let mixed = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    format!("{:06}", mixed % 1_000_000)
+    let mut bytes = [0_u8; 16];
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_err()
+    {
+        let mut seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or_default()
+            ^ ((std::process::id() as u64) << 17);
+        for chunk in bytes.chunks_mut(8) {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            for (idx, byte) in chunk.iter_mut().enumerate() {
+                *byte = ((seed >> (idx * 8)) & 0xff) as u8;
+            }
+        }
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    token
 }
 
 fn mobile_token_matches(expected: &str, provided: Option<&str>) -> bool {
@@ -309,6 +356,84 @@ fn mobile_token_matches(expected: &str, provided: Option<&str>) -> bool {
         .zip(candidate.bytes())
         .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
         == 0
+}
+
+fn mobile_auth_client_id(stream: &TcpStream) -> String {
+    stream
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn mobile_auth_is_blocked(state: &AppState, client_id: &str, now: Instant) -> bool {
+    let Ok(mut failures) = state.mobile_auth.lock() else {
+        return true;
+    };
+    let Some(entry) = failures.get(client_id).cloned() else {
+        return false;
+    };
+    match entry.blocked_until {
+        Some(until) if until > now => true,
+        Some(_) => {
+            failures.remove(client_id);
+            false
+        }
+        None => false,
+    }
+}
+
+fn record_mobile_auth_result(
+    state: &AppState,
+    client_id: &str,
+    ok: bool,
+    now: Instant,
+) -> bool {
+    let Ok(mut failures) = state.mobile_auth.lock() else {
+        return false;
+    };
+    if ok {
+        failures.remove(client_id);
+        return true;
+    }
+    let entry = failures
+        .entry(client_id.to_string())
+        .or_insert(MobileAuthFailure {
+            count: 0,
+            blocked_until: None,
+        });
+    entry.count = entry.count.saturating_add(1);
+    if entry.count >= MOBILE_AUTH_FAILURE_LIMIT {
+        entry.blocked_until = Some(now + Duration::from_secs(MOBILE_AUTH_BACKOFF_S));
+    }
+    false
+}
+
+fn authorize_mobile_request(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    request: &HttpRequest,
+) -> bool {
+    let state = app.state::<AppState>();
+    let client_id = mobile_auth_client_id(stream);
+    let now = Instant::now();
+    if mobile_auth_is_blocked(&state, &client_id, now) {
+        write_json_error(
+            stream,
+            "429 Too Many Requests",
+            "Too many mobile token attempts. Try again shortly.",
+        );
+        return false;
+    }
+    let ok = mobile_token_matches(
+        &state.mobile_token,
+        request_header(request, MOBILE_TOKEN_HEADER),
+    );
+    record_mobile_auth_result(&state, &client_id, ok, now);
+    if !ok {
+        write_json_error(stream, "401 Unauthorized", "Invalid mobile token.");
+        return false;
+    }
+    true
 }
 
 fn select_mobile_port<I, F>(ports: I, mut can_bind: F) -> Option<u16>
@@ -432,7 +557,7 @@ fn copy_engine_files_from(source: &Path, target: &Path) -> Result<(), String> {
             source.display()
         ));
     }
-    fs::create_dir_all(&target)
+    fs::create_dir_all(target)
         .map_err(|err| format!("failed to create {}: {err}", target.display()))?;
     for name in ENGINE_FILE_NAMES {
         copy_file(&source.join(name), &target.join(name))?;
@@ -474,12 +599,9 @@ fn find_uv() -> Option<PathBuf> {
         return Some(path);
     }
     let home = dirs::home_dir()?;
-    for candidate in [home.join(".local/bin/uv"), home.join(".cargo/bin/uv")] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    [home.join(".local/bin/uv"), home.join(".cargo/bin/uv")]
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn install_uv() -> Result<PathBuf, String> {
@@ -548,6 +670,9 @@ fn parse_config_targets(config: &str) -> Vec<(String, String)> {
     };
     if let Some(cameras) = parsed.get("cameras").and_then(|v| v.as_sequence()) {
         for cam in cameras {
+            if !camera_tracking_enabled(cam) {
+                continue;
+            }
             let name = cam
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -607,6 +732,14 @@ fn yaml_points(value: Option<&serde_yaml::Value>) -> Vec<Vec<f64>> {
 
 fn yaml_optional_f64(value: Option<&serde_yaml::Value>) -> Option<f64> {
     value.and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+}
+
+fn yaml_optional_bool(value: Option<&serde_yaml::Value>) -> Option<bool> {
+    value.and_then(serde_yaml::Value::as_bool)
+}
+
+fn camera_tracking_enabled(camera: &serde_yaml::Value) -> bool {
+    yaml_optional_bool(camera.get("tracking_enabled")).unwrap_or(true)
 }
 
 fn validate_unit_rect(rect: [f64; 4], label: &str) -> Result<[f64; 4], String> {
@@ -702,6 +835,7 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
         })
         .unwrap_or_default();
 
+    let mut cameras_info = Vec::new();
     let mut camera_count = 0;
     let mut regions = Vec::new();
     if let Some(cameras) = parsed.get("cameras").and_then(|v| v.as_sequence()) {
@@ -712,10 +846,16 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
                 .and_then(|v| v.as_str())
                 .unwrap_or("camera")
                 .to_string();
+            let tracking_enabled = camera_tracking_enabled(camera);
+            cameras_info.push(CameraInfo {
+                name: camera_name.clone(),
+                tracking_enabled,
+            });
             if let Some(region_items) = camera.get("regions").and_then(|v| v.as_sequence()) {
                 for region in region_items {
                     regions.push(RegionInfo {
                         camera: camera_name.clone(),
+                        tracking_enabled,
                         id: region
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -734,6 +874,10 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
                         dispatch_uv: yaml_number_vec(region.get("dispatch_uv")),
                         min_bbox_height_px: yaml_optional_f64(region.get("min_bbox_height_px")),
                         body_catch_points: yaml_points(region.get("body_catch_points")),
+                        relaxed_presence_enabled: yaml_optional_bool(
+                            region.get("relaxed_presence_enabled"),
+                        )
+                        .unwrap_or(true),
                         relaxed_presence_points: yaml_points(
                             region
                                 .get("relaxed_presence_points")
@@ -756,6 +900,7 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
     }
 
     Ok(ProjectionSnapshot {
+        cameras: cameras_info,
         projections,
         regions,
         camera_count,
@@ -986,7 +1131,6 @@ fn calibration_config_text(
         serde_yaml::to_value(&request.image_points)
             .map_err(|err| format!("failed to serialize image points: {err}"))?,
     );
-
     serde_yaml::to_string(&config_value)
         .map_err(|err| format!("failed to serialize calibration config: {err}"))
 }
@@ -1059,6 +1203,12 @@ fn calibration_mapping_config_text(
                 .map_err(|err| format!("failed to serialize dispatch_uv: {err}"))?,
         );
     }
+    if let Some(relaxed_presence_enabled) = request.relaxed_presence_enabled {
+        region.insert(
+            serde_yaml::Value::String("relaxed_presence_enabled".to_string()),
+            serde_yaml::Value::Bool(relaxed_presence_enabled),
+        );
+    }
     if let Some(relaxed_presence_uv) = request.relaxed_presence_uv {
         if !has_relaxed_presence_points {
             return Err(
@@ -1084,6 +1234,38 @@ fn calibration_mapping_config_text(
 
     serde_yaml::to_string(&config_value)
         .map_err(|err| format!("failed to serialize calibration config: {err}"))
+}
+
+fn camera_tracking_config_text(
+    config_text: &str,
+    request: &SaveCameraTrackingRequest,
+) -> Result<String, String> {
+    let mut config_value: serde_yaml::Value = serde_yaml::from_str(config_text)
+        .map_err(|err| format!("YAML validation failed: {err}"))?;
+    let cameras = config_value
+        .get_mut("cameras")
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "config is missing cameras[]".to_string())?;
+    let camera = cameras
+        .iter_mut()
+        .find(|camera| {
+            camera
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|name| name == request.camera_name)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("camera not found: {}", request.camera_name))?;
+    let camera = camera
+        .as_mapping_mut()
+        .ok_or_else(|| "target camera entry must be a YAML mapping".to_string())?;
+    camera.insert(
+        serde_yaml::Value::String("tracking_enabled".to_string()),
+        serde_yaml::Value::Bool(request.tracking_enabled),
+    );
+
+    serde_yaml::to_string(&config_value)
+        .map_err(|err| format!("failed to serialize camera tracking config: {err}"))
 }
 
 fn output_warp_config_text(
@@ -1633,11 +1815,12 @@ fn downsample_ops_series(points: Vec<OpsSeriesPoint>) -> Vec<OpsSeriesPoint> {
     if points.len() <= OPS_SERIES_MAX_POINTS {
         return points;
     }
-    let stride = (points.len() + OPS_SERIES_MAX_POINTS - 1) / OPS_SERIES_MAX_POINTS;
+    let stride = points.len().div_ceil(OPS_SERIES_MAX_POINTS);
     let mut out = points
         .iter()
         .enumerate()
-        .filter_map(|(idx, point)| (idx % stride == 0).then(|| point.clone()))
+        .filter(|(idx, _)| idx % stride == 0)
+        .map(|(_, point)| point.clone())
         .collect::<Vec<_>>();
     if let (Some(last_out), Some(last_point)) = (out.last(), points.last()) {
         if last_out.ts != last_point.ts {
@@ -1664,6 +1847,9 @@ fn read_ops_summary_from_path(path: &Path, day: &str) -> Result<OpsSummary, Stri
             osc_rate_avg: None,
             projection_active_count_avg: None,
             projection_active_count_max: 0,
+            heartbeat_interval_s_avg: None,
+            processing_ms_avg: None,
+            camera_timing_ms_avg: None,
             series: Vec::new(),
         });
     }
@@ -1681,6 +1867,12 @@ fn read_ops_summary_from_path(path: &Path, day: &str) -> Result<OpsSummary, Stri
     let mut total_active_count_sum = 0_u64;
     let mut total_active_count_samples = 0_u64;
     let mut total_active_count_max = 0_u64;
+    let mut heartbeat_interval_sum = 0.0_f64;
+    let mut heartbeat_interval_samples = 0_u64;
+    let mut processing_ms_sum = 0.0_f64;
+    let mut processing_ms_samples = 0_u64;
+    let mut camera_timing_ms_sum = 0.0_f64;
+    let mut camera_timing_ms_samples = 0_u64;
     let mut series = Vec::new();
 
     for line in BufReader::new(file).lines() {
@@ -1708,6 +1900,16 @@ fn read_ops_summary_from_path(path: &Path, day: &str) -> Result<OpsSummary, Stri
         }
 
         let mut event_osc_rate = 0.0_f64;
+        if let Some(settings) = value.get("settings") {
+            if let Some(heartbeat_interval) = json_number(settings, "heartbeat_interval_s") {
+                heartbeat_interval_sum += heartbeat_interval;
+                heartbeat_interval_samples += 1;
+            }
+            if let Some(processing_ms) = json_number(settings, "processing_ms") {
+                processing_ms_sum += processing_ms;
+                processing_ms_samples += 1;
+            }
+        }
         if let Some(items) = value.get("cameras").and_then(|item| item.as_array()) {
             for camera in items {
                 let name = camera_name(camera);
@@ -1728,6 +1930,12 @@ fn read_ops_summary_from_path(path: &Path, day: &str) -> Result<OpsSummary, Stri
                     entry.osc_sample_count += 1;
                     entry.osc_rate_sum += osc_rate;
                     event_osc_rate += osc_rate;
+                }
+                if let Some(timing_ms) = json_number(camera, "camera_timing_ms")
+                    .or_else(|| json_number(camera, "timing_ms"))
+                {
+                    camera_timing_ms_sum += timing_ms;
+                    camera_timing_ms_samples += 1;
                 }
             }
         }
@@ -1807,6 +2015,12 @@ fn read_ops_summary_from_path(path: &Path, day: &str) -> Result<OpsSummary, Stri
         projection_active_count_avg: (total_active_count_samples > 0)
             .then(|| total_active_count_sum as f64 / total_active_count_samples as f64),
         projection_active_count_max: total_active_count_max,
+        heartbeat_interval_s_avg: (heartbeat_interval_samples > 0)
+            .then(|| heartbeat_interval_sum / heartbeat_interval_samples as f64),
+        processing_ms_avg: (processing_ms_samples > 0)
+            .then(|| processing_ms_sum / processing_ms_samples as f64),
+        camera_timing_ms_avg: (camera_timing_ms_samples > 0)
+            .then(|| camera_timing_ms_sum / camera_timing_ms_samples as f64),
         series: downsample_ops_series(series),
     })
 }
@@ -2425,7 +2639,7 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
 fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.as_bytes().len()
+        body.len()
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
@@ -2554,12 +2768,7 @@ fn handle_mobile_connection(mut stream: TcpStream, app: AppHandle) {
             );
             return;
         }
-        let state = app.state::<AppState>();
-        if !mobile_token_matches(
-            &state.mobile_token,
-            request_header(&request, MOBILE_TOKEN_HEADER),
-        ) {
-            write_json_error(&mut stream, "401 Unauthorized", "Invalid mobile PIN.");
+        if !authorize_mobile_request(&mut stream, &app, &request) {
             return;
         }
         if let Err(err) = handle_mobile_preview_request(&mut stream, &app, &camera_name) {
@@ -2573,14 +2782,10 @@ fn handle_mobile_connection(mut stream: TcpStream, app: AppHandle) {
             write_http_response(&mut stream, "200 OK", "text/html", mobile_page_html());
         }
         ("GET", "/api/status") | ("POST", "/api/start") | ("POST", "/api/stop") => {
-            let state = app.state::<AppState>();
-            if !mobile_token_matches(
-                &state.mobile_token,
-                request_header(&request, MOBILE_TOKEN_HEADER),
-            ) {
-                write_json_error(&mut stream, "401 Unauthorized", "Invalid mobile PIN.");
+            if !authorize_mobile_request(&mut stream, &app, &request) {
                 return;
             }
+            let state = app.state::<AppState>();
             match (request.method.as_str(), route) {
                 ("GET", "/api/status") => match mobile_status_for_app(&app) {
                     Ok(value) => write_json_response(&mut stream, "200 OK", value),
@@ -2981,9 +3186,9 @@ fn mobile_page_html() -> &'static str {
 <body>
   <main id="auth" class="app auth">
     <div class="top"><span>vomlab/reolink</span><span class="badge">mobile</span></div>
-    <h1>Enter PIN</h1>
-    <p>Status and controls stay locked until the desktop app PIN is entered.</p>
-    <input id="pin" inputmode="numeric" autocomplete="one-time-code" placeholder="000000">
+    <h1>Enter token</h1>
+    <p>Status and controls stay locked until the desktop app token is entered.</p>
+    <input id="pin" autocomplete="one-time-code" placeholder="access token">
     <button id="unlock" class="primary">Unlock</button>
     <div id="authError" class="error hidden"></div>
   </main>
@@ -3125,7 +3330,7 @@ fn mobile_page_html() -> &'static str {
         if (response.status === 401) {
           localStorage.removeItem(key);
           token = "";
-          showAuth("Wrong PIN.");
+          showAuth("Wrong token.");
           return;
         }
         if (!response.ok) {
@@ -3159,8 +3364,8 @@ fn mobile_page_html() -> &'static str {
       if (response.status === 401) {
         localStorage.removeItem(key);
         token = "";
-        showAuth("Wrong PIN.");
-        throw new Error("Wrong PIN.");
+        showAuth("Wrong token.");
+        throw new Error("Wrong token.");
       }
       if (!response.ok || data.ok === false) {
         throw new Error(data.error || response.statusText);
@@ -3341,14 +3546,14 @@ cameras:
   - name: cam1
     url: rtsp://admin:%21pass@192.168.1.21:554/h264Preview_01_sub
   - name: cam2
+    tracking_enabled: false
     url: rtsp://admin:%21pass@192.168.1.22:554/h264Preview_01_sub
 "#;
         assert_eq!(
             parse_config_targets(config),
             vec![
                 ("cam0".to_string(), "192.168.1.20".to_string()),
-                ("cam1".to_string(), "192.168.1.21".to_string()),
-                ("cam2".to_string(), "192.168.1.22".to_string())
+                ("cam1".to_string(), "192.168.1.21".to_string())
             ]
         );
     }
@@ -3606,6 +3811,29 @@ cameras:
     }
 
     #[test]
+    fn generated_mobile_token_uses_hex_128_bit_shape() {
+        let token = generate_mobile_token();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn mobile_auth_throttles_repeated_failures_by_client() {
+        let state = AppState::default();
+        let client = "192.0.2.44";
+        let now = Instant::now();
+        for _ in 0..MOBILE_AUTH_FAILURE_LIMIT {
+            assert!(!record_mobile_auth_result(&state, client, false, now));
+        }
+        assert!(mobile_auth_is_blocked(&state, client, now));
+        assert!(!mobile_auth_is_blocked(
+            &state,
+            client,
+            now + Duration::from_secs(MOBILE_AUTH_BACKOFF_S + 1)
+        ));
+    }
+
+    #[test]
     fn select_mobile_port_uses_first_available_candidate() {
         let picked = select_mobile_port([1421, 1422, 1423], |port| port >= 1422);
         assert_eq!(picked, Some(1422));
@@ -3735,12 +3963,14 @@ cameras:
         projection_id: corridor
         projection_uv: [0.0, 0.0, 0.55, 1.0]
         dispatch_uv: [0.0, 0.0, 0.5, 1.0]
+        relaxed_presence_enabled: false
         relaxed_presence_uv: [0.05, 0.2, 0.45, 0.9]
         min_bbox_height_px: 24
         relaxed_presence_points: [[100, 80], [320, 80], [300, 150], [120, 150]]
         relaxed_presence_margin_uv: 0.1
         relaxed_presence_min_confidence: 0.12
   - name: cam2
+    tracking_enabled: false
     regions:
       - id: center
         projection_id: corridor
@@ -3750,6 +3980,10 @@ cameras:
 "#;
         let snapshot = parse_projection_snapshot(config).expect("snapshot should parse");
         assert_eq!(snapshot.camera_count, 2);
+        assert_eq!(snapshot.cameras[0].name, "cam0");
+        assert!(snapshot.cameras[0].tracking_enabled);
+        assert_eq!(snapshot.cameras[1].name, "cam2");
+        assert!(!snapshot.cameras[1].tracking_enabled);
         assert_eq!(snapshot.projections[0].id, "corridor");
         assert_eq!(
             snapshot.projections[0].output_warp_points[0],
@@ -3759,7 +3993,10 @@ cameras:
         assert_eq!(snapshot.regions[0].camera, "cam0");
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
         assert_eq!(snapshot.regions[1].camera, "cam2");
+        assert!(!snapshot.regions[1].tracking_enabled);
         assert_eq!(snapshot.regions[1].dispatch_uv, vec![0.4, 0.0, 0.6, 1.0]);
+        assert!(!snapshot.regions[0].relaxed_presence_enabled);
+        assert!(snapshot.regions[1].relaxed_presence_enabled);
         assert_eq!(
             snapshot.regions[0].relaxed_presence_uv,
             vec![0.05, 0.2, 0.45, 0.9]
@@ -3905,6 +4142,64 @@ cameras:
             .expect("relaxed points should exist");
         assert_eq!(relaxed.len(), 4);
         assert_eq!(yaml_number_vec(relaxed.first()), vec![100.0, 80.0]);
+        assert_eq!(
+            region
+                .get("relaxed_presence_enabled")
+                .and_then(|value| value.as_bool()),
+            None
+        );
+    }
+
+    #[test]
+    fn calibration_config_preserves_disabled_stair_relaxed_when_points_change() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam0
+    url: /tmp/test.mp4
+    regions:
+      - id: near
+        projection_id: corridor
+        image_points: [[0, 0], [1, 0], [1, 1], [0, 1]]
+        projection_uv: [0.0, 0.0, 0.5, 1.0]
+        dispatch_uv: [0.0, 0.0, 0.5, 1.0]
+        relaxed_presence_enabled: false
+        relaxed_presence_points: [[90, 70], [300, 70], [280, 140], [110, 140]]
+"#;
+        let request = SaveCalibrationPointsRequest {
+            camera_name: "cam0".to_string(),
+            region_id: Some("near".to_string()),
+            image_points: vec![[100.0, 80.0], [320.0, 80.0], [300.0, 150.0], [120.0, 150.0]],
+            point_kind: Some("stair".to_string()),
+        };
+        let text = calibration_config_text(config, &request)
+            .expect("disabled stair points should still save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let region = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .and_then(|cameras| cameras.first())
+            .and_then(|camera| camera.get("regions"))
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .expect("region should exist");
+        assert_eq!(
+            region
+                .get("relaxed_presence_enabled")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            yaml_number_vec(
+                region
+                    .get("relaxed_presence_points")
+                    .and_then(|value| value.as_sequence())
+                    .and_then(|points| points.first())
+            ),
+            vec![100.0, 80.0]
+        );
     }
 
     #[test]
@@ -3993,6 +4288,7 @@ cameras:
             region_id: "center_band".to_string(),
             projection_uv: Some([0.30, 0.0, 0.70, 1.0]),
             dispatch_uv: Some([0.40, 0.0, 0.60, 1.0]),
+            relaxed_presence_enabled: None,
             relaxed_presence_uv: Some([0.32, 0.2, 0.58, 0.82]),
             relaxed_presence_v: Some(0.35),
         };
@@ -4033,6 +4329,67 @@ cameras:
     }
 
     #[test]
+    fn calibration_mapping_writes_relaxed_presence_enabled_false_without_dropping_relaxed_fields() {
+        let config = r#"
+projections:
+  - id: corridor
+cameras:
+  - name: cam2
+    url: /tmp/cam2.mp4
+    regions:
+      - id: center_band
+        projection_id: corridor
+        projection_uv: [0.32, 0.0, 0.68, 1.0]
+        dispatch_uv: [0.4, 0.0, 0.6, 1.0]
+        relaxed_presence_points: [[400, 280], [1120, 280], [1120, 420], [400, 420]]
+        relaxed_presence_uv: [0.32, 0.2, 0.58, 0.82]
+        relaxed_presence_v: 0.35
+"#;
+        let request = SaveCalibrationMappingRequest {
+            camera_name: "cam2".to_string(),
+            region_id: "center_band".to_string(),
+            projection_uv: None,
+            dispatch_uv: None,
+            relaxed_presence_enabled: Some(false),
+            relaxed_presence_uv: None,
+            relaxed_presence_v: None,
+        };
+        let text = calibration_mapping_config_text(config, &request)
+            .expect("relaxed presence enabled flag should save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let region = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .and_then(|cameras| cameras.first())
+            .and_then(|camera| camera.get("regions"))
+            .and_then(|value| value.as_sequence())
+            .and_then(|regions| regions.first())
+            .expect("region should exist");
+        assert_eq!(
+            region
+                .get("relaxed_presence_enabled")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            yaml_number_vec(region.get("relaxed_presence_uv")),
+            vec![0.32, 0.2, 0.58, 0.82]
+        );
+        assert_eq!(
+            yaml_optional_f64(region.get("relaxed_presence_v")),
+            Some(0.35)
+        );
+        assert_eq!(
+            region
+                .get("relaxed_presence_points")
+                .and_then(|value| value.as_sequence())
+                .map(|points| points.len()),
+            Some(4)
+        );
+    }
+
+    #[test]
     fn calibration_mapping_rejects_invalid_relaxed_presence_uv() {
         let config = r#"
 projections:
@@ -4052,6 +4409,7 @@ cameras:
             region_id: "center_band".to_string(),
             projection_uv: None,
             dispatch_uv: None,
+            relaxed_presence_enabled: None,
             relaxed_presence_uv: Some([0.75, 0.2, 0.25, 0.8]),
             relaxed_presence_v: None,
         };
@@ -4079,6 +4437,7 @@ cameras:
             region_id: "center_band".to_string(),
             projection_uv: None,
             dispatch_uv: None,
+            relaxed_presence_enabled: None,
             relaxed_presence_uv: Some([0.32, 0.2, 0.58, 0.82]),
             relaxed_presence_v: None,
         };
@@ -4087,6 +4446,41 @@ cameras:
         assert_eq!(
             err,
             "relaxed_presence_uv requires relaxed_presence_points on the target region"
+        );
+    }
+
+    #[test]
+    fn camera_tracking_config_sets_camera_flag() {
+        let config = r#"
+cameras:
+  - name: cam0
+    url: /tmp/cam0.mp4
+  - name: cam2
+    url: /tmp/cam2.mp4
+"#;
+        let request = SaveCameraTrackingRequest {
+            camera_name: "cam2".to_string(),
+            tracking_enabled: false,
+        };
+        let text = camera_tracking_config_text(config, &request)
+            .expect("camera tracking flag should save");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).expect("generated YAML should parse");
+        let cameras = parsed
+            .get("cameras")
+            .and_then(|value| value.as_sequence())
+            .expect("cameras should exist");
+        assert_eq!(
+            cameras[1]
+                .get("tracking_enabled")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            cameras[0]
+                .get("tracking_enabled")
+                .and_then(|value| value.as_bool()),
+            None
         );
     }
 
@@ -4520,6 +4914,29 @@ fn save_calibration_mapping(
 }
 
 #[tauri::command]
+fn save_camera_tracking(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    request: SaveCameraTrackingRequest,
+) -> Result<(), String> {
+    let config = config_path(&app)?;
+    let config_text = fs::read_to_string(&config)
+        .map_err(|err| format!("failed to read runtime config: {err}"))?;
+    let next_config = camera_tracking_config_text(&config_text, &request)?;
+    write_text_atomically(&config, &next_config)?;
+
+    if let Some(active_config) = active_config_path(&state) {
+        if active_config != config && active_config.exists() {
+            let active_text = fs::read_to_string(&active_config)
+                .map_err(|err| format!("failed to read active tracker config: {err}"))?;
+            let next_active_config = camera_tracking_config_text(&active_text, &request)?;
+            write_text_atomically(&active_config, &next_active_config)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn save_output_warp(
     app: AppHandle,
     state: tauri::State<AppState>,
@@ -4806,6 +5223,7 @@ pub fn run() {
             capture_calibration_frame,
             save_calibration_points,
             save_calibration_mapping,
+            save_camera_tracking,
             save_output_warp,
             stop_tracker,
             tracker_status,

@@ -113,6 +113,9 @@ type OpsSummary = {
   osc_rate_avg: number | null;
   projection_active_count_avg: number | null;
   projection_active_count_max: number;
+  heartbeat_interval_s_avg: number | null;
+  processing_ms_avg: number | null;
+  camera_timing_ms_avg: number | null;
   series: OpsSeriesPoint[];
 };
 
@@ -126,6 +129,7 @@ type ProjectionInfo = {
 
 type RegionInfo = {
   camera: string;
+  tracking_enabled: boolean;
   id: string;
   projection_id: string;
   image_points: number[][];
@@ -138,12 +142,34 @@ type RegionInfo = {
   relaxed_presence_margin_uv: number | null;
   relaxed_presence_min_confidence: number | null;
   relaxed_presence_v: number | null;
+  relaxed_presence_enabled: boolean;
+};
+
+type RawRegionInfo = Omit<RegionInfo, "relaxed_presence_enabled" | "tracking_enabled"> & {
+  relaxed_presence_enabled?: boolean | null;
+  tracking_enabled?: boolean | null;
+};
+
+type CameraInfo = {
+  name: string;
+  tracking_enabled: boolean;
+};
+
+type RawCameraInfo = {
+  name?: string | null;
+  tracking_enabled?: boolean | null;
 };
 
 type ProjectionSnapshot = {
   projections: ProjectionInfo[];
+  cameras: CameraInfo[];
   regions: RegionInfo[];
   camera_count: number;
+};
+
+type RawProjectionSnapshot = Omit<ProjectionSnapshot, "regions" | "cameras"> & {
+  cameras?: RawCameraInfo[] | null;
+  regions?: RawRegionInfo[] | null;
 };
 
 type ProjectionRuntime = {
@@ -169,6 +195,7 @@ type UvQuad = [UvPoint, UvPoint, UvPoint, UvPoint];
 type WorkbenchMode = "inspect" | "canvas" | "fit" | "surface" | "warp";
 type WorkbenchLayer = "projection" | "dispatch" | "zones" | "actors" | "surface" | "warp" | "links";
 type WorkbenchHandleKind = "region" | "surface" | "warp";
+type WorkbenchFitTarget = "projection" | "dispatch";
 type WorkbenchSelection = { kind: WorkbenchHandleKind; index: number; key?: string } | null;
 type WorkbenchCanvasSize = { width: number; height: number; lockedAspect: boolean };
 
@@ -195,6 +222,7 @@ type CalibrationMappingDraft = {
   stairRelaxedVMin: string;
   stairRelaxedVMax: string;
   stairFixedV: string;
+  stairEnabled: boolean;
 };
 
 type SectionId =
@@ -252,7 +280,9 @@ const state: {
   workbenchCanvasSize: WorkbenchCanvasSize;
   workbenchCanvasTouched: boolean;
   workbenchRegionKey: string;
+  workbenchFitTarget: WorkbenchFitTarget;
   draftRegionProjection: Record<string, UvQuad>;
+  draftRegionDispatch: Record<string, UvQuad>;
   draftUsableSurface: Record<string, UvQuad>;
   draftInteractionWarp: Record<string, UvQuad>;
   workbenchView: {
@@ -290,7 +320,9 @@ const state: {
   workbenchCanvasSize: { width: 9600, height: 1080, lockedAspect: true },
   workbenchCanvasTouched: false,
   workbenchRegionKey: "",
+  workbenchFitTarget: "dispatch",
   draftRegionProjection: {},
+  draftRegionDispatch: {},
   draftUsableSurface: {},
   draftInteractionWarp: {},
   workbenchView: {
@@ -334,7 +366,7 @@ let workbenchDrag: {
   startClientY: number;
   rect: DOMRect;
 } | null = null;
-let pendingWorkbenchRegionPersistKey: string | null = null;
+let pendingWorkbenchRegionPersistKeys = new Set<string>();
 let pendingWorkbenchRegionPersistRefresh = false;
 let workbenchRegionPersistTimer: number | null = null;
 let workbenchRegionPersistInFlight = false;
@@ -397,6 +429,56 @@ function latestFpsEvent(): TrackerEvent | undefined {
   return latestEvent("fps_tick");
 }
 
+function relaxedPresenceEnabled(region: Pick<RegionInfo, "relaxed_presence_enabled"> | RawRegionInfo | undefined): boolean {
+  return region?.relaxed_presence_enabled !== false;
+}
+
+function hasRelaxedPresenceMask(region: Pick<RegionInfo, "relaxed_presence_points"> | undefined): boolean {
+  return Boolean(region?.relaxed_presence_points?.length);
+}
+
+function stairMaskCounts(regions: RegionInfo[]): { configured: number; enabled: number; disabled: number } {
+  return regions.reduce((counts, region) => {
+    if (!hasRelaxedPresenceMask(region)) {
+      return counts;
+    }
+    counts.configured += 1;
+    if (relaxedPresenceEnabled(region)) {
+      counts.enabled += 1;
+    } else {
+      counts.disabled += 1;
+    }
+    return counts;
+  }, { configured: 0, enabled: 0, disabled: 0 });
+}
+
+function stairMaskSummary(counts: { configured: number; enabled: number; disabled: number }): string {
+  if (!counts.configured) {
+    return "none";
+  }
+  return counts.disabled
+    ? `${counts.enabled} on · ${counts.disabled} off`
+    : `${counts.enabled} on`;
+}
+
+function normalizeProjectionSnapshot(snapshot: RawProjectionSnapshot): ProjectionSnapshot {
+  const rawCameras = snapshot.cameras ?? [];
+  return {
+    ...snapshot,
+    cameras: rawCameras
+      .map((camera, index) => ({
+        name: String(camera.name ?? `cam${index}`),
+        tracking_enabled: camera.tracking_enabled !== false,
+      }))
+      .filter((camera) => camera.name.length > 0),
+    regions: (snapshot.regions ?? []).map((region) => ({
+      ...region,
+      tracking_enabled: region.tracking_enabled !== false,
+      relaxed_presence_enabled: relaxedPresenceEnabled(region),
+    })),
+  };
+}
+
 function runtimeSettings(): Record<string, unknown> {
   const settings = latestFpsEvent()?.settings;
   return settings && typeof settings === "object" && !Array.isArray(settings)
@@ -421,7 +503,7 @@ function isSetupReady(runtime = state.runtime): boolean {
 function cameraRows(): string {
   const cameras = cameraItems();
   if (!cameras.length) {
-    return `<tr><td colspan="5" class="empty-cell">No camera status events yet.</td></tr>`;
+    return `<tr><td colspan="6" class="empty-cell">No camera status events yet.</td></tr>`;
   }
   return cameras
     .map((cam, index) => {
@@ -433,6 +515,7 @@ function cameraRows(): string {
         <td>${formatNumber(cam.osc_rate)}</td>
         <td>${escapeHtml(String(cam.reconnects ?? 0))}</td>
         <td>${formatNumber(cam.frame_age_s)} s</td>
+        <td>${formatNumber(cam.track_step_ms_avg ?? cam.camera_timing_ms)} ms</td>
       </tr>`;
     })
     .join("");
@@ -542,7 +625,7 @@ function render(): void {
     }, { passive: true });
   }
   root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => {
-    button.addEventListener("click", () => void handleAction(button.dataset.action ?? ""));
+    button.addEventListener("click", () => void handleAction(button.dataset.action ?? "", button));
   });
   root.querySelectorAll<HTMLButtonElement>("button[data-section]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -623,6 +706,9 @@ function render(): void {
       state.saved = false;
     });
   });
+  root.querySelector<HTMLInputElement>("#stairEnabled")?.addEventListener("change", () => {
+    render();
+  });
   root.querySelectorAll<HTMLButtonElement>("button[data-workbench-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       const mode = button.dataset.workbenchMode as WorkbenchMode | undefined;
@@ -634,6 +720,14 @@ function render(): void {
         }
         render();
       }
+    });
+  });
+  root.querySelectorAll<HTMLButtonElement>("button[data-workbench-fit-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.dataset.workbenchFitTarget as WorkbenchFitTarget | undefined;
+      state.workbenchFitTarget = target === "projection" ? "projection" : "dispatch";
+      state.workbenchView.selectedHandle = null;
+      render();
     });
   });
   const workbenchRegion = root.querySelector<HTMLSelectElement>("#workbenchRegion");
@@ -779,7 +873,7 @@ function endWorkbenchDrag(): void {
   const ended = workbenchDrag;
   workbenchDrag = null;
   if (ended?.kind === "region") {
-    pendingWorkbenchRegionPersistKey = ended.projectionId;
+    pendingWorkbenchRegionPersistKeys.add(ended.projectionId);
     void flushWorkbenchRegionPersist(true);
   } else if (ended?.kind === "warp") {
     pendingWorkbenchWarpPersistProjectionId = ended.projectionId;
@@ -793,7 +887,7 @@ function cancelWorkbenchDrag(): void {
   }
   setDraftQuad(workbenchDrag.kind, workbenchDrag.projectionId, cloneQuad(workbenchDrag.originQuad));
   if (workbenchDrag.kind === "region") {
-    pendingWorkbenchRegionPersistKey = workbenchDrag.projectionId;
+    pendingWorkbenchRegionPersistKeys.add(workbenchDrag.projectionId);
     void flushWorkbenchRegionPersist(true);
   } else if (workbenchDrag.kind === "warp") {
     pendingWorkbenchWarpPersistProjectionId = workbenchDrag.projectionId;
@@ -904,7 +998,7 @@ function liveSection(): string {
         <div class="panel-head"><h3>camera status</h3><span class="sub">tracker-status event stream</span></div>
         <div class="panel-body panel-body-flush">
           <table class="app-table">
-            <thead><tr><th>Name</th><th>FPS</th><th>OSC/s</th><th>Reconnects</th><th>Age</th></tr></thead>
+            <thead><tr><th>Name</th><th>FPS</th><th>OSC/s</th><th>Reconnects</th><th>Age</th><th>Track</th></tr></thead>
             <tbody>${cameraRows()}</tbody>
           </table>
         </div>
@@ -948,7 +1042,10 @@ function liveSection(): string {
 function projectionSection(): string {
   const snapshot = state.projection;
   const projections = snapshot?.projections ?? [];
+  const cameras = snapshot?.cameras ?? [];
   const regions = snapshot?.regions ?? [];
+  const enabledRegionCount = regions.filter((region) => region.tracking_enabled).length;
+  const stairCounts = stairMaskCounts(regions);
   const projection = projections[0];
   const projectionId = projection?.id ?? "corridor";
   const projectionRegions = regions.filter((region) => region.projection_id === projectionId || !projection);
@@ -981,6 +1078,7 @@ function projectionSection(): string {
           <label>Preset ${workbenchPresetSelect(projection)}</label>
           <button class="btn" data-action="workbench-reset-canvas">Reset to config</button>
         </div>
+        ${trackingSourceControls(cameras, regions)}
         ${mode === "fit" ? workbenchRegionControl(projectionRegions, selectedFitRegion) : ""}
         ${workbenchModeGuide(mode)}
         ${workbenchLayerControls()}
@@ -990,15 +1088,16 @@ function projectionSection(): string {
         <span>world <b>${formatVector(projection?.world_size_m, "m")}</b></span>
         <span>pixels <b id="workbenchPixelsValue">${canvas.width} x ${canvas.height} px</b></span>
         <span>config <b>${formatVector(projection?.pixel_size, "px")}</b></span>
-        <span>cameras <b>${snapshot?.camera_count ?? cameraNames().length}</b></span>
-        <span>regions <b>${regions.length}</b></span>
-        <span>stairs <b>${regions.filter((region) => region.relaxed_presence_points?.length).length}</b></span>
+        <span>cameras <b>${enabledCameraCount(cameras)} / ${snapshot?.camera_count ?? cameraNames().length}</b></span>
+        <span>regions <b>${enabledRegionCount} / ${regions.length}</b></span>
+        <span>stairs <b>${escapeHtml(stairMaskSummary(stairCounts))}</b></span>
       </div>
       <div class="workbench-shell">
         <div class="workbench-stage">
           <div
             id="workbenchCanvas"
             class="proj-canvas workbench-canvas mode-${escapeAttr(mode)}"
+            data-fit-target="${escapeAttr(state.workbenchFitTarget)}"
             data-projection-id="${escapeAttr(projectionId)}"
             style="--canvas-aspect:${canvasAspect(canvas)};aspect-ratio:${Math.max(1, canvas.width)} / ${Math.max(1, canvas.height)}"
           >
@@ -1013,9 +1112,10 @@ function projectionSection(): string {
     <section class="metric-grid">
       ${validationCard("projection config", projections.length ? `${projections.length}` : "none", projections.length ? "ok" : "warn", "read from config.yaml projections[]")}
       ${validationCard("calibrated regions", regions.length ? `${regions.length}` : "none", regions.length ? "ok" : "warn", "camera regions with projection_uv and dispatch_uv")}
+      ${validationCard("tracking sources", `${enabledCameraCount(cameras)} / ${snapshot?.camera_count ?? cameraNames().length}`, enabledCameraCount(cameras) ? "ok" : "warn", "disabled cameras stay available for preview/calibration but do not spawn actors")}
       ${validationCard("interaction zones", zones.length ? `${zones.length}` : "none", zones.length ? "ok" : "warn", "read-only zone overlay from interaction_zones[]")}
       ${validationCard("output warp", projection?.output_warp_points?.length === 4 ? "saved" : "identity", "ok", "projection-level output_warp_points")}
-      ${validationCard("stair relaxed masks", regions.some((region) => region.relaxed_presence_points?.length) ? `${regions.filter((region) => region.relaxed_presence_points?.length).length}` : "none", regions.some((region) => region.relaxed_presence_points?.length) ? "ok" : "warn", "camera-image polygons used only for relaxed seated-person detection")}
+      ${validationCard("stair relaxed masks", stairMaskSummary(stairCounts), stairCounts.enabled ? "ok" : stairCounts.disabled ? "warn" : "warn", "camera-image polygons used only for relaxed seated-person detection")}
       ${validationCard("live actors", String(projectionRuntimeItems().reduce((count, projection) => count + projection.active.length, 0)), "ok", "latest fps_tick projection active ids")}
     </section>
     <section class="panel">
@@ -1048,6 +1148,9 @@ function calibrationSection(): string {
   const stairRelaxedUv = normalizedUv(selectedRegion?.relaxed_presence_uv, projectionUv);
   const stairV = selectedRegion?.relaxed_presence_v ?? null;
   const mappingKey = calibrationMappingKey(state.calibrationCamera, selectedRegion?.id ?? state.calibrationRegionId);
+  const calibrationTrackingEnabled = cameraTrackingEnabled(state.calibrationCamera);
+  const stairEnabled = mappingDraftChecked(mappingKey, "stairEnabled", relaxedPresenceEnabled(selectedRegion));
+  const stairConfigured = hasRelaxedPresenceMask(selectedRegion);
   const frameSrc = frame && hasTauriRuntime ? convertFileSrc(frame.path) : "";
   const frameStyle = frame
     ? `aspect-ratio:${Math.max(1, frame.width)} / ${Math.max(1, frame.height)};min-height:0`
@@ -1069,8 +1172,9 @@ function calibrationSection(): string {
           <div class="tool-switch" role="group" aria-label="Calibration tool">
             <button class="btn ${state.calibrationTool === "floor" ? "active" : ""}" data-calibration-tool="floor">Floor UV</button>
             <button class="btn ${state.calibrationTool === "body" ? "active body" : ""}" data-calibration-tool="body">Body catch</button>
-            <button class="btn ${state.calibrationTool === "stair" ? "active stair" : ""}" data-calibration-tool="stair">Stair relaxed</button>
+            <button class="btn ${state.calibrationTool === "stair" ? "active stair" : ""} ${stairConfigured && !stairEnabled ? "stair-off" : ""}" data-calibration-tool="stair">Stair relaxed${stairConfigured && !stairEnabled ? " off" : ""}</button>
           </div>
+          <button class="btn ${calibrationTrackingEnabled ? "" : "warn"}" data-action="toggle-camera-tracking" data-camera-name="${escapeAttr(state.calibrationCamera)}" data-tracking-enabled="${calibrationTrackingEnabled ? "true" : "false"}" ${buttonDisabled(!hasTauriRuntime)}>${calibrationTrackingEnabled ? "Tracking on" : "Tracking off"}</button>
           <button class="btn" data-action="clear-calibration-points" ${buttonDisabled(!points.length)}>Clear points</button>
           <button class="btn primary" data-action="save-calibration-points" ${buttonDisabled(saveDisabled)}>Save ${toolLabel}</button>
         </div>
@@ -1085,13 +1189,16 @@ function calibrationSection(): string {
         <div class="panel-body">
           <div class="checks">
             <span class="${isSetupReady() ? "ok" : "missing"}">runtime: ${isSetupReady() ? "ready" : "missing"}</span>
+            <span class="${calibrationTrackingEnabled ? "ok" : "missing"}">tracking: ${calibrationTrackingEnabled ? "on" : "off"}</span>
             <span class="${points.length === 4 ? "ok" : "missing"}">${pointsLabel}: ${points.length}/4</span>
+            <span class="${stairConfigured ? stairEnabled ? "ok" : "missing" : "missing"}">stair: ${stairConfigured ? stairEnabled ? "on" : "off" : "not set"}</span>
           </div>
           <div class="mapping-help">
             <b>Projection</b> observes and holds tracks for handoff. <b>Dispatch</b> creates gid/OSC actors.
             U splits left-to-right camera ownership; V controls depth rows.
           </div>
           <div class="mapping-grid">
+            <label class="check-control mapping-toggle ${stairEnabled ? "" : "is-disabled"}"><input id="stairEnabled" type="checkbox" ${stairEnabled ? "checked" : ""} ${buttonDisabled(!selectedRegion)}> Use Stair relaxed</label>
             <label>Projection U min <small>left observe edge</small><input id="projectionUMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "projectionUMin", formatUvNumber(projectionUv[0])))}"></label>
             <label>Projection U max <small>right observe edge</small><input id="projectionUMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "projectionUMax", formatUvNumber(projectionUv[2])))}"></label>
             <label>Projection V min <small>far/top observe row</small><input id="projectionVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "projectionVMin", formatUvNumber(projectionUv[1])))}"></label>
@@ -1100,25 +1207,27 @@ function calibrationSection(): string {
             <label>Dispatch U max <small>right gid edge</small><input id="dispatchUMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchUMax", formatUvNumber(dispatchUv[2])))}"></label>
             <label>Dispatch V min <small>far/top gid row</small><input id="dispatchVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchVMin", formatUvNumber(dispatchUv[1])))}"></label>
             <label>Dispatch V max <small>near/bottom gid row</small><input id="dispatchVMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "dispatchVMax", formatUvNumber(dispatchUv[3])))}"></label>
-            <label>Stair U min <small>left relaxed warp edge</small><input id="stairRelaxedUMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedUMin", formatUvNumber(stairRelaxedUv[0])))}"></label>
-            <label>Stair U max <small>right relaxed warp edge</small><input id="stairRelaxedUMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedUMax", formatUvNumber(stairRelaxedUv[2])))}"></label>
-            <label>Stair V min <small>far/top relaxed warp row</small><input id="stairRelaxedVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedVMin", formatUvNumber(stairRelaxedUv[1])))}"></label>
-            <label>Stair V max <small>near/bottom relaxed warp row</small><input id="stairRelaxedVMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedVMax", formatUvNumber(stairRelaxedUv[3])))}"></label>
-            <label>Stair fixed v <input id="stairFixedV" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairFixedV", stairV == null ? "" : formatUvNumber(stairV)))}" placeholder="optional"></label>
+            <label class="stair-field ${stairEnabled ? "" : "is-disabled"}">Stair U min <small>left relaxed warp edge</small><input id="stairRelaxedUMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedUMin", formatUvNumber(stairRelaxedUv[0])))}" ${buttonDisabled(!selectedRegion || !stairEnabled)}></label>
+            <label class="stair-field ${stairEnabled ? "" : "is-disabled"}">Stair U max <small>right relaxed warp edge</small><input id="stairRelaxedUMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedUMax", formatUvNumber(stairRelaxedUv[2])))}" ${buttonDisabled(!selectedRegion || !stairEnabled)}></label>
+            <label class="stair-field ${stairEnabled ? "" : "is-disabled"}">Stair V min <small>far/top relaxed warp row</small><input id="stairRelaxedVMin" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedVMin", formatUvNumber(stairRelaxedUv[1])))}" ${buttonDisabled(!selectedRegion || !stairEnabled)}></label>
+            <label class="stair-field ${stairEnabled ? "" : "is-disabled"}">Stair V max <small>near/bottom relaxed warp row</small><input id="stairRelaxedVMax" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairRelaxedVMax", formatUvNumber(stairRelaxedUv[3])))}" ${buttonDisabled(!selectedRegion || !stairEnabled)}></label>
+            <label class="stair-field ${stairEnabled ? "" : "is-disabled"}">Stair fixed v <input id="stairFixedV" type="number" min="0" max="1" step="0.01" value="${escapeAttr(mappingDraftValue(mappingKey, "stairFixedV", stairV == null ? "" : formatUvNumber(stairV)))}" placeholder="optional" ${buttonDisabled(!selectedRegion || !stairEnabled)}></label>
             <button class="btn primary" data-action="save-calibration-mapping" ${buttonDisabled(!selectedRegion)}>Save mapping</button>
           </div>
           <div class="kv">
             <div class="row"><span class="k">camera</span><span class="v">${escapeHtml(state.calibrationCamera)}</span></div>
+            <div class="row"><span class="k">tracking</span><span class="v ${calibrationTrackingEnabled ? "" : "is-muted"}">${calibrationTrackingEnabled ? "enabled" : "disabled"}</span></div>
             <div class="row"><span class="k">region</span><span class="v">${escapeHtml(state.calibrationRegionId)}</span></div>
             <div class="row"><span class="k">tool</span><span class="v">${escapeHtml(toolLabel)}</span></div>
             <div class="row"><span class="k">points</span><span class="v">${escapeHtml(formatImagePoints(points))}</span></div>
             <div class="row"><span class="k">projection uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.projection_uv ?? []))}</span></div>
             <div class="row"><span class="k">dispatch uv</span><span class="v">${escapeHtml(formatUvRange(selectedRegion?.dispatch_uv ?? []))}</span></div>
-            <div class="row"><span class="k">stair relaxed uv</span><span class="v">${escapeHtml(formatUvRange(stairRelaxedUv))}</span></div>
+            <div class="row"><span class="k">stair state</span><span class="v ${stairEnabled ? "" : "is-muted"}">${stairConfigured ? stairEnabled ? "enabled" : "disabled" : "not configured"}</span></div>
+            <div class="row"><span class="k">stair relaxed uv</span><span class="v ${stairEnabled ? "" : "is-muted"}">${escapeHtml(formatUvRange(stairRelaxedUv))}</span></div>
             <div class="row"><span class="k">body catch</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.body_catch_points ?? []))}</span></div>
-            <div class="row"><span class="k">stair mask</span><span class="v">${escapeHtml(formatImagePoints(selectedRegion?.relaxed_presence_points ?? []))}</span></div>
-            <div class="row"><span class="k">stair margin/conf</span><span class="v">${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_margin_uv))} / ${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_min_confidence))}</span></div>
-            <div class="row"><span class="k">stair fixed v</span><span class="v">${stairV == null ? "not set" : escapeHtml(formatUvNumber(stairV))}</span></div>
+            <div class="row"><span class="k">stair mask</span><span class="v ${stairEnabled ? "" : "is-muted"}">${escapeHtml(formatImagePoints(selectedRegion?.relaxed_presence_points ?? []))}</span></div>
+            <div class="row"><span class="k">stair margin/conf</span><span class="v ${stairEnabled ? "" : "is-muted"}">${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_margin_uv))} / ${escapeHtml(formatOptionalNumber(selectedRegion?.relaxed_presence_min_confidence))}</span></div>
+            <div class="row"><span class="k">stair fixed v</span><span class="v ${stairEnabled ? "" : "is-muted"}">${stairV == null ? "not set" : escapeHtml(formatUvNumber(stairV))}</span></div>
             <div class="row"><span class="k">save path</span><span class="v">${escapeHtml(shortPath(state.runtime?.config_path))}</span></div>
             <div class="row"><span class="k">frame</span><span class="v">${frame ? `${frame.width} x ${frame.height}` : "not captured"}</span></div>
           </div>
@@ -1185,6 +1294,9 @@ function operationsSection(): string {
             ? `<div class="ops-summary-strip">
                 ${opsMetric("events", summary ? String(summary.valid_event_count) : String(selectedMeta?.event_count ?? 0), "valid fps_tick lines")}
                 ${opsMetric("osc avg", summary?.osc_rate_avg == null ? "-" : `${formatNumber(summary.osc_rate_avg)}/s`, "sum of camera osc_rate")}
+                ${opsMetric("heartbeat", summary?.heartbeat_interval_s_avg == null ? "-" : `${formatNumber(summary.heartbeat_interval_s_avg)}s`, "avg settings.heartbeat_interval_s")}
+                ${opsMetric("processing", summary?.processing_ms_avg == null ? "-" : `${formatNumber(summary.processing_ms_avg)}ms`, "avg settings.processing_ms")}
+                ${opsMetric("cam timing", summary?.camera_timing_ms_avg == null ? "-" : `${formatNumber(summary.camera_timing_ms_avg)}ms`, "avg camera_timing_ms")}
                 ${opsMetric("active avg", activeAvg == null ? "-" : formatNumber(activeAvg), "projection active count")}
                 ${opsMetric("active max", String(summary?.projection_active_count_max ?? 0), "peak concurrent ids")}
                 ${opsMetric("cameras", String(summary?.cameras.length ?? 0), "camera summaries")}
@@ -1329,7 +1441,7 @@ function mobileSection(): string {
       <article class="panel">
         <div class="panel-head">
           <h3>LAN mobile control</h3>
-          <span class="sub">status plus PIN-protected Start/Stop</span>
+          <span class="sub">status plus token-protected Start/Stop</span>
           <div class="actions"><button class="btn" data-action="mobile-refresh" ${buttonDisabled()}>Refresh</button></div>
         </div>
         <div class="panel-body">
@@ -1341,7 +1453,7 @@ function mobileSection(): string {
           </div>
           ${mobile?.error ? `<div class="banner error mobile-error">${escapeHtml(mobile.error)}</div>` : ""}
           <div class="mobile-pin-box">
-            <span>PIN</span>
+            <span>Token</span>
             <b>${escapeHtml(mobile?.token ?? "-")}</b>
             <em>${escapeHtml(mobile?.token_header ?? "X-Reolink-Mobile-Token")} header is required for every API request.</em>
           </div>
@@ -1370,8 +1482,8 @@ function mobileSection(): string {
             <span class="meta">port ${escapeHtml(String(mobile?.port ?? "1421-1430"))}</span>
           </div>
           <div class="field-check-item warn">
-            <span class="ck">PIN</span>
-            <span class="body"><b>Status is private</b><em>The phone shows only the PIN entry screen until the correct PIN is entered.</em></span>
+            <span class="ck">AUTH</span>
+            <span class="body"><b>Status is private</b><em>The phone shows only the token entry screen until the correct token is entered.</em></span>
             <span class="meta">required</span>
           </div>
         </div>
@@ -1380,7 +1492,7 @@ function mobileSection(): string {
         <div class="panel-head"><h3>mobile API</h3><span class="sub">v1 scope</span></div>
         <div class="panel-body future-grid mobile-api-grid">
           ${statusTile("GET /mobile", "Phone-first status and emergency control page.", "live")}
-          ${statusTile("GET /api/status", "Runtime, process, camera, OSC, event, and log summary after PIN.", "live")}
+          ${statusTile("GET /api/status", "Runtime, process, camera, OSC, event, and log summary after token auth.", "live")}
           ${statusTile("GET /api/preview/<cam>.jpg", "Low-rate preview frame served only while mobile View is active.", "live")}
           ${statusTile("POST /api/start", "Starts tracker headless through the same desktop process supervisor.", "live")}
           ${statusTile("POST /api/stop", "Stops the shared tracker process. Preview and calibration stay desktop-only.", "live")}
@@ -1413,7 +1525,7 @@ function workbenchModeGuide(mode: WorkbenchMode): string {
     },
     fit: {
       title: "Camera Fit",
-      body: "Set per-camera projection_uv and dispatch_uv ownership for observation, handoff, and gid creation.",
+      body: "Edit projection_uv for observation overlap or dispatch_uv for gid/OSC ownership from the same camera-region handles.",
     },
     surface: {
       title: "Interactive Area",
@@ -1434,10 +1546,67 @@ function workbenchRegionControl(regions: RegionInfo[], selected: RegionInfo | un
   if (!regions.length) {
     return `<div class="fit-controls"><span class="muted">No camera regions available.</span></div>`;
   }
+  const trackingState = selected?.tracking_enabled === false ? "tracking off" : "tracking on";
+  const target = state.workbenchFitTarget;
+  const targetValues = target === "projection"
+    ? selected?.projection_uv ?? []
+    : selected?.dispatch_uv ?? [];
+  const stairState = selected && hasRelaxedPresenceMask(selected)
+    ? relaxedPresenceEnabled(selected) ? "stair on" : "stair off"
+    : "no stair";
   return `<div class="fit-controls">
     <label>Camera region ${selectHtml("workbenchRegion", regions.map(regionKey), selected ? regionKey(selected) : regionKey(regions[0]))}</label>
-    <span>${selected ? `${escapeHtml(selected.camera)} · floor ${selected.image_points?.length ?? 0}pt · stair ${selected.relaxed_presence_points?.length ?? 0}pt` : ""}</span>
+    <div class="fit-target-switch" role="group" aria-label="Camera Fit edit target">
+      ${workbenchFitTargetButton("projection", "Projection UV")}
+      ${workbenchFitTargetButton("dispatch", "Dispatch UV")}
+    </div>
+    <span>${selected ? `${escapeHtml(selected.camera)} · ${escapeHtml(trackingState)} · editing ${escapeHtml(target)} ${formatUvRange(targetValues)} · stair ${escapeHtml(stairState)}` : ""}</span>
   </div>`;
+}
+
+function workbenchFitTargetButton(target: WorkbenchFitTarget, label: string): string {
+  return `<button class="btn ${state.workbenchFitTarget === target ? "active" : ""}" data-workbench-fit-target="${target}">${escapeHtml(label)}</button>`;
+}
+
+function trackingSourceControls(cameras: CameraInfo[], regions: RegionInfo[]): string {
+  const byName = new Map<string, CameraInfo>();
+  cameras.forEach((camera) => byName.set(camera.name, camera));
+  regions.forEach((region) => {
+    if (!byName.has(region.camera)) {
+      byName.set(region.camera, { name: region.camera, tracking_enabled: region.tracking_enabled });
+    }
+  });
+  cameraNames().forEach((name) => {
+    if (!byName.has(name)) {
+      byName.set(name, { name, tracking_enabled: true });
+    }
+  });
+  const sourceCameras = [...byName.values()];
+  if (!sourceCameras.length) {
+    return "";
+  }
+  const enabled = sourceCameras.filter((camera) => camera.tracking_enabled !== false).length;
+  return `<div class="tracking-source-grid" aria-label="Tracking source controls">
+    <span class="tracking-source-label">Tracking sources <b>${enabled}/${sourceCameras.length}</b></span>
+    ${sourceCameras
+      .map((camera, index) => {
+        const enabled = camera.tracking_enabled !== false;
+        const camClass = cameraClassForName(camera.name, index);
+        return `<button class="camera-toggle ${enabled ? "is-enabled" : "is-disabled"}" data-action="toggle-camera-tracking" data-camera-name="${escapeAttr(camera.name)}" data-tracking-enabled="${enabled ? "true" : "false"}" ${buttonDisabled(!hasTauriRuntime)}>
+          <span class="cam-swatch ${camClass}"></span>
+          <span>${escapeHtml(camera.name)}</span>
+          <b>${enabled ? "tracking on" : "tracking off"}</b>
+        </button>`;
+      })
+      .join("")}
+  </div>`;
+}
+
+function enabledCameraCount(cameras: CameraInfo[]): number {
+  if (!cameras.length) {
+    return configuredCameraNames().length;
+  }
+  return cameras.filter((camera) => camera.tracking_enabled !== false).length;
 }
 
 function workbenchLayerControls(): string {
@@ -1581,14 +1750,16 @@ function workbenchRegionTile(region: RegionInfo, index: number, kind: "projectio
   const rect = uvRect(values.length === 4 ? values : region.projection_uv);
   const camClass = cameraClassForName(region.camera, index);
   const isSelected = selected ? regionKey(selected) === regionKey(region) : false;
-  return `<div class="dispatch wb-${kind} ${camClass} ${isSelected ? "selected-region" : ""}" style="${rectStyle(rect)}">
+  const trackingOff = region.tracking_enabled === false;
+  return `<div class="dispatch wb-${kind} ${camClass} ${isSelected ? "selected-region" : ""} ${trackingOff ? "tracking-off" : ""}" style="${rectStyle(rect)}">
     <span>${escapeHtml(region.camera)} · ${escapeHtml(region.id)}</span>
-    <b>${escapeHtml(kind)} ${formatUvRange(values)}</b>
+    <b>${trackingOff ? "off · " : ""}${escapeHtml(kind)} ${formatUvRange(values)}</b>
   </div>`;
 }
 
 function workbenchSeams(regions: RegionInfo[]): string {
   const slices = regions
+    .filter((region) => region.tracking_enabled !== false)
     .map((region) => {
       const rect = normalizedUv(region.dispatch_uv, region.projection_uv.length === 4 ? region.projection_uv : [0, 0, 1, 1]);
       return {
@@ -1679,6 +1850,7 @@ function workbenchReadout(projection: ProjectionInfo | undefined): string {
       <div class="micro-row"><span>size</span><b id="workbenchReadoutSize">${canvas.width} x ${canvas.height}</b></div>
       <div class="micro-row"><span>aspect</span><b id="workbenchReadoutAspect">${formatAspect(canvas.width, canvas.height)}</b></div>
       <div class="micro-row"><span>mode</span><b>${escapeHtml(state.workbenchView.mode)}</b></div>
+      ${state.workbenchView.mode === "fit" ? `<div class="micro-row"><span>fit target</span><b>${escapeHtml(state.workbenchFitTarget)}</b></div>` : ""}
     </div>
     <div class="readout-block">
       <h4>selected handle</h4>
@@ -1687,7 +1859,7 @@ function workbenchReadout(projection: ProjectionInfo | undefined): string {
         <div class="micro-row"><span>uv</span><b>${formatUvPoint(selectedPoint)}</b></div>
         <div class="micro-row"><span>px</span><b>${formatPxPoint(selectedPoint)}</b></div>
       ` : `<p class="muted">${escapeHtml(workbenchSelectionHint())}</p>`}
-      ${selection?.kind === "region" ? `<p class="muted readout-note">Camera Fit saves live while dragging; release finalizes the config refresh.</p>` : state.workbenchView.mode === "surface" || state.workbenchView.mode === "warp" ? `<div class="inline-actions tight">
+      ${selection?.kind === "region" ? `<p class="muted readout-note">Camera Fit saves ${escapeHtml(state.workbenchFitTarget)} while dragging; release finalizes the config refresh.</p>` : state.workbenchView.mode === "surface" || state.workbenchView.mode === "warp" ? `<div class="inline-actions tight">
         <button class="btn" data-action="workbench-reset-surface">Reset surface</button>
         <button class="btn" data-action="workbench-reset-warp">Reset warp</button>
       </div>${state.workbenchView.mode === "warp" ? `<p class="muted readout-note">Output Warp saves live and the running tracker reloads it from config.</p>` : ""}` : ""}
@@ -1786,13 +1958,13 @@ function cloneQuad(quad: UvQuad): UvQuad {
 
 function draftQuad(kind: WorkbenchHandleKind, projectionId: string, region?: RegionInfo): UvQuad {
   const store = kind === "region"
-    ? state.draftRegionProjection
+    ? regionDraftStore(state.workbenchFitTarget)
     : kind === "surface"
       ? state.draftUsableSurface
       : state.draftInteractionWarp;
   if (!store[projectionId]) {
     store[projectionId] = region
-      ? rectToQuad(normalizedUv(region.projection_uv, [0, 0, 1, 1]))
+      ? regionFitQuad(region, state.workbenchFitTarget)
       : kind === "warp"
         ? outputWarpQuad(projectionById(projectionId))
         : identityQuad();
@@ -1800,14 +1972,43 @@ function draftQuad(kind: WorkbenchHandleKind, projectionId: string, region?: Reg
   return store[projectionId];
 }
 
+function regionDraftStore(target: WorkbenchFitTarget): Record<string, UvQuad> {
+  return target === "dispatch" ? state.draftRegionDispatch : state.draftRegionProjection;
+}
+
+function draftRegionQuadForTarget(key: string, target: WorkbenchFitTarget, region: RegionInfo): UvQuad {
+  const store = regionDraftStore(target);
+  if (!store[key]) {
+    store[key] = regionFitQuad(region, target);
+  }
+  return store[key];
+}
+
+function regionFitQuad(region: RegionInfo, target: WorkbenchFitTarget): UvQuad {
+  if (target === "dispatch") {
+    const projectionUv = normalizedUv(region.projection_uv, [0, 0, 1, 1]) as [number, number, number, number];
+    const dispatchUv = normalizedUv(region.dispatch_uv, projectionUv) as [number, number, number, number];
+    return rectToQuad(clampRectInsideRect(dispatchUv, projectionUv));
+  }
+  return rectToQuad(normalizedUv(region.projection_uv, [0, 0, 1, 1]));
+}
+
 function setDraftQuad(kind: WorkbenchHandleKind, projectionId: string, quad: UvQuad): void {
   if (kind === "region") {
-    state.draftRegionProjection[projectionId] = quad;
+    regionDraftStore(state.workbenchFitTarget)[projectionId] = quad;
   } else if (kind === "surface") {
     state.draftUsableSurface[projectionId] = quad;
   } else {
     state.draftInteractionWarp[projectionId] = quad;
   }
+}
+
+function resetDraftQuad(kind: WorkbenchHandleKind, projectionId: string): void {
+  if (kind === "region") {
+    setDraftQuad(kind, projectionId, rectToQuad([0, 0, 1, 1]));
+    return;
+  }
+  setDraftQuad(kind, projectionId, identityQuad());
 }
 
 function setDraftHandle(kind: WorkbenchHandleKind, projectionId: string, index: number, point: UvPoint): void {
@@ -1818,10 +2019,6 @@ function setDraftHandle(kind: WorkbenchHandleKind, projectionId: string, index: 
     quad[index] = { u: clamp01(point.u), v: clamp01(point.v) };
     setDraftQuad(kind, projectionId, quad);
   }
-}
-
-function resetDraftQuad(kind: WorkbenchHandleKind, projectionId: string): void {
-  setDraftQuad(kind, projectionId, identityQuad());
 }
 
 function regionKey(region: RegionInfo): string {
@@ -1889,7 +2086,7 @@ function clampRectInsideRect(rect: [number, number, number, number], bounds: [nu
 }
 
 function scheduleWorkbenchRegionPersist(key: string): void {
-  pendingWorkbenchRegionPersistKey = key;
+  pendingWorkbenchRegionPersistKeys.add(key);
   if (workbenchRegionPersistTimer !== null) {
     return;
   }
@@ -1908,8 +2105,10 @@ async function flushWorkbenchRegionPersist(refreshAfterSave: boolean): Promise<v
   if (workbenchRegionPersistInFlight) {
     return;
   }
-  const key = pendingWorkbenchRegionPersistKey;
-  pendingWorkbenchRegionPersistKey = null;
+  const key = pendingWorkbenchRegionPersistKeys.values().next().value as string | undefined;
+  if (key) {
+    pendingWorkbenchRegionPersistKeys.delete(key);
+  }
   if (!key) {
     pendingWorkbenchRegionPersistRefresh = false;
     return;
@@ -1921,8 +2120,11 @@ async function flushWorkbenchRegionPersist(refreshAfterSave: boolean): Promise<v
     await persistWorkbenchRegionFit(key, shouldRefresh);
   } finally {
     workbenchRegionPersistInFlight = false;
-    if (pendingWorkbenchRegionPersistKey) {
-      scheduleWorkbenchRegionPersist(pendingWorkbenchRegionPersistKey);
+    if (pendingWorkbenchRegionPersistKeys.size > 0 && workbenchRegionPersistTimer === null) {
+      workbenchRegionPersistTimer = window.setTimeout(() => {
+        workbenchRegionPersistTimer = null;
+        void flushWorkbenchRegionPersist(false);
+      }, 180);
     }
   }
 }
@@ -1932,9 +2134,11 @@ async function persistWorkbenchRegionFit(key: string, refreshAfterSave = true): 
   if (!region) {
     return;
   }
-  const projectionUv = quadToRect(draftQuad("region", key, region));
-  const currentDispatch = normalizedUv(region.dispatch_uv, projectionUv) as [number, number, number, number];
-  const dispatchUv = clampRectInsideRect(currentDispatch, projectionUv);
+  const projectionUv = quadToRect(draftRegionQuadForTarget(key, "projection", region));
+  const dispatchUv = clampRectInsideRect(
+    quadToRect(draftRegionQuadForTarget(key, "dispatch", region)),
+    projectionUv,
+  );
   try {
     await invoke("save_calibration_mapping", {
       request: {
@@ -1942,6 +2146,7 @@ async function persistWorkbenchRegionFit(key: string, refreshAfterSave = true): 
         regionId: region.id,
         projectionUv,
         dispatchUv,
+        relaxedPresenceEnabled: region.relaxed_presence_enabled,
         relaxedPresenceV: region.relaxed_presence_v,
       },
     });
@@ -2267,12 +2472,14 @@ function minimalAddressRows(): string {
 function regionTile(region: RegionInfo, index: number): string {
   const rect = uvRect(region.dispatch_uv.length === 4 ? region.dispatch_uv : region.projection_uv);
   const camClass = cameraClassForName(region.camera, index);
-  const hasRelaxed = Boolean(region.relaxed_presence_points?.length);
-  const relaxedMeta = `stair m ${formatOptionalNumber(region.relaxed_presence_margin_uv)}`;
-  return `<div class="dispatch ${camClass} ${hasRelaxed ? "has-relaxed" : ""}" style="${rectStyle(rect)}">
+  const hasRelaxed = hasRelaxedPresenceMask(region);
+  const relaxedEnabled = relaxedPresenceEnabled(region);
+  const relaxedMeta = `stair ${relaxedEnabled ? "on" : "off"} · m ${formatOptionalNumber(region.relaxed_presence_margin_uv)}`;
+  const trackingOff = region.tracking_enabled === false;
+  return `<div class="dispatch ${camClass} ${hasRelaxed ? `has-relaxed${relaxedEnabled ? "" : " disabled"}` : ""} ${trackingOff ? "tracking-off" : ""}" style="${rectStyle(rect)}">
     <span>${escapeHtml(region.camera)} · ${escapeHtml(region.id)}</span>
-    <b>${formatUvRange(region.dispatch_uv)}</b>
-    ${hasRelaxed ? `<em>${escapeHtml(relaxedMeta)}</em>` : ""}
+    <b>${trackingOff ? "tracking off · " : ""}${formatUvRange(region.dispatch_uv)}</b>
+    ${hasRelaxed ? `<em class="${relaxedEnabled ? "" : "disabled"}">${escapeHtml(relaxedMeta)}</em>` : ""}
   </div>`;
 }
 
@@ -2289,7 +2496,7 @@ function projectionRegionRows(regions: RegionInfo[]): string {
     .map(
       (region) => `<div class="row">
         <span class="k">${escapeHtml(region.camera)} / ${escapeHtml(region.id)}</span>
-        <span class="v">${escapeHtml(region.projection_id)} · proj ${formatUvRange(region.projection_uv)} · dispatch ${formatUvRange(region.dispatch_uv)}${region.relaxed_presence_points?.length ? ` · stair ${region.relaxed_presence_points.length}pt margin ${formatOptionalNumber(region.relaxed_presence_margin_uv)} conf ${formatOptionalNumber(region.relaxed_presence_min_confidence)}` : ""}</span>
+        <span class="v">${escapeHtml(region.projection_id)} · tracking ${region.tracking_enabled ? "on" : "off"} · proj ${formatUvRange(region.projection_uv)} · dispatch ${formatUvRange(region.dispatch_uv)}${hasRelaxedPresenceMask(region) ? ` · stair ${region.relaxed_presence_points.length}pt ${relaxedPresenceEnabled(region) ? "on" : "off"} margin ${formatOptionalNumber(region.relaxed_presence_margin_uv)} conf ${formatOptionalNumber(region.relaxed_presence_min_confidence)}` : ""}</span>
       </div>`,
     )
     .join("")}</div>`;
@@ -2418,10 +2625,20 @@ function cameraClassForName(cameraName: string, fallbackIndex = 0): string {
 }
 
 function configuredCameraNames(): string[] {
+  const fromSnapshot = (state.projection?.cameras ?? []).map((camera) => camera.name);
   const fromRegions = [...new Set((state.projection?.regions ?? []).map((region) => region.camera))].filter(Boolean);
   const fromConfig = cameraNames();
-  const names = [...new Set([...fromRegions, ...fromConfig])].filter(Boolean);
+  const names = [...new Set([...fromSnapshot, ...fromRegions, ...fromConfig])].filter(Boolean);
   return names.length ? names : ["cam0"];
+}
+
+function cameraTrackingEnabled(cameraName: string): boolean {
+  const fromCamera = state.projection?.cameras.find((camera) => camera.name === cameraName);
+  if (fromCamera) {
+    return fromCamera.tracking_enabled !== false;
+  }
+  const fromRegion = state.projection?.regions.find((region) => region.camera === cameraName);
+  return fromRegion?.tracking_enabled !== false;
 }
 
 function calibrationRegionsForCamera(camera: string): RegionInfo[] {
@@ -2468,15 +2685,16 @@ function calibrationRegionOverlay(region: RegionInfo | undefined, frame: Calibra
     return "";
   }
   const stateClass = (tool: CalibrationTool) => tool === activeTool ? "active" : "dim";
+  const relaxedClasses = [stateClass("stair"), relaxedPresenceEnabled(region) ? "" : "disabled"].filter(Boolean).join(" ");
   return `<svg class="calib-overlay" viewBox="0 0 ${Math.max(1, frame.width)} ${Math.max(1, frame.height)}" aria-hidden="true">
     ${floor ? `<polygon class="floor-poly ${stateClass("floor")}" points="${escapeAttr(floor)}"></polygon>` : ""}
     ${body ? `<polygon class="body-poly ${stateClass("body")}" points="${escapeAttr(body)}"></polygon>` : ""}
-    ${relaxed ? `<polygon class="relaxed-poly ${stateClass("stair")}" points="${escapeAttr(relaxed)}"></polygon>` : ""}
+    ${relaxed ? `<polygon class="relaxed-poly ${relaxedClasses}" points="${escapeAttr(relaxed)}"></polygon>` : ""}
   </svg>
   <div class="calib-legend">
     ${floor ? `<span class="floor">floor uv</span>` : ""}
     ${body ? `<span class="body">body catch</span>` : ""}
-    ${relaxed ? `<span class="relaxed">stair relaxed</span>` : ""}
+    ${relaxed ? `<span class="relaxed ${relaxedPresenceEnabled(region) ? "" : "disabled"}">stair relaxed${relaxedPresenceEnabled(region) ? "" : " off"}</span>` : ""}
   </div>`;
 }
 
@@ -2533,14 +2751,25 @@ function defaultCalibrationMappingDraft(key = currentCalibrationMappingKey()): C
     stairRelaxedVMin: formatUvNumber(stairRelaxedUv[1]),
     stairRelaxedVMax: formatUvNumber(stairRelaxedUv[3]),
     stairFixedV: region?.relaxed_presence_v == null ? "" : formatUvNumber(region.relaxed_presence_v),
+    stairEnabled: relaxedPresenceEnabled(region),
   };
 }
 
 function mappingDraftValue(
   key: string,
-  field: keyof Omit<CalibrationMappingDraft, "key">,
+  field: Exclude<keyof Omit<CalibrationMappingDraft, "key">, "stairEnabled">,
   fallback: string,
 ): string {
+  return state.calibrationMappingDraft?.key === key
+    ? state.calibrationMappingDraft[field]
+    : fallback;
+}
+
+function mappingDraftChecked(
+  key: string,
+  field: "stairEnabled",
+  fallback: boolean,
+): boolean {
   return state.calibrationMappingDraft?.key === key
     ? state.calibrationMappingDraft[field]
     : fallback;
@@ -2552,10 +2781,11 @@ function updateCalibrationMappingDraft(input: HTMLInputElement): void {
     ? state.calibrationMappingDraft
     : defaultCalibrationMappingDraft(key);
   if (input.id in draft) {
+    const field = input.id as keyof Omit<CalibrationMappingDraft, "key">;
     state.calibrationMappingDraft = {
       ...draft,
-      [input.id]: input.value,
-    };
+      [field]: field === "stairEnabled" ? input.checked : input.value,
+    } as CalibrationMappingDraft;
   }
 }
 
@@ -2783,6 +3013,9 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
   if (command === "save_calibration_mapping") {
     return undefined as T;
   }
+  if (command === "save_camera_tracking") {
+    return undefined as T;
+  }
   if (command === "save_output_warp") {
     return undefined as T;
   }
@@ -2898,6 +3131,9 @@ cameras:
         { id: "corridor", sample_count: 126, active_count_avg: 1.8, active_count_max: 4 },
       ],
       osc_rate_avg: 23.1,
+      heartbeat_interval_s_avg: 0.05,
+      processing_ms_avg: 12.4,
+      camera_timing_ms_avg: 11.3,
       projection_active_count_avg: 1.8,
       projection_active_count_max: 4,
       series: Array.from({ length: 48 }, (_, index) => ({
@@ -2910,6 +3146,11 @@ cameras:
   if (command === "read_projection_snapshot") {
     return {
       camera_count: 3,
+      cameras: [
+        { name: "cam0", tracking_enabled: true },
+        { name: "cam2", tracking_enabled: false },
+        { name: "cam1", tracking_enabled: true },
+      ],
       projections: [
         {
           id: "corridor",
@@ -2922,6 +3163,7 @@ cameras:
       regions: [
         {
           camera: "cam0",
+          tracking_enabled: true,
           id: "cam0_region_1",
           projection_id: "corridor",
           image_points: [[120, 120], [740, 120], [780, 520], [90, 520]],
@@ -2934,9 +3176,11 @@ cameras:
           relaxed_presence_margin_uv: 0,
           relaxed_presence_min_confidence: null,
           relaxed_presence_v: null,
+          relaxed_presence_enabled: true,
         },
         {
           camera: "cam2",
+          tracking_enabled: false,
           id: "center_band",
           projection_id: "corridor",
           image_points: [[180, 110], [1040, 120], [1080, 570], [150, 560]],
@@ -2949,9 +3193,11 @@ cameras:
           relaxed_presence_margin_uv: 0.12,
           relaxed_presence_min_confidence: 0.12,
           relaxed_presence_v: null,
+          relaxed_presence_enabled: true,
         },
         {
           camera: "cam1",
+          tracking_enabled: true,
           id: "cam1_region_1",
           projection_id: "corridor",
           image_points: [[1180, 120], [520, 120], [500, 530], [1210, 540]],
@@ -2964,6 +3210,7 @@ cameras:
           relaxed_presence_margin_uv: 0.1,
           relaxed_presence_min_confidence: 0.12,
           relaxed_presence_v: null,
+          relaxed_presence_enabled: true,
         },
       ],
     } as T;
@@ -3269,7 +3516,7 @@ function readOptionalUnitInput(id: string): number | null {
   return Number.isFinite(parsed) ? clamp01(parsed) : null;
 }
 
-async function handleAction(action: string): Promise<void> {
+async function handleAction(action: string, source?: HTMLElement): Promise<void> {
   try {
     state.error = null;
     if (action === "prepare") {
@@ -3328,6 +3575,7 @@ async function handleAction(action: string): Promise<void> {
       if (!region) {
         throw new Error("Select a calibration region first.");
       }
+      const stairEnabled = mappingDraftChecked(currentCalibrationMappingKey(), "stairEnabled", relaxedPresenceEnabled(region));
       const projectionUv = normalizedUv(region.projection_uv, [0, 0, 1, 1]);
       const dispatchUv = normalizedUv(region.dispatch_uv, projectionUv);
       const stairRelaxedUv = normalizedUv(region.relaxed_presence_uv, projectionUv);
@@ -3373,7 +3621,8 @@ async function handleAction(action: string): Promise<void> {
           regionId: region.id,
           projectionUv,
           dispatchUv,
-          relaxedPresenceUv: region.relaxed_presence_points?.length ? stairRelaxedUv : undefined,
+          relaxedPresenceEnabled: stairEnabled,
+          relaxedPresenceUv: hasRelaxedPresenceMask(region) ? stairRelaxedUv : undefined,
           relaxedPresenceV: readOptionalUnitInput("stairFixedV"),
         },
       });
@@ -3393,6 +3642,21 @@ async function handleAction(action: string): Promise<void> {
     } else if (action === "operations-refresh") {
       await refreshOperations();
     } else if (action === "projection-refresh") {
+      await refreshProjection();
+    } else if (action === "toggle-camera-tracking") {
+      const cameraName = source?.dataset.cameraName ?? "";
+      if (!cameraName) {
+        throw new Error("Camera name is missing.");
+      }
+      const trackingEnabled = source?.dataset.trackingEnabled !== "true";
+      await invoke("save_camera_tracking", {
+        request: {
+          cameraName,
+          trackingEnabled,
+        },
+      });
+      state.saved = true;
+      await refreshConfig();
       await refreshProjection();
     } else if (action === "workbench-reset-canvas") {
       syncWorkbenchCanvasFromConfig(true);
@@ -3441,7 +3705,7 @@ async function refreshConfig(): Promise<void> {
 
 async function refreshProjection(): Promise<void> {
   try {
-    state.projection = await invoke<ProjectionSnapshot>("read_projection_snapshot");
+    state.projection = normalizeProjectionSnapshot(await invoke<RawProjectionSnapshot>("read_projection_snapshot"));
     syncWorkbenchCanvasFromConfig();
   } catch {
     state.projection = null;
@@ -3581,9 +3845,9 @@ if (hasTauriRuntime) {
   state.events.push({
     event: "fps_tick",
     cameras: [
-      { name: "cam0", fps: 0, osc_rate: 0, reconnects: 0, frame_age_s: null },
-      { name: "cam2", fps: 0, osc_rate: 0, reconnects: 0, frame_age_s: null },
-      { name: "cam1", fps: 0, osc_rate: 0, reconnects: 0, frame_age_s: null },
+      { name: "cam0", fps: 0, osc_rate: 0, reconnects: 0, frame_age_s: null, track_step_ms_avg: null },
+      { name: "cam2", fps: 0, osc_rate: 0, reconnects: 0, frame_age_s: null, track_step_ms_avg: null },
+      { name: "cam1", fps: 0, osc_rate: 0, reconnects: 0, frame_age_s: null, track_step_ms_avg: null },
     ],
     projections: [
       {

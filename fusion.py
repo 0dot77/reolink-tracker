@@ -30,6 +30,10 @@ class PersonEvent:
     dispatching: bool = True
     relaxed: bool = False
     source_zone: str = "floor"
+    # Lower is better. Tracker sets this to distance from the event UV to the
+    # center of the camera's dispatch slice so simultaneous cross-camera
+    # duplicates can keep the source that is deeper inside its ownership band.
+    dispatch_center_distance: float = 0.0
 
 
 @dataclass
@@ -50,6 +54,7 @@ class Person:
     source: tuple[str, int] = ("", -1)  # (cam_name, track_id) currently feeding this gid
     relaxed: bool = False
     source_zone: str = "floor"
+    dispatch_center_distance: float = 0.0
 
 
 @dataclass
@@ -310,26 +315,15 @@ def _event_source_zone(ev: PersonEvent) -> str:
 
 def _source_zone_priority(ev: PersonEvent) -> int:
     zone = _event_source_zone(ev)
+    return _source_zone_name_priority(zone)
+
+
+def _source_zone_name_priority(zone: str) -> int:
     if zone == "stair_relaxed":
         return 2
     if zone == "body_catch":
         return 1
     return 0
-
-
-def _normalize_handoff_u_edges(
-    edges: dict[str, list[float]],
-) -> dict[str, tuple[float, ...]]:
-    out: dict[str, tuple[float, ...]] = {}
-    for projection_id, values in edges.items():
-        clean: set[float] = set()
-        for edge in values:
-            value = float(edge)
-            if 0.0 < value < 1.0:
-                clean.add(value)
-        if clean:
-            out[str(projection_id)] = tuple(sorted(clean))
-    return out
 
 
 class PersonTracker:
@@ -363,8 +357,7 @@ class PersonTracker:
         velocity_max_dt_s: float = 1.0,
         velocity_predict_max_dt_s: float = 1.0,
         hold_boundary_margin_uv: float = 0.0,
-        hold_handoff_margin_uv: float = 0.0,
-        hold_handoff_u_edges: Optional[dict[str, list[float]]] = None,
+        overlap_duplicate_radius_uv: float = 0.04,
         max_update_jump_uv: float = 0.0,
         relaxed_hold_s: float = 0.0,
         reuse_lost_gids: bool = True,
@@ -383,13 +376,11 @@ class PersonTracker:
         # the projection edge. Interior misses become immediate lost events so
         # downstream visuals do not show a ghost in the middle of the floor.
         self.hold_boundary_margin_uv = max(0.0, min(float(hold_boundary_margin_uv), 0.5))
-        # Optional internal hand-off bands. These keep gid state alive around
-        # dispatch slice boundaries while still suppressing unrelated interior
-        # ghosts when hold_boundary_margin_uv is enabled.
-        self.hold_handoff_margin_uv = max(0.0, min(float(hold_handoff_margin_uv), 0.5))
-        self.hold_handoff_u_edges = _normalize_handoff_u_edges(
-            hold_handoff_u_edges or {}
-        )
+        # Fresh duplicate guard. General active matching intentionally excludes
+        # fresh persons to avoid merging two nearby walkers, but two cameras can
+        # report the same boundary walker as fresh in the same tick. This narrow
+        # radius suppresses only same-projection, cross-camera dispatch duplicates.
+        self.overlap_duplicate_radius_uv = max(0.0, float(overlap_duplicate_radius_uv))
         # Optional teleport guard. When enabled, a fresh observation that would
         # move an existing gid farther than this UV distance is treated as a
         # new person instead of dragging the OSC actor across the floor.
@@ -412,6 +403,7 @@ class PersonTracker:
         self.handoff_count = 0
         self.lost_count = 0
         self.teleport_reject_count = 0
+        self.duplicate_suppressed_count = 0
 
     def update(
         self,
@@ -432,8 +424,8 @@ class PersonTracker:
         for person in self._persons.values():
             person.state = "held"
 
-        # Sources that truly disappeared move to pending, but they remain held
-        # until the hand-off window expires so interaction slots do not flicker.
+        # Sources that truly disappeared move to pending only when the hold
+        # policy allows it. Edge-gated interior misses emit lost immediately.
         for src in lost_sources:
             gid = self._source_to_gid.pop(src, None)
             if gid is None:
@@ -484,6 +476,10 @@ class PersonTracker:
         claimed_active: set[int] = set()
         for ev in new_events:
             src = (ev.cam_name, ev.track_id)
+            duplicate_gid = self._fresh_duplicate_match(ev)
+            if duplicate_gid is not None:
+                self._suppress_fresh_duplicate(duplicate_gid, src, ev, now)
+                continue
             gid = self._best_active_match(ev, fresh | claimed_active)
             if gid is not None:
                 old_src = self._persons[gid].source
@@ -577,9 +573,6 @@ class PersonTracker:
         self._just_lost = []
         return out
 
-    def set_handoff_u_edges(self, edges: dict[str, list[float]]) -> None:
-        self.hold_handoff_u_edges = _normalize_handoff_u_edges(edges)
-
     def _allows_held(self, person: Person) -> bool:
         margin = self.hold_boundary_margin_uv
         if margin <= 0.0:
@@ -591,13 +584,7 @@ class PersonTracker:
             or person.v >= 1.0 - margin
         ):
             return True
-        handoff_margin = self.hold_handoff_margin_uv
-        if handoff_margin <= 0.0:
-            return False
-        return any(
-            abs(person.u - edge) <= handoff_margin
-            for edge in self.hold_handoff_u_edges.get(person.projection_id, ())
-        )
+        return False
 
     def _best_pending_match(
         self,
@@ -680,9 +667,63 @@ class PersonTracker:
             source=src,
             relaxed=ev.relaxed,
             source_zone=_event_source_zone(ev),
+            dispatch_center_distance=max(0.0, float(ev.dispatch_center_distance)),
         )
         self._source_to_gid[src] = gid
         return gid
+
+    def _fresh_duplicate_match(self, ev: PersonEvent) -> Optional[int]:
+        if not ev.dispatching or self.overlap_duplicate_radius_uv <= 0.0:
+            return None
+        best_gid: Optional[int] = None
+        best_dist = self.overlap_duplicate_radius_uv
+        for gid, p in self._persons.items():
+            if p.state != "fresh":
+                continue
+            if p.projection_id != ev.projection_id:
+                continue
+            if p.source[0] == ev.cam_name:
+                continue
+            if not self._allows_update_distance(p, ev):
+                continue
+            du = ev.u - p.u
+            dv = ev.v - p.v
+            dist = (du * du + dv * dv) ** 0.5
+            if dist <= best_dist:
+                best_dist = dist
+                best_gid = gid
+        return best_gid
+
+    def _suppress_fresh_duplicate(
+        self,
+        gid: int,
+        src: tuple[str, int],
+        ev: PersonEvent,
+        now: float,
+    ) -> None:
+        self.duplicate_suppressed_count += 1
+        person = self._persons.get(gid)
+        if person is None:
+            return
+        if not self._duplicate_source_is_better(person, ev):
+            return
+        self._source_to_gid.pop(person.source, None)
+        self._source_to_gid[src] = gid
+        person.source = src
+        person.relaxed = person.relaxed or ev.relaxed
+        self._update_person(gid, ev, now)
+
+    def _duplicate_source_is_better(self, person: Person, ev: PersonEvent) -> bool:
+        ev_distance = max(0.0, float(ev.dispatch_center_distance))
+        if ev_distance + 1e-9 < person.dispatch_center_distance:
+            return True
+        if abs(ev_distance - person.dispatch_center_distance) > 1e-9:
+            return False
+        ev_priority = _source_zone_priority(ev)
+        person_priority = _source_zone_name_priority(person.source_zone)
+        if ev_priority != person_priority:
+            return ev_priority > person_priority
+        return ev.conf > person.conf
 
     def _can_update_person(self, gid: int, ev: PersonEvent) -> bool:
         p = self._persons.get(gid)
@@ -768,6 +809,7 @@ class PersonTracker:
         p.state = "fresh"
         p.relaxed = p.relaxed or ev.relaxed
         p.source_zone = _event_source_zone(ev)
+        p.dispatch_center_distance = max(0.0, float(ev.dispatch_center_distance))
 
     def _update_held_person(self, gid: int, ev: PersonEvent, now: float) -> None:
         self._update_person(gid, ev, now)
@@ -1196,6 +1238,103 @@ if __name__ == "__main__":
         f"persons={[p.gid for p in persons]}, spawned={pt.spawned_count}",
     )
 
+    # (m4) Simultaneous cross-camera fresh duplicates inside the narrow
+    # overlap radius collapse to one gid. The source deeper inside its
+    # dispatch ownership band can take over the existing gid.
+    pt = PersonTracker(overlap_duplicate_radius_uv=0.04)
+    persons = pt.update(
+        [
+            PersonEvent(
+                "corridor",
+                "cam0",
+                11,
+                0.400,
+                0.50,
+                0.90,
+                0.0,
+                dispatch_center_distance=0.18,
+            ),
+            PersonEvent(
+                "corridor",
+                "cam2",
+                21,
+                0.425,
+                0.50,
+                0.85,
+                0.0,
+                dispatch_center_distance=0.02,
+            ),
+        ],
+        [],
+        0.0,
+    )
+    _check(
+        "(m4) same-frame cross-camera duplicate keeps one gid",
+        {p.gid for p in persons} == {1}
+        and pt.spawned_count == 1
+        and pt.duplicate_suppressed_count == 1
+        and pt._source_to_gid.get(("cam2", 21)) == 1,
+        f"persons={[(p.gid, p.source) for p in persons]}, spawned={pt.spawned_count}, "
+        f"suppressed={pt.duplicate_suppressed_count}, source_map={pt._source_to_gid}",
+    )
+
+    # (m5) Far enough simultaneous people still spawn distinct gids.
+    pt = PersonTracker(overlap_duplicate_radius_uv=0.04)
+    persons = pt.update(
+        [
+            PersonEvent("corridor", "cam0", 11, 0.40, 0.50, 0.90, 0.0),
+            PersonEvent("corridor", "cam2", 21, 0.47, 0.50, 0.85, 0.0),
+        ],
+        [],
+        0.0,
+    )
+    _check(
+        "(m5) separated same-frame cross-camera events stay distinct",
+        {p.gid for p in persons} == {1, 2}
+        and pt.spawned_count == 2
+        and pt.duplicate_suppressed_count == 0,
+        f"persons={[p.gid for p in persons]}, spawned={pt.spawned_count}, "
+        f"suppressed={pt.duplicate_suppressed_count}",
+    )
+
+    # (m6) Duplicate suppression is projection-local.
+    pt = PersonTracker(overlap_duplicate_radius_uv=0.04)
+    persons = pt.update(
+        [
+            PersonEvent("corridor", "cam0", 11, 0.40, 0.50, 0.90, 0.0),
+            PersonEvent("lobby", "cam2", 21, 0.42, 0.50, 0.85, 0.0),
+        ],
+        [],
+        0.0,
+    )
+    _check(
+        "(m6) fresh duplicate suppression rejects cross-projection events",
+        {p.gid for p in persons} == {1, 2}
+        and pt.spawned_count == 2
+        and pt.duplicate_suppressed_count == 0,
+        f"persons={[(p.gid, p.projection_id) for p in persons]}, "
+        f"suppressed={pt.duplicate_suppressed_count}",
+    )
+
+    # (m7) The teleport guard still wins over the duplicate radius.
+    pt = PersonTracker(overlap_duplicate_radius_uv=0.10, max_update_jump_uv=0.03)
+    persons = pt.update(
+        [
+            PersonEvent("corridor", "cam0", 11, 0.40, 0.50, 0.90, 0.0),
+            PersonEvent("corridor", "cam2", 21, 0.45, 0.50, 0.85, 0.0),
+        ],
+        [],
+        0.0,
+    )
+    _check(
+        "(m7) max_update_jump_uv prevents far fresh duplicate merge",
+        {p.gid for p in persons} == {1, 2}
+        and pt.spawned_count == 2
+        and pt.duplicate_suppressed_count == 0,
+        f"persons={[p.gid for p in persons]}, spawned={pt.spawned_count}, "
+        f"suppressed={pt.duplicate_suppressed_count}",
+    )
+
     # (n) Velocity comes from raw observation deltas even when position is
     # smoothed, so TD motion vectors do not get damped twice.
     pt = PersonTracker(position_alpha=0.5, velocity_alpha=1.0)
@@ -1355,28 +1494,16 @@ if __name__ == "__main__":
         f"persons={persons}, lost={lost}",
     )
 
-    # (t2) The edge gate also allows configured internal dispatch boundaries.
-    # This is the cam0 -> cam2 -> cam1 case: the projection middle should not
-    # linger generally, but the hand-off u boundaries should stay pending briefly.
-    pt = PersonTracker(
-        hand_off_window_s=1.0,
-        hold_boundary_margin_uv=0.1,
-        hold_handoff_margin_uv=0.05,
-        hold_handoff_u_edges={"corridor": [0.4, 0.6]},
-    )
+    # (t2) Internal dispatch boundaries should not create held ghosts. The
+    # cam0 -> cam2 -> cam1 hand-off relies on live overlap/fresh matching, not
+    # a pending held actor after the source disappears in the projection middle.
+    pt = PersonTracker(hand_off_window_s=1.0, hold_boundary_margin_uv=0.1)
     pt.update([PersonEvent("corridor", "cam0", 5, 0.41, 0.50, 0.9, 0.0)], [], 0.0)
     persons = pt.update([], [("cam0", 5)], 0.1)
     lost = pt.drain_lost_gids()
-    persons = pt.update(
-        [PersonEvent("corridor", "cam2", 8, 0.43, 0.50, 0.9, 0.2)],
-        [],
-        0.2,
-    )
     _check(
-        "(t2) internal hand-off edge remains held and stitches",
-        {p.gid for p in persons} == {1}
-        and pt._source_to_gid.get(("cam2", 8)) == 1
-        and lost == [],
+        "(t2) internal hand-off edge miss emits lost immediately",
+        persons == [] and lost == [LostPerson("corridor", 1)] and pt.handoff_count == 0,
         f"persons={persons}, lost={lost}, source_map={pt._source_to_gid}",
     )
 

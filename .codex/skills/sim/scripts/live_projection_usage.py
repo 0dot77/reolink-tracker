@@ -432,7 +432,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         frame_lost = []
         cam_panels = []
         for ci, (worker, frame) in enumerate(zip(workers, frames)):
-            overlays, _regions, events, lost_sources = worker.step(
+            step = worker.step(
                 frame,
                 sim_imgsz,
                 sim_conf,
@@ -440,6 +440,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 sim_cfg.get("tracker", "botsort.yaml"),
                 frame_idx / source_fps,
             )
+            overlays, _regions, events, lost_sources = step.legacy_tuple()
             frame_events.extend(events)
             frame_lost.extend(lost_sources)
             cam_panels.append(draw_camera(frame, worker, overlays, ci))

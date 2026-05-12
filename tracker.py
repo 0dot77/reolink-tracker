@@ -42,6 +42,7 @@ Legacy image-space schema (when osc.legacy_image_space: true):
 import argparse
 import json
 import os
+import queue
 import signal
 import sys
 import threading
@@ -210,6 +211,19 @@ def _clamp_v_to_rect(
     return (u, min(max(v, lo_v), hi_v))
 
 
+def _uv_distance_to_rect_center(
+    uv: tuple[float, float],
+    rect: tuple[float, float, float, float],
+) -> float:
+    u, v = uv
+    u0, v0, u1, v1 = rect
+    center_u = (u0 + u1) / 2.0
+    center_v = (v0 + v1) / 2.0
+    du = u - center_u
+    dv = v - center_v
+    return (du * du + dv * dv) ** 0.5
+
+
 def _is_inside_expanded_u(
     uv: tuple[float, float],
     rect: tuple[float, float, float, float],
@@ -222,12 +236,87 @@ def _is_inside_expanded_u(
     return lo_u - m <= u <= hi_u + m
 
 
+def _body_catch_inference_crop_rect(
+    regions: list[Region],
+    frame_shape: tuple[int, ...],
+    margin_px: int,
+) -> Optional[tuple[int, int, int, int]]:
+    """Return a stable full-frame crop rect driven by body-catch polygons.
+
+    The detector crop is based on regions that actually define
+    `body_catch_points`, and includes each matching floor `image_points` too.
+    That keeps the detector's ROI zoom focused on the body-catch band without
+    accidentally cutting away lower body/foot pixels needed for stable person
+    boxes and the existing floor homography.
+    """
+    if len(frame_shape) < 2:
+        return None
+    frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
+    if frame_w <= 1 or frame_h <= 1:
+        return None
+
+    points: list[tuple[float, float]] = []
+    for reg in regions:
+        if not reg.body_catch_points:
+            continue
+        points.extend(reg.body_catch_points)
+        points.extend(reg.image_points)
+    if not points:
+        return None
+
+    margin = max(int(margin_px), 0)
+    xs = [float(x) for x, _y in points]
+    ys = [float(y) for _x, y in points]
+    x0 = max(int(np.floor(min(xs))) - margin, 0)
+    y0 = max(int(np.floor(min(ys))) - margin, 0)
+    x1 = min(int(np.ceil(max(xs))) + margin, frame_w)
+    y1 = min(int(np.ceil(max(ys))) + margin, frame_h)
+    if x1 - x0 <= 1 or y1 - y0 <= 1:
+        return None
+    if x0 == 0 and y0 == 0 and x1 == frame_w and y1 == frame_h:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _offset_boxes_xyxy(
+    boxes: np.ndarray,
+    offset: tuple[int, int],
+    frame_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Translate crop-local YOLO boxes back into full-frame coordinates."""
+    if boxes.size == 0:
+        return boxes
+    ox, oy = offset
+    if ox == 0 and oy == 0:
+        return boxes
+    out = boxes.copy()
+    out[:, [0, 2]] += float(ox)
+    out[:, [1, 3]] += float(oy)
+    if len(frame_shape) >= 2:
+        frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
+        out[:, [0, 2]] = np.clip(out[:, [0, 2]], 0.0, float(frame_w))
+        out[:, [1, 3]] = np.clip(out[:, [1, 3]], 0.0, float(frame_h))
+    return out
+
+
+@dataclass
+class BodyCatchInferenceCropCfg:
+    """Optional camera-level software zoom based on configured body-catch masks."""
+
+    enabled: bool = False
+    margin_px: int = 96
+
+
 @dataclass
 class CamCfg:
     name: str
     url: str
     osc_prefix: str
     regions: list[Region] = field(default_factory=list)
+    tracking_enabled: bool = True
+    body_catch_inference_crop: BodyCatchInferenceCropCfg = field(
+        default_factory=BodyCatchInferenceCropCfg
+    )
 
 
 @dataclass
@@ -263,10 +352,203 @@ class DetectionFilterCfg:
 
 
 @dataclass
+class ProcessingCfg:
+    """Runtime scheduling policy for camera inference workers."""
+
+    parallel: bool = True
+    max_frame_age_s: float = 1.0
+    result_queue_size: int = 4
+
+
+@dataclass
 class _PendingDetection:
     first_t: float
     last_t: float
     hits: int = 1
+
+
+@dataclass
+class OscPacket:
+    address: str
+    args: object
+
+
+@dataclass
+class CamStepResult:
+    overlays: list
+    regions: list[Region]
+    person_events: list[PersonEvent]
+    lost_sources: list[tuple[str, int]]
+    osc_packets: list[OscPacket]
+    speed_ms: dict[str, float]
+    step_ms: float
+
+    def legacy_tuple(self) -> tuple[list, list[Region], list[PersonEvent], list[tuple[str, int]]]:
+        return (
+            self.overlays,
+            self.regions,
+            self.person_events,
+            self.lost_sources,
+        )
+
+
+@dataclass
+class CameraProcessResult:
+    cam_name: str
+    frame: np.ndarray
+    frame_idx: int
+    frame_ts: float
+    processed_mono: float
+    frame_age_s: float
+    step: CamStepResult
+    dropped_frames: int = 0
+    dropped_results: int = 0
+    skipped_stale_frames: int = 0
+
+
+@dataclass
+class CameraStatsWindow:
+    frames: int = 0
+    osc_messages: int = 0
+    step_ms_sum: float = 0.0
+    step_ms_max: float = 0.0
+    frame_age_sum: float = 0.0
+    frame_age_max: float = 0.0
+    dropped_frames: int = 0
+    dropped_results: int = 0
+    skipped_stale_frames: int = 0
+    speed_ms_sum: dict[str, float] = field(default_factory=dict)
+    speed_ms_count: dict[str, int] = field(default_factory=dict)
+
+    def add_result(self, result: CameraProcessResult, emitted_osc: int) -> None:
+        self.frames += 1
+        self.osc_messages += emitted_osc
+        self.step_ms_sum += result.step.step_ms
+        self.step_ms_max = max(self.step_ms_max, result.step.step_ms)
+        self.frame_age_sum += result.frame_age_s
+        self.frame_age_max = max(self.frame_age_max, result.frame_age_s)
+        self.dropped_frames += result.dropped_frames
+        self.dropped_results += result.dropped_results
+        self.skipped_stale_frames += result.skipped_stale_frames
+        for key, value in result.step.speed_ms.items():
+            self.speed_ms_sum[key] = self.speed_ms_sum.get(key, 0.0) + value
+            self.speed_ms_count[key] = self.speed_ms_count.get(key, 0) + 1
+
+    def snapshot(self, dt: float) -> dict:
+        fps = self.frames / dt if dt > 0 else 0.0
+        osc_rate = self.osc_messages / dt if dt > 0 else 0.0
+        speed_avg = {
+            key: self.speed_ms_sum[key] / max(1, self.speed_ms_count.get(key, 0))
+            for key in sorted(self.speed_ms_sum)
+        }
+        return {
+            "fps": fps,
+            "osc_rate": osc_rate,
+            "track_step_ms_avg": (
+                self.step_ms_sum / self.frames if self.frames else None
+            ),
+            "track_step_ms_max": self.step_ms_max if self.frames else None,
+            "frame_age_s_avg": (
+                self.frame_age_sum / self.frames if self.frames else None
+            ),
+            "frame_age_s_max": self.frame_age_max if self.frames else None,
+            "dropped_frames": self.dropped_frames,
+            "dropped_results": self.dropped_results,
+            "skipped_stale_frames": self.skipped_stale_frames,
+            "yolo_speed_ms": speed_avg,
+        }
+
+
+class CameraProcessor(threading.Thread):
+    """Runs one camera's YOLO tracker without blocking OSC heartbeat cadence."""
+
+    def __init__(
+        self,
+        grabber: "FrameGrabber",
+        worker: "CamWorker",
+        imgsz: int,
+        conf: float,
+        iou: float,
+        tracker: str,
+        processing: ProcessingCfg,
+    ):
+        super().__init__(daemon=True, name=f"track-{grabber.cam.name}")
+        self.grabber = grabber
+        self.worker = worker
+        self.imgsz = imgsz
+        self.conf = conf
+        self.iou = iou
+        self.tracker = tracker
+        self.processing = processing
+        self._stop_event = threading.Event()
+        self._result_q: queue.Queue[CameraProcessResult] = queue.Queue(
+            maxsize=max(processing.result_queue_size, 1)
+        )
+        self._last_idx = -1
+        self._dropped_frames = 0
+        self._dropped_results = 0
+        self._skipped_stale_frames = 0
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            frame, frame_idx, frame_ts = self.grabber.get()
+            if frame is None or frame_idx == self._last_idx:
+                self._stop_event.wait(0.002)
+                continue
+            dropped_since_last = max(0, frame_idx - self._last_idx - 1) if self._last_idx >= 0 else 0
+            self._last_idx = frame_idx
+            frame_age_s = time.time() - frame_ts if frame_ts else 999.0
+            if (
+                self.processing.max_frame_age_s > 0
+                and frame_age_s > self.processing.max_frame_age_s
+            ):
+                self._skipped_stale_frames += 1
+                continue
+            step = self.worker.step(
+                frame,
+                self.imgsz,
+                self.conf,
+                self.iou,
+                self.tracker,
+                time.monotonic(),
+            )
+            dropped_results = self._dropped_results
+            while not self._result_q.empty():
+                try:
+                    self._result_q.get_nowait()
+                    dropped_results += 1
+                except queue.Empty:
+                    break
+            result = CameraProcessResult(
+                cam_name=self.grabber.cam.name,
+                frame=frame,
+                frame_idx=frame_idx,
+                frame_ts=frame_ts,
+                processed_mono=time.monotonic(),
+                frame_age_s=frame_age_s,
+                step=step,
+                dropped_frames=dropped_since_last + self._dropped_frames,
+                dropped_results=dropped_results,
+                skipped_stale_frames=self._skipped_stale_frames,
+            )
+            self._dropped_frames = 0
+            self._dropped_results = 0
+            self._skipped_stale_frames = 0
+            try:
+                self._result_q.put_nowait(result)
+            except queue.Full:
+                self._dropped_results += 1
+
+    def drain_results(self) -> list[CameraProcessResult]:
+        results = []
+        while True:
+            try:
+                results.append(self._result_q.get_nowait())
+            except queue.Empty:
+                return results
+
+    def stop(self) -> None:
+        self._stop_event.set()
 
 
 class FrameGrabber(threading.Thread):
@@ -514,7 +796,8 @@ class CamWorker:
     ):
         self.cam = cam
         self.osc = osc
-        self.model = YOLO(model_path)
+        self.model_path = model_path
+        self.model: Optional[YOLO] = YOLO(model_path) if cam.tracking_enabled else None
         self.device = device
         self.projections = projections
         self.legacy_image_space = legacy_image_space
@@ -541,11 +824,54 @@ class CamWorker:
         # detections from spawning OSC identities.
         self._pending_detections: dict[int, _PendingDetection] = {}
         self._confirmed_tids: set[int] = set()
+        self._last_inference_crop_rect: Optional[tuple[int, int, int, int]] = None
         self.fps_count = 0
         self.osc_count = 0
+        self._lock = threading.Lock()
 
     def update_regions(self, regions: list[Region], preserve_tracking: bool = False) -> None:
         """Replace active regions after operator edits in the viewer."""
+        with self._lock:
+            self._update_regions_unlocked(regions, preserve_tracking)
+
+    def update_runtime_calibration(
+        self,
+        projections: dict[str, Projection],
+        detection_filter: DetectionFilterCfg,
+        tracking_enabled: bool,
+        body_catch_inference_crop: BodyCatchInferenceCropCfg,
+        regions: list[Region],
+        preserve_tracking: bool = False,
+    ) -> list[tuple[str, int]]:
+        with self._lock:
+            forced_lost_sources: list[tuple[str, int]] = []
+            self.projections = projections
+            self.detection_filter = detection_filter
+            if self.cam.tracking_enabled != tracking_enabled:
+                if self.cam.tracking_enabled and not tracking_enabled:
+                    forced_lost_sources = [
+                        (self.cam.name, tid) for tid in sorted(self.last_projection_tids)
+                    ]
+                self.cam.tracking_enabled = tracking_enabled
+                preserve_tracking = False
+                self._last_inference_crop_rect = None
+            if self.cam.body_catch_inference_crop != body_catch_inference_crop:
+                self.cam.body_catch_inference_crop = body_catch_inference_crop
+                preserve_tracking = False
+                self._last_inference_crop_rect = None
+            self._update_regions_unlocked(regions, preserve_tracking)
+            return forced_lost_sources
+
+    def _ensure_model(self) -> YOLO:
+        if self.model is None:
+            self.model = YOLO(self.model_path)
+        return self.model
+
+    def _update_regions_unlocked(
+        self,
+        regions: list[Region],
+        preserve_tracking: bool,
+    ) -> None:
         previous_last_ids = self.last_ids
         self.cam.regions = regions
         self.last_ids = {
@@ -692,7 +1018,7 @@ class CamWorker:
         uv: tuple[float, float],
         conf: float,
     ) -> bool:
-        if not reg.relaxed_presence_points:
+        if not reg.relaxed_presence_enabled or not reg.relaxed_presence_points:
             return False
         if not self._classify_relaxed_presence(box, conf):
             return False
@@ -705,6 +1031,36 @@ class CamWorker:
             return False
         return _is_inside_expanded_u(uv, reg.projection_uv, reg.relaxed_presence_margin_uv)
 
+    def _select_inference_frame(
+        self,
+        frame: np.ndarray,
+    ) -> tuple[np.ndarray, tuple[int, int]]:
+        cfg = self.cam.body_catch_inference_crop
+        if not cfg.enabled:
+            return frame, (0, 0)
+        rect = _body_catch_inference_crop_rect(
+            self.cam.regions,
+            frame.shape,
+            cfg.margin_px,
+        )
+        if rect is None:
+            if self._last_inference_crop_rect is not None:
+                print(
+                    f"[{self.cam.name}] body-catch inference crop disabled; using full frame",
+                    flush=True,
+                )
+                self._last_inference_crop_rect = None
+            return frame, (0, 0)
+        x0, y0, x1, y1 = rect
+        if rect != self._last_inference_crop_rect:
+            print(
+                f"[{self.cam.name}] body-catch inference crop: "
+                f"{x1 - x0}x{y1 - y0} at x={x0}, y={y0}",
+                flush=True,
+            )
+            self._last_inference_crop_rect = rect
+        return frame[y0:y1, x0:x1], (x0, y0)
+
     def step(
         self,
         frame: np.ndarray,
@@ -713,7 +1069,19 @@ class CamWorker:
         iou: float,
         tracker: str,
         now: float,
-    ) -> tuple[list, list[Region], list[PersonEvent], list[tuple[str, int]]]:
+    ) -> CamStepResult:
+        with self._lock:
+            return self._step_unlocked(frame, imgsz, conf, iou, tracker, now)
+
+    def _step_unlocked(
+        self,
+        frame: np.ndarray,
+        imgsz: int,
+        conf: float,
+        iou: float,
+        tracker: str,
+        now: float,
+    ) -> CamStepResult:
         """Run one detection+track step.
 
         Returns `(overlays, regions, person_events, lost_sources)`. Person
@@ -727,11 +1095,23 @@ class CamWorker:
         so the fusion layer keeps their gid alive across boundary jitter
         and only stops broadcasting `/person/<gid>` for that frame.
 
-        Raw per-cam OSC is emitted inline only when `raw_per_cam=True`.
-        Person-level OSC is emitted by the caller, not here, because it
-        spans cameras."""
-        results = self.model.track(
-            frame,
+        Raw/legacy OSC packets are returned to the caller so the main thread
+        remains the only OSC sender.
+        """
+        step_started = time.perf_counter()
+        if not self.cam.tracking_enabled:
+            return CamStepResult(
+                overlays=[],
+                regions=self.cam.regions,
+                person_events=[],
+                lost_sources=[],
+                osc_packets=[],
+                speed_ms={},
+                step_ms=(time.perf_counter() - step_started) * 1000.0,
+            )
+        inference_frame, inference_offset = self._select_inference_frame(frame)
+        results = self._ensure_model().track(
+            inference_frame,
             imgsz=imgsz,
             conf=conf,
             iou=iou,
@@ -742,6 +1122,11 @@ class CamWorker:
             verbose=False,
         )
         r = results[0]
+        speed_ms = {
+            str(key): float(value)
+            for key, value in (getattr(r, "speed", {}) or {}).items()
+            if isinstance(value, (int, float))
+        }
         h, w = frame.shape[:2]
 
         overlays: list = []  # list[viewer.TrackOverlay] (lazy import below to avoid cycle when --show is off)
@@ -749,14 +1134,20 @@ class CamWorker:
         active: dict[str, list[int]] = {reg.id: [] for reg in self.cam.regions}
         legacy_active: list[int] = []
         person_events: list[PersonEvent] = []
+        osc_packets: list[OscPacket] = []
         projection_tids: set[int] = set()
         has_relaxed_regions = any(
-            reg.relaxed_presence_points for reg in self.cam.regions
+            reg.relaxed_presence_enabled and reg.relaxed_presence_points
+            for reg in self.cam.regions
         )
 
         if r.boxes is not None and r.boxes.id is not None:
             ids = r.boxes.id.cpu().numpy().astype(int)
-            xyxy = r.boxes.xyxy.cpu().numpy()
+            xyxy = _offset_boxes_xyxy(
+                r.boxes.xyxy.cpu().numpy(),
+                inference_offset,
+                frame.shape,
+            )
             confs = r.boxes.conf.cpu().numpy()
 
             for tid, box, c in zip(ids, xyxy, confs):
@@ -844,6 +1235,10 @@ class CamWorker:
                         dispatching=in_dispatch,
                         relaxed=relaxed,
                         source_zone=source_zone,
+                        dispatch_center_distance=_uv_distance_to_rect_center(
+                            (u, v),
+                            reg.dispatch_uv,
+                        ),
                     ))
                     if in_dispatch:
                         if self.raw_per_cam:
@@ -853,7 +1248,7 @@ class CamWorker:
                             if proj is not None and proj.pixel_size is not None:
                                 pw, ph = proj.pixel_size
                                 args.extend([u * pw, v * ph])
-                            self.osc.send_message(addr, args)
+                            osc_packets.append(OscPacket(addr, args))
                             self.osc_count += 1
                         active[reg.id].append(int(tid))
 
@@ -866,10 +1261,10 @@ class CamWorker:
                     cy = (y1 + y2) / 2.0 / h
                     bw = (x2 - x1) / w
                     bh = bbox_h / h
-                    self.osc.send_message(
+                    osc_packets.append(OscPacket(
                         f"{self.cam.osc_prefix}/track/{int(tid)}",
                         [cx, cy, bw, bh, float(c)],
-                    )
+                    ))
                     self.osc_count += 1
                     legacy_active.append(int(tid))
 
@@ -880,21 +1275,21 @@ class CamWorker:
             cur = set(active[reg.id])
             if self.raw_per_cam:
                 for lost_id in self.last_ids.get(reg.id, set()) - cur:
-                    self.osc.send_message(
+                    osc_packets.append(OscPacket(
                         f"/proj/{reg.projection_id}/cam/{self.cam.name}/track/{lost_id}/lost",
                         [],
-                    )
+                    ))
                     self.osc_count += 1
-                self.osc.send_message(
+                osc_packets.append(OscPacket(
                     f"/proj/{reg.projection_id}/cam/{self.cam.name}/count",
                     len(cur),
-                )
+                ))
                 self.osc_count += 1
                 if cur:
-                    self.osc.send_message(
+                    osc_packets.append(OscPacket(
                         f"/proj/{reg.projection_id}/cam/{self.cam.name}/active",
                         sorted(cur),
-                    )
+                    ))
                     self.osc_count += 1
             self.last_ids[reg.id] = cur
 
@@ -902,17 +1297,17 @@ class CamWorker:
         if self.legacy_image_space:
             cur = set(legacy_active)
             for lost_id in self.last_ids[""] - cur:
-                self.osc.send_message(
+                osc_packets.append(OscPacket(
                     f"{self.cam.osc_prefix}/track/{lost_id}/lost", []
-                )
+                ))
                 self.osc_count += 1
             self.last_ids[""] = cur
-            self.osc.send_message(f"{self.cam.osc_prefix}/count", len(cur))
+            osc_packets.append(OscPacket(f"{self.cam.osc_prefix}/count", len(cur)))
             self.osc_count += 1
             if cur:
-                self.osc.send_message(
+                osc_packets.append(OscPacket(
                     f"{self.cam.osc_prefix}/active", sorted(cur)
-                )
+                ))
                 self.osc_count += 1
 
         # Fusion lost_sources: any tid that had a foot in projection_uv last
@@ -944,7 +1339,15 @@ class CamWorker:
         self._prune_pending_detections(now)
 
         self.fps_count += 1
-        return overlays, self.cam.regions, person_events, lost_sources
+        return CamStepResult(
+            overlays=overlays,
+            regions=self.cam.regions,
+            person_events=person_events,
+            lost_sources=lost_sources,
+            osc_packets=osc_packets,
+            speed_ms=speed_ms,
+            step_ms=(time.perf_counter() - step_started) * 1000.0,
+        )
 
 
 def _require_mapping(value: object, label: str) -> dict:
@@ -976,6 +1379,20 @@ def _optional_uv_rect(
     if value in (None, ""):
         return None
     return _require_uv_rect(value, label)
+
+
+def _optional_bool(value: object, default: bool, label: str) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+    raise ConfigError(f"{label} must be a boolean")
 
 
 def _optional_points(value: object, label: str) -> list[tuple[float, float]]:
@@ -1167,6 +1584,11 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
             "stair_catch_points",
             f"{label} {rid}",
         )
+        relaxed_presence_enabled = _optional_bool(
+            r.get("relaxed_presence_enabled"),
+            True,
+            f"{label} {rid}.relaxed_presence_enabled",
+        )
         relaxed_presence_uv = _optional_uv_rect(
             r.get("relaxed_presence_uv"),
             f"{label} {rid}.relaxed_presence_uv",
@@ -1208,7 +1630,7 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
             validate_dispatch(proj_uv, disp_uv)
             H = build_homography([tuple(p) for p in image_points], proj_uv)
             relaxed_presence_H = None
-            if relaxed_presence_uv is not None:
+            if relaxed_presence_enabled and relaxed_presence_uv is not None:
                 if not relaxed_presence_points:
                     raise ValueError(
                         "relaxed_presence_uv requires relaxed_presence_points"
@@ -1230,6 +1652,7 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
                 body_catch_points=body_catch_points,
                 body_catch_margin_uv=body_catch_margin_uv,
                 body_catch_min_confidence=body_catch_min_confidence,
+                relaxed_presence_enabled=relaxed_presence_enabled,
                 relaxed_presence_points=relaxed_presence_points,
                 relaxed_presence_uv=relaxed_presence_uv,
                 relaxed_presence_margin_uv=relaxed_presence_margin_uv,
@@ -1240,6 +1663,31 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
             )
         )
     return regions
+
+
+def _parse_body_catch_inference_crop(
+    camera_entry: dict,
+    label: str,
+) -> BodyCatchInferenceCropCfg:
+    raw = camera_entry.get("body_catch_inference_crop", False)
+    default_margin = camera_entry.get("body_catch_crop_margin_px", 96)
+    if isinstance(raw, dict):
+        enabled = _optional_bool(
+            raw.get("enabled"),
+            False,
+            f"{label}.body_catch_inference_crop.enabled",
+        )
+        margin_value = raw.get("margin_px", default_margin)
+    else:
+        enabled = _optional_bool(raw, False, f"{label}.body_catch_inference_crop")
+        margin_value = default_margin
+    try:
+        margin_px = max(int(margin_value), 0)
+    except (TypeError, ValueError) as ex:
+        raise ConfigError(
+            f"{label}.body_catch_inference_crop.margin_px must be an integer"
+        ) from ex
+    return BodyCatchInferenceCropCfg(enabled=enabled, margin_px=margin_px)
 
 
 def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg]:
@@ -1268,6 +1716,15 @@ def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg
                 url=url,
                 osc_prefix=entry.get("osc_prefix", f"/cam/{name}"),
                 regions=_parse_regions(entry, projections),
+                tracking_enabled=_optional_bool(
+                    entry.get("tracking_enabled"),
+                    True,
+                    f"{label}.tracking_enabled",
+                ),
+                body_catch_inference_crop=_parse_body_catch_inference_crop(
+                    entry,
+                    label,
+                ),
             )
         )
     return cams
@@ -1302,9 +1759,21 @@ def _parse_detection_filter(cfg: dict) -> DetectionFilterCfg:
     )
 
 
+def _parse_processing(cfg: dict) -> ProcessingCfg:
+    raw = cfg.get("processing", {}) or {}
+    raw = _require_mapping(raw, "processing")
+    return ProcessingCfg(
+        parallel=bool(raw.get("parallel", True)),
+        max_frame_age_s=max(float(raw.get("max_frame_age_s", 1.0)), 0.0),
+        result_queue_size=max(int(raw.get("result_queue_size", 4)), 1),
+    )
+
+
 def _validate_dispatch_overlaps(cams: list[CamCfg]) -> None:
     by_proj: dict[str, list[tuple[str, str, tuple[float, float, float, float]]]] = {}
     for cam in cams:
+        if not cam.tracking_enabled:
+            continue
         for reg in cam.regions:
             by_proj.setdefault(reg.projection_id, []).append(
                 (cam.name, reg.id, reg.dispatch_uv)
@@ -1323,50 +1792,6 @@ def _validate_dispatch_overlaps(cams: list[CamCfg]) -> None:
                         "Projection overlap is allowed for hand-off, but "
                         "dispatch_uv slices must only touch edges or be disjoint."
                     )
-
-
-def _derive_handoff_u_edges(cams: list[CamCfg]) -> dict[str, list[float]]:
-    edges: dict[str, set[float]] = {}
-    for cam in cams:
-        for reg in cam.regions:
-            u0, _v0, u1, _v1 = reg.dispatch_uv
-            for edge in (u0, u1):
-                if 0.0 < edge < 1.0:
-                    edges.setdefault(reg.projection_id, set()).add(round(edge, 6))
-    return {pid: sorted(values) for pid, values in edges.items() if values}
-
-
-def _parse_handoff_u_edges(raw: object, label: str) -> dict[str, list[float]]:
-    mapping = _require_mapping(raw, label)
-    out: dict[str, list[float]] = {}
-    for projection_id, values in mapping.items():
-        seq = _require_sequence(values, f"{label}.{projection_id}")
-        edges: set[float] = set()
-        for idx, value in enumerate(seq):
-            try:
-                edge = float(value)
-            except (TypeError, ValueError) as ex:
-                raise ConfigError(
-                    f"{label}.{projection_id}[{idx}] must be a number"
-                ) from ex
-            if not 0.0 < edge < 1.0:
-                raise ConfigError(
-                    f"{label}.{projection_id}[{idx}] must satisfy 0 < u < 1, got {edge}"
-                )
-            edges.add(round(edge, 6))
-        if edges:
-            out[str(projection_id)] = sorted(edges)
-    return out
-
-
-def _handoff_u_edges_from_cfg(
-    fusion_cfg: dict,
-    cams: list[CamCfg],
-) -> dict[str, list[float]]:
-    raw = fusion_cfg.get("hold_handoff_u_edges")
-    if raw is not None:
-        return _parse_handoff_u_edges(raw, "fusion.hold_handoff_u_edges")
-    return _derive_handoff_u_edges(cams)
 
 
 def load_cfg(path: Path) -> dict:
@@ -1394,6 +1819,8 @@ def _region_to_cfg(region: Region) -> dict:
         out["body_catch_margin_uv"] = float(region.body_catch_margin_uv)
         out["body_catch_min_confidence"] = float(region.body_catch_min_confidence)
     if region.relaxed_presence_points:
+        if not region.relaxed_presence_enabled:
+            out["relaxed_presence_enabled"] = False
         out["relaxed_presence_points"] = [
             [round(float(x), 1), round(float(y), 1)]
             for x, y in region.relaxed_presence_points
@@ -1480,7 +1907,7 @@ def _reload_runtime_calibration(
     config_path: Path,
     projections: dict[str, Projection],
     workers: list[CamWorker],
-) -> dict:
+) -> tuple[dict, list[tuple[str, int]]]:
     next_cfg = load_cfg(config_path)
     next_projections = _parse_projections(next_cfg)
     next_cams = _parse_cameras(next_cfg, next_projections)
@@ -1494,19 +1921,23 @@ def _reload_runtime_calibration(
             "live reload cannot remove active camera(s): " + ", ".join(sorted(missing))
         )
 
-    # Keep the original dict object alive because the viewer and workers hold
-    # references to it, but replace its projection contents atomically from the
-    # Python process point of view.
+    forced_lost_sources: list[tuple[str, int]] = []
+    for worker in workers:
+        next_cam = next_by_name[worker.cam.name]
+        forced_lost_sources.extend(
+            worker.update_runtime_calibration(
+                next_projections,
+                next_detection_filter,
+                next_cam.tracking_enabled,
+                next_cam.body_catch_inference_crop,
+                next_cam.regions,
+                preserve_tracking=True,
+            )
+        )
+    # Keep the original dict object alive for the main loop and viewer.
     projections.clear()
     projections.update(next_projections)
-    for worker in workers:
-        worker.projections = projections
-        worker.detection_filter = next_detection_filter
-        worker.update_regions(
-            next_by_name[worker.cam.name].regions,
-            preserve_tracking=True,
-        )
-    return next_cfg
+    return next_cfg, forced_lost_sources
 
 
 def _emit_person_osc(
@@ -1580,6 +2011,12 @@ def _emit_person_osc(
         include_count=True,
     )
     return sent
+
+
+def _emit_osc_packets(osc: SimpleUDPClient, packets: list[OscPacket]) -> int:
+    for packet in packets:
+        osc.send_message(packet.address, packet.args)
+    return len(packets)
 
 
 def _emit_person_level_osc(
@@ -1686,6 +2123,7 @@ def main() -> int:
         projections = _parse_projections(cfg)
         cams = _parse_cameras(cfg, projections)
         detection_filter = _parse_detection_filter(cfg)
+        processing = _parse_processing(cfg)
         _validate_dispatch_overlaps(cams)
     except (OSError, yaml.YAMLError, ConfigError) as ex:
         print(f"config error: {ex}", file=sys.stderr)
@@ -1716,11 +2154,6 @@ def main() -> int:
     fusion_cfg = cfg.get("fusion", {}) or {}
     miss_buffer_frames = max(int(fusion_cfg.get("miss_buffer_frames", 8)), 0)
     match_uv_radius = float(fusion_cfg.get("match_uv_radius", 0.05))
-    hold_handoff_margin_uv = max(
-        float(fusion_cfg.get("hold_handoff_margin_uv", match_uv_radius)),
-        0.0,
-    )
-    handoff_u_edges = _handoff_u_edges_from_cfg(fusion_cfg, cams)
     fusion_enabled = td_minimal or person_level or zone_level
     if fusion_enabled:
         person_tracker = PersonTracker(
@@ -1729,8 +2162,9 @@ def main() -> int:
             velocity_alpha=float(fusion_cfg.get("velocity_alpha", 0.3)),
             position_alpha=float(fusion_cfg.get("position_alpha", 0.45)),
             hold_boundary_margin_uv=float(fusion_cfg.get("hold_boundary_margin_uv", 0.08)),
-            hold_handoff_margin_uv=hold_handoff_margin_uv,
-            hold_handoff_u_edges=handoff_u_edges,
+            overlap_duplicate_radius_uv=float(
+                fusion_cfg.get("overlap_duplicate_radius_uv", 0.04)
+            ),
             max_update_jump_uv=float(fusion_cfg.get("max_update_jump_uv", 0.0)),
             relaxed_hold_s=float(fusion_cfg.get("relaxed_hold_s", 3.0)),
             reuse_lost_gids=bool(fusion_cfg.get("reuse_lost_gids", True)),
@@ -1742,8 +2176,7 @@ def main() -> int:
             f"velocity_alpha={person_tracker.velocity_alpha} "
             f"position_alpha={person_tracker.position_alpha} "
             f"hold_boundary_margin_uv={person_tracker.hold_boundary_margin_uv} "
-            f"hold_handoff_margin_uv={person_tracker.hold_handoff_margin_uv} "
-            f"hold_handoff_u_edges={person_tracker.hold_handoff_u_edges} "
+            f"overlap_duplicate_radius_uv={person_tracker.overlap_duplicate_radius_uv} "
             f"max_update_jump_uv={person_tracker.max_update_jump_uv} "
             f"relaxed_hold_s={person_tracker.relaxed_hold_s} "
             f"reuse_lost_gids={person_tracker.reuse_lost_gids} "
@@ -1774,6 +2207,22 @@ def main() -> int:
         f"relaxed_aspect={detection_filter.relaxed_min_aspect_h_over_w}..{detection_filter.relaxed_max_aspect_h_over_w} "
         f"confirm_hits={detection_filter.confirm_hits}/{detection_filter.confirm_window_s:.1f}s"
     )
+    print(
+        "processing: "
+        f"parallel={processing.parallel} "
+        f"max_frame_age_s={processing.max_frame_age_s:.2f} "
+        f"result_queue_size={processing.result_queue_size}"
+    )
+    crop_cams = [
+        f"{cam.name}(margin={cam.body_catch_inference_crop.margin_px}px)"
+        for cam in cams
+        if cam.body_catch_inference_crop.enabled
+    ]
+    if crop_cams:
+        print("body-catch inference crop: " + ", ".join(crop_cams))
+    disabled_cams = [cam.name for cam in cams if not cam.tracking_enabled]
+    if disabled_cams:
+        print("tracking disabled: " + ", ".join(disabled_cams))
 
     grabbers = [FrameGrabber(c) for c in cams]
     for g in grabbers:
@@ -1785,6 +2234,14 @@ def main() -> int:
                   detection_filter=detection_filter)
         for c in cams
     ]
+    camera_processors: list[CameraProcessor] = []
+    if processing.parallel:
+        camera_processors = [
+            CameraProcessor(g, w, imgsz, conf, iou, tracker, processing)
+            for g, w in zip(grabbers, workers)
+        ]
+        for processor in camera_processors:
+            processor.start()
 
     viewer = None
     if args.show:
@@ -1856,8 +2313,16 @@ def main() -> int:
     last_overlays: dict[str, list] = {c.name: [] for c in cams}
     last_fps_per_cam: dict[str, float] = {c.name: 0.0 for c in cams}
     last_osc_per_cam: dict[str, float] = {c.name: 0.0 for c in cams}
+    camera_stats: dict[str, CameraStatsWindow] = {
+        c.name: CameraStatsWindow() for c in cams
+    }
     last_fused_persons: list = []
     last_person_osc_mono = 0.0
+    heartbeat_count = 0
+    heartbeat_osc_messages = 0
+    main_processing_ms_sum = 0.0
+    main_processing_ms_count = 0
+    main_processing_ms_max = 0.0
     last_config_mtime_ns = _config_mtime_ns(config_path)
     last_config_reload_check = time.monotonic()
     mobile_preview_cfg = _mobile_preview_cfg_from_env()
@@ -1874,6 +2339,7 @@ def main() -> int:
 
     try:
         while not stop_flag.is_set():
+            loop_started = time.perf_counter()
             any_new = False
             frame_events: list[PersonEvent] = []
             frame_lost_sources: list[tuple[str, int]] = []
@@ -1888,19 +2354,12 @@ def main() -> int:
                     and current_mtime_ns != last_config_mtime_ns
                 ):
                     try:
-                        cfg = _reload_runtime_calibration(
+                        cfg, reload_lost_sources = _reload_runtime_calibration(
                             config_path,
                             projections,
                             workers,
                         )
-                        if person_tracker is not None:
-                            fusion_cfg = cfg.get("fusion", {}) or {}
-                            person_tracker.set_handoff_u_edges(
-                                _handoff_u_edges_from_cfg(
-                                    fusion_cfg,
-                                    [worker.cam for worker in workers],
-                                )
-                            )
+                        frame_lost_sources.extend(reload_lost_sources)
                         last_config_mtime_ns = current_mtime_ns
                         print(
                             "config: live calibration reload applied "
@@ -1916,31 +2375,83 @@ def main() -> int:
                             flush=True,
                         )
 
-            for grab, worker in zip(grabbers, workers):
-                frame, fidx, frame_ts = grab.get()
-                if frame is None or fidx == last_idx[grab.cam.name]:
-                    continue
-                last_idx[grab.cam.name] = fidx
-                any_new = True
-                overlays, _regions, events, lost_sources = worker.step(
-                    frame, imgsz, conf, iou, tracker, now_mono
-                )
-                last_frame[grab.cam.name] = frame
-                last_frame_ts[grab.cam.name] = frame_ts
-                last_overlays[grab.cam.name] = overlays
-                if mobile_preview is not None:
-                    mobile_preview.write(
-                        grab.cam.name,
-                        frame,
-                        overlays,
-                        last_fps_per_cam[grab.cam.name],
-                        last_osc_per_cam[grab.cam.name],
-                        grab.reconnects,
-                        time.time() - frame_ts if frame_ts else 999.0,
-                        now_mono,
+            if processing.parallel:
+                for processor in camera_processors:
+                    for result in processor.drain_results():
+                        result_updates_persons = (
+                            bool(result.step.person_events)
+                            or bool(result.step.lost_sources)
+                            or bool(result.step.osc_packets)
+                        )
+                        any_new = any_new or result_updates_persons
+                        emitted_raw = _emit_osc_packets(osc, result.step.osc_packets)
+                        camera_stats[result.cam_name].add_result(result, emitted_raw)
+                        last_frame[result.cam_name] = result.frame
+                        last_frame_ts[result.cam_name] = result.frame_ts
+                        last_overlays[result.cam_name] = result.step.overlays
+                        if mobile_preview is not None:
+                            grab = processor.grabber
+                            mobile_preview.write(
+                                result.cam_name,
+                                result.frame,
+                                result.step.overlays,
+                                last_fps_per_cam[result.cam_name],
+                                last_osc_per_cam[result.cam_name],
+                                grab.reconnects,
+                                time.time() - result.frame_ts if result.frame_ts else 999.0,
+                                now_mono,
+                            )
+                        frame_events.extend(result.step.person_events)
+                        frame_lost_sources.extend(result.step.lost_sources)
+            else:
+                for grab, worker in zip(grabbers, workers):
+                    frame, fidx, frame_ts = grab.get()
+                    if frame is None or fidx == last_idx[grab.cam.name]:
+                        continue
+                    previous_idx = last_idx[grab.cam.name]
+                    last_idx[grab.cam.name] = fidx
+                    frame_age_s = time.time() - frame_ts if frame_ts else 999.0
+                    if (
+                        processing.max_frame_age_s > 0
+                        and frame_age_s > processing.max_frame_age_s
+                    ):
+                        camera_stats[grab.cam.name].skipped_stale_frames += 1
+                        continue
+                    step = worker.step(frame, imgsz, conf, iou, tracker, now_mono)
+                    step_updates_persons = (
+                        bool(step.person_events)
+                        or bool(step.lost_sources)
+                        or bool(step.osc_packets)
                     )
-                frame_events.extend(events)
-                frame_lost_sources.extend(lost_sources)
+                    any_new = any_new or step_updates_persons
+                    result = CameraProcessResult(
+                        cam_name=grab.cam.name,
+                        frame=frame,
+                        frame_idx=fidx,
+                        frame_ts=frame_ts,
+                        processed_mono=now_mono,
+                        frame_age_s=frame_age_s,
+                        step=step,
+                        dropped_frames=max(0, fidx - previous_idx - 1) if previous_idx >= 0 else 0,
+                    )
+                    emitted_raw = _emit_osc_packets(osc, step.osc_packets)
+                    camera_stats[grab.cam.name].add_result(result, emitted_raw)
+                    last_frame[grab.cam.name] = frame
+                    last_frame_ts[grab.cam.name] = frame_ts
+                    last_overlays[grab.cam.name] = step.overlays
+                    if mobile_preview is not None:
+                        mobile_preview.write(
+                            grab.cam.name,
+                            frame,
+                            step.overlays,
+                            last_fps_per_cam[grab.cam.name],
+                            last_osc_per_cam[grab.cam.name],
+                            grab.reconnects,
+                            frame_age_s,
+                            now_mono,
+                        )
+                    frame_events.extend(step.person_events)
+                    frame_lost_sources.extend(step.lost_sources)
 
             should_heartbeat = (
                 person_tracker is not None
@@ -1983,7 +2494,9 @@ def main() -> int:
                 # OSC accounting goes onto the first worker so the printed
                 # rate still shows non-zero even when raw_per_cam is off.
                 if workers and emitted:
-                    workers[0].osc_count += emitted
+                    camera_stats[workers[0].cam.name].osc_messages += emitted
+                heartbeat_count += 1
+                heartbeat_osc_messages += emitted
 
             if viewer is not None:
                 from viewer import CamFrame, FusedPersonFrame, TrackOverlay  # type: ignore
@@ -2036,6 +2549,10 @@ def main() -> int:
                 if not viewer.render(cam_frames, fused_frames, stats):
                     break
 
+            loop_processing_ms = (time.perf_counter() - loop_started) * 1000.0
+            main_processing_ms_sum += loop_processing_ms
+            main_processing_ms_count += 1
+            main_processing_ms_max = max(main_processing_ms_max, loop_processing_ms)
             if not any_new and viewer is None:
                 time.sleep(0.005)
 
@@ -2045,11 +2562,17 @@ def main() -> int:
                 parts = []
                 camera_status = []
                 for w in workers:
-                    f = w.fps_count / dt
-                    o = w.osc_count / dt
+                    snapshot = camera_stats[w.cam.name].snapshot(dt)
+                    f = snapshot["fps"]
+                    o = snapshot["osc_rate"]
                     last_fps_per_cam[w.cam.name] = f
                     last_osc_per_cam[w.cam.name] = o
-                    parts.append(f"{w.cam.name}={f:.1f}fps osc={o:.0f}/s")
+                    timing_ms = snapshot["track_step_ms_avg"]
+                    parts.append(
+                        f"{w.cam.name}={f:.1f}fps osc={o:.0f}/s "
+                        f"track={timing_ms:.1f}ms" if timing_ms is not None
+                        else f"{w.cam.name}={f:.1f}fps osc={o:.0f}/s"
+                    )
                     frame_age = (
                         now - last_frame_ts[w.cam.name]
                         if last_frame_ts[w.cam.name] else None
@@ -2068,10 +2591,28 @@ def main() -> int:
                                 0,
                             ),
                             "frame_age_s": frame_age,
+                            "frame_age_s_avg": snapshot["frame_age_s_avg"],
+                            "frame_age_s_max": snapshot["frame_age_s_max"],
+                            "track_step_ms_avg": snapshot["track_step_ms_avg"],
+                            "track_step_ms_max": snapshot["track_step_ms_max"],
+                            "camera_timing_ms": snapshot["track_step_ms_avg"],
+                            "dropped_frames": snapshot["dropped_frames"],
+                            "dropped_results": snapshot["dropped_results"],
+                            "skipped_stale_frames": snapshot["skipped_stale_frames"],
+                            "yolo_speed_ms": snapshot["yolo_speed_ms"],
+                            "tracking_enabled": w.cam.tracking_enabled,
+                            "body_catch_inference_crop": (
+                                {
+                                    "enabled": w.cam.body_catch_inference_crop.enabled,
+                                    "margin_px": w.cam.body_catch_inference_crop.margin_px,
+                                    "rect": list(w._last_inference_crop_rect)
+                                    if w._last_inference_crop_rect is not None
+                                    else None,
+                                }
+                            ),
                         }
                     )
-                    w.fps_count = 0
-                    w.osc_count = 0
+                    camera_stats[w.cam.name] = CameraStatsWindow()
                 projection_status = []
                 for pid, projection in projections.items():
                     plist = [
@@ -2114,6 +2655,11 @@ def main() -> int:
                             "output_warp": bool(projection.output_warp_points),
                         }
                     )
+                processing_ms_avg = (
+                    main_processing_ms_sum / main_processing_ms_count
+                    if main_processing_ms_count
+                    else None
+                )
                 print("  ".join(parts))
                 print(
                     json.dumps(
@@ -2131,6 +2677,12 @@ def main() -> int:
                                     else None
                                 ),
                                 "heartbeat_interval_s": heartbeat_interval_s,
+                                "heartbeat_count": heartbeat_count,
+                                "heartbeat_osc_messages": heartbeat_osc_messages,
+                                "processing_ms": processing_ms_avg,
+                                "processing_ms_max": main_processing_ms_max,
+                                "processing_parallel": processing.parallel,
+                                "max_frame_age_s": processing.max_frame_age_s,
                                 "td_minimal": td_minimal,
                                 "person_level": person_level,
                             },
@@ -2138,8 +2690,15 @@ def main() -> int:
                         separators=(",", ":"),
                     )
                 )
+                heartbeat_count = 0
+                heartbeat_osc_messages = 0
+                main_processing_ms_sum = 0.0
+                main_processing_ms_count = 0
+                main_processing_ms_max = 0.0
                 last_fps = now
     finally:
+        for processor in camera_processors:
+            processor.stop()
         for g in grabbers:
             g.stop()
         if viewer is not None:

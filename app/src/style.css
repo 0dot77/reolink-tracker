@@ -1084,6 +1084,59 @@ textarea:focus {
   width: 188px;
 }
 
+.tracking-source-grid {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.tracking-source-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  color: var(--mute);
+  font: 11px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tracking-source-label b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+
+.camera-toggle {
+  display: inline-grid;
+  grid-template-columns: auto auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--ink-2);
+  font: 11px var(--mono);
+  padding: 6px 10px;
+}
+
+.camera-toggle b {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.camera-toggle.is-disabled {
+  border-color: rgba(150, 156, 170, 0.34);
+  background: rgba(150, 156, 170, 0.06);
+  color: var(--mute);
+}
+
+.camera-toggle.is-disabled b {
+  color: var(--mute);
+}
+
 .mode-guide {
   grid-column: 1 / -1;
   display: grid;
@@ -1112,6 +1165,17 @@ textarea:focus {
   color: var(--mute);
   font-family: var(--mono);
   font-size: 11px;
+}
+
+.fit-target-switch {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.fit-target-switch .btn.active {
+  border-color: var(--amber);
+  background: rgba(255, 138, 61, 0.14);
+  color: var(--amber);
 }
 
 .fit-controls label {
@@ -1241,6 +1305,10 @@ textarea:focus {
   outline-offset: -3px;
 }
 
+.dispatch.has-relaxed.disabled {
+  outline-color: rgba(150, 156, 170, 0.42);
+}
+
 .dispatch em {
   position: absolute;
   right: 8px;
@@ -1254,6 +1322,12 @@ textarea:focus {
   letter-spacing: 0.08em;
   padding: 2px 5px;
   text-transform: uppercase;
+}
+
+.dispatch em.disabled {
+  border-color: rgba(150, 156, 170, 0.34);
+  background: rgba(150, 156, 170, 0.08);
+  color: var(--mute);
 }
 
 .empty-projection {
@@ -1308,6 +1382,12 @@ textarea:focus {
   opacity: 1;
   outline: 2px solid rgba(255, 255, 255, 0.26);
   outline-offset: -2px;
+}
+
+.dispatch.tracking-off {
+  border-style: dotted;
+  filter: grayscale(0.65);
+  opacity: 0.38;
 }
 
 .workbench-canvas.mode-surface .dispatch,
@@ -1427,6 +1507,16 @@ textarea:focus {
 .wb-handle.region {
   border-color: #6ea8fe;
   box-shadow: 0 0 0 5px rgba(110, 168, 254, 0.1);
+}
+
+.workbench-canvas[data-fit-target="dispatch"] .workbench-svg.region polygon {
+  stroke: rgba(78, 205, 196, 0.92);
+  fill: rgba(78, 205, 196, 0.10);
+}
+
+.workbench-canvas[data-fit-target="dispatch"] .wb-handle.region {
+  border-color: rgba(78, 205, 196, 0.92);
+  box-shadow: 0 0 0 5px rgba(78, 205, 196, 0.10);
 }
 
 .wb-handle.warp {
@@ -1641,6 +1731,12 @@ textarea:focus {
   stroke: var(--red);
 }
 
+.calib-overlay .relaxed-poly.disabled {
+  fill: rgba(150, 156, 170, 0.06);
+  stroke: var(--mute);
+  stroke-dasharray: 6 7;
+}
+
 .calib-legend {
   position: absolute;
   left: 12px;
@@ -1674,6 +1770,10 @@ textarea:focus {
   color: var(--red);
 }
 
+.calib-legend .relaxed.disabled {
+  color: var(--mute);
+}
+
 .calib-toolbar {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1700,6 +1800,12 @@ textarea:focus {
   border-color: rgba(255, 71, 87, 0.55);
   background: rgba(255, 71, 87, 0.14);
   color: var(--red);
+}
+
+.tool-switch .btn.stair-off {
+  border-color: rgba(150, 156, 170, 0.36);
+  background: rgba(150, 156, 170, 0.08);
+  color: var(--mute);
 }
 
 .tool-switch .btn.active.body {
@@ -1741,6 +1847,26 @@ textarea:focus {
   text-transform: uppercase;
 }
 
+.mapping-grid .check-control {
+  display: inline-flex;
+  grid-column: 1 / -1;
+  justify-content: flex-start;
+  text-transform: none;
+}
+
+.mapping-grid .mapping-toggle {
+  border-color: rgba(255, 71, 87, 0.34);
+  background: rgba(255, 71, 87, 0.08);
+  color: var(--ink-2);
+}
+
+.mapping-grid .mapping-toggle.is-disabled,
+.mapping-grid .stair-field.is-disabled {
+  border-color: var(--line);
+  color: var(--mute);
+  opacity: 0.74;
+}
+
 .mapping-grid small {
   color: color-mix(in srgb, var(--mute) 78%, transparent);
   font-size: 9px;
@@ -1761,6 +1887,10 @@ textarea:focus {
 
 .mapping-grid .btn {
   align-self: end;
+}
+
+.is-muted {
+  color: var(--mute) !important;
 }
 
 .calib-toolbar .btn {
