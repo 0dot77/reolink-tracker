@@ -167,6 +167,41 @@ def record_live_clips(
     return results
 
 
+def recorded_clip_results(
+    cfg: dict[str, Any],
+    input_dir: Path,
+    fallback_fps: float,
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    for idx, cam in enumerate(cfg.get("cameras", [])):
+        name = cam.get("name", f"cam{idx}")
+        path = input_dir / f"{name}.mp4"
+        if not path.exists():
+            results[name] = {"ok": False, "error": "missing input clip", "path": str(path)}
+            continue
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            results[name] = {"ok": False, "error": "open failed", "path": str(path)}
+            continue
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or fallback_fps)
+        cap.release()
+        results[name] = {
+            "ok": frames > 0,
+            "path": str(path),
+            "width": width,
+            "height": height,
+            "writer_fps": fps,
+            "frames": frames,
+            "source": "input-dir",
+        }
+        if frames <= 0:
+            results[name]["error"] = "empty input clip"
+    return results
+
+
 def make_sim_config(
     base_cfg: dict[str, Any],
     record_results: dict[str, dict[str, Any]],
@@ -213,6 +248,7 @@ def parse_runtime(cfg: dict[str, Any]) -> tuple[dict[str, Any], PersonTracker, l
     projections = tr._parse_projections(cfg)
     cameras = tr._parse_cameras(cfg, projections)
     detection_filter = tr._parse_detection_filter(cfg)
+    clahe = tr._parse_clahe(cfg)
     tr._validate_dispatch_overlaps(cameras)
     fusion = cfg.get("fusion", {}) or {}
     person_tracker = PersonTracker(
@@ -220,9 +256,16 @@ def parse_runtime(cfg: dict[str, Any]) -> tuple[dict[str, Any], PersonTracker, l
         match_uv_radius=float(fusion.get("match_uv_radius", 0.05)),
         velocity_alpha=float(fusion.get("velocity_alpha", 0.3)),
         position_alpha=float(fusion.get("position_alpha", 0.45)),
+        velocity_max_dt_s=float(fusion.get("velocity_max_dt_s", 1.0)),
+        velocity_predict_max_dt_s=float(fusion.get("velocity_predict_max_dt_s", 1.0)),
         hold_boundary_margin_uv=float(fusion.get("hold_boundary_margin_uv", 0.08)),
+        overlap_duplicate_radius_uv=float(fusion.get("overlap_duplicate_radius_uv", 0.04)),
         max_update_jump_uv=float(fusion.get("max_update_jump_uv", 0.08)),
+        relaxed_hold_s=float(fusion.get("relaxed_hold_s", 0.0)),
         reuse_lost_gids=bool(fusion.get("reuse_lost_gids", True)),
+        aux_match_uv_radius=float(fusion.get("aux_match_uv_radius", 0.08)),
+        aux_match_time_window_s=float(fusion.get("aux_match_time_window_s", 0.5)),
+        aux_position_alpha=float(fusion.get("aux_position_alpha", 0.25)),
     )
     workers = [
         tr.CamWorker(
@@ -235,6 +278,7 @@ def parse_runtime(cfg: dict[str, Any]) -> tuple[dict[str, Any], PersonTracker, l
             raw_per_cam=False,
             miss_buffer_frames=max(int(fusion.get("miss_buffer_frames", 8)), 0),
             detection_filter=detection_filter,
+            clahe=clahe,
         )
         for cam in cameras
     ]
@@ -262,7 +306,8 @@ def draw_camera(frame: np.ndarray, worker: tr.CamWorker, overlays: list, cam_idx
         color = (0, 230, 255) if hits else (150, 150, 150)
         cv2.rectangle(panel, p0, p1, color, 2, cv2.LINE_AA)
         cv2.putText(panel, f"{tid}:{conf:.2f}", (p0[0], max(14, p0[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
-    cv2.putText(panel, worker.cam.name, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    label = f"{worker.cam.name} {worker.cam.role}"
+    cv2.putText(panel, label, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
     return panel
 
 
@@ -356,6 +401,7 @@ def draw_usage_panel(
         f"projection usage simulation frame={frame_idx}",
         f"active={len(persons)} fresh={sum(1 for p in persons if p.state == 'fresh')} used_cells={used}/{GRID_W * GRID_H} ({used / (GRID_W * GRID_H) * 100:.1f}%)",
         f"sources {source_sample_text(workers, metrics)} center_overlap_samples={metrics['center_overlap_samples']}",
+        f"events {source_sample_text(workers, {'source_samples': metrics['event_samples']})} aux={metrics['auxiliary_event_samples']}",
     ]
     y = 28
     for line in lines:
@@ -380,15 +426,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             flush=True,
         )
     base_cfg = yaml.safe_load(config_path.read_text())
+    input_dir = Path(args.input_dir).expanduser() if args.input_dir else None
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    out_dir = Path(args.out_root) / f"live-{stamp}-20s-usage"
+    out_prefix = "replay" if input_dir else "live"
+    out_dir = Path(args.out_root) / f"{out_prefix}-{stamp}-20s-usage"
     out_dir.mkdir(parents=True, exist_ok=True)
     output_video = out_dir / "all-cameras-20s-projection-usage.mp4"
     summary_path = out_dir / "summary.json"
     sim_config_path = out_dir / "sim-config.yaml"
 
-    print(json.dumps({"status": "recording", "out_dir": str(out_dir)}, ensure_ascii=False), flush=True)
-    record_results = record_live_clips(base_cfg, out_dir, args.seconds, args.fps)
+    if input_dir:
+        print(
+            json.dumps(
+                {"status": "using-input-dir", "input_dir": str(input_dir), "out_dir": str(out_dir)},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        record_results = recorded_clip_results(base_cfg, input_dir, args.fps)
+    else:
+        print(json.dumps({"status": "recording", "out_dir": str(out_dir)}, ensure_ascii=False), flush=True)
+        record_results = record_live_clips(base_cfg, out_dir, args.seconds, args.fps)
     if len(record_results) < 1 or not all(item.get("ok") for item in record_results.values()):
         raise RuntimeError(json.dumps(record_results, ensure_ascii=False, indent=2))
     print(json.dumps({"status": "processing", "record_results": record_results}, ensure_ascii=False), flush=True)
@@ -414,6 +472,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "fresh_samples": 0,
         "center_overlap_samples": 0,
         "source_samples": {},
+        "event_samples": {},
+        "auxiliary_event_samples": 0,
+        "auxiliary_center_event_samples": 0,
+        "primary_event_samples": 0,
     }
     preview_frames: list[str] = []
     start = time.time()
@@ -441,6 +503,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 frame_idx / source_fps,
             )
             overlays, _regions, events, lost_sources = step.legacy_tuple()
+            for ev in events:
+                metrics["event_samples"][ev.cam_name] = metrics["event_samples"].get(ev.cam_name, 0) + 1
+                if getattr(ev, "auxiliary", False):
+                    metrics["auxiliary_event_samples"] += 1
+                    if 0.44 <= ev.u <= 0.56:
+                        metrics["auxiliary_center_event_samples"] += 1
+                else:
+                    metrics["primary_event_samples"] += 1
             frame_events.extend(events)
             frame_lost.extend(lost_sources)
             cam_panels.append(draw_camera(frame, worker, overlays, ci))
@@ -480,6 +550,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "requested_config": str(requested_config.resolve(strict=False)),
         "sim_config": str(sim_config_path),
         "record_results": record_results,
+        "input_dir": str(input_dir) if input_dir else None,
         "output_video": str(output_video),
         "preview_frames": preview_frames,
         "processed_frames": processed_frames,
@@ -517,6 +588,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "mean_v": float(np.mean(vs)) if vs else None,
         },
         "source_samples": metrics["source_samples"],
+        "event_samples": metrics["event_samples"],
+        "primary_event_samples": metrics["primary_event_samples"],
+        "auxiliary_event_samples": metrics["auxiliary_event_samples"],
+        "auxiliary_center_event_samples": metrics["auxiliary_center_event_samples"],
         "spawned_gids": person_tracker.spawned_count,
         "handoff_count": person_tracker.handoff_count,
         "teleport_reject_count": person_tracker.teleport_reject_count,
@@ -535,7 +610,11 @@ def main() -> int:
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--imgsz", type=int, default=None)
     parser.add_argument("--conf", type=float, default=None)
-    parser.add_argument("--out-root", default="/private/tmp/reolink-video-sim")
+    parser.add_argument(
+        "--out-root",
+        default=str(Path.home() / "Desktop" / "vom-reolink-videosim"),
+    )
+    parser.add_argument("--input-dir", default=None, help="Reuse existing cam<N>.mp4 clips instead of recording live RTSP.")
     args = parser.parse_args()
     run(args)
     return 0

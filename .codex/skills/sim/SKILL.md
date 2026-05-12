@@ -1,6 +1,6 @@
 ---
 name: sim
-description: Project-local Reolink tracker simulation workflow for this repository. Use when the user asks to run "sim", make a live multi-camera 20-second projection usage simulation, compare tracking coverage, or generate the same 1280x600 projection heatmap video format under /private/tmp/reolink-video-sim.
+description: Project-local Reolink tracker simulation workflow for this repository. Use when the user asks to run "sim", make a live multi-camera 20-second projection usage simulation, compare tracking coverage, or generate the same 1280x600 projection heatmap video format under ~/Desktop/vom-reolink-videosim.
 ---
 
 # Reolink Projection Simulation
@@ -22,7 +22,7 @@ Use this skill only in `/Users/taeyang/Developer/tools/reolink-tracker`.
 4. The script records every configured camera for 20 seconds, writes temporary `<camera>.mp4` files, then processes exactly 400 frames at 20 fps into the reference-style video:
 
 ```text
-/private/tmp/reolink-video-sim/live-YYYYMMDD-HHMMSS-20s-usage/
+~/Desktop/vom-reolink-videosim/live-YYYYMMDD-HHMMSS-20s-usage/
   cam0.mp4
   cam2.mp4
   cam1.mp4
@@ -34,11 +34,17 @@ Use this skill only in `/Users/taeyang/Developer/tools/reolink-tracker`.
   all-cameras-20s-projection-usage.mp4
 ```
 
-5. Open the output folder or video when the user asks to see it:
+5. To replay an existing recorded simulation folder with the current tracker/config logic, pass:
 
 ```bash
-open /private/tmp/reolink-video-sim/live-YYYYMMDD-HHMMSS-20s-usage
-open /private/tmp/reolink-video-sim/live-YYYYMMDD-HHMMSS-20s-usage/all-cameras-20s-projection-usage.mp4
+./.venv/bin/python .codex/skills/sim/scripts/live_projection_usage.py --config config.yaml --input-dir ~/Desktop/vom-reolink-videosim/live-YYYYMMDD-HHMMSS-20s-usage
+```
+
+6. Open the output folder or video when the user asks to see it:
+
+```bash
+open ~/Desktop/vom-reolink-videosim/live-YYYYMMDD-HHMMSS-20s-usage
+open ~/Desktop/vom-reolink-videosim/live-YYYYMMDD-HHMMSS-20s-usage/all-cameras-20s-projection-usage.mp4
 ```
 
 ## Output Contract

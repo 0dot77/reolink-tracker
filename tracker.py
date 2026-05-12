@@ -308,12 +308,22 @@ class BodyCatchInferenceCropCfg:
 
 
 @dataclass
+class ClaheCfg:
+    enabled: bool = False
+    clip_limit: float = 2.0
+    tile_grid: tuple[int, int] = (8, 8)
+    cameras: set[str] = field(default_factory=set)
+
+
+@dataclass
 class CamCfg:
     name: str
     url: str
     osc_prefix: str
     regions: list[Region] = field(default_factory=list)
     tracking_enabled: bool = True
+    role: str = "primary"
+    conf: Optional[float] = None
     body_catch_inference_crop: BodyCatchInferenceCropCfg = field(
         default_factory=BodyCatchInferenceCropCfg
     )
@@ -343,6 +353,7 @@ class DetectionFilterCfg:
     projection_inner_margin_uv: float = 0.0
     confirm_hits: int = 3
     confirm_window_s: float = 0.8
+    auxiliary_confirm_hits: int = 1
     relaxed_min_confidence: float = 0.12
     relaxed_min_bbox_height_px: float = 24.0
     relaxed_min_bbox_area_px: float = 500.0
@@ -793,6 +804,7 @@ class CamWorker:
         raw_per_cam: bool = True,
         miss_buffer_frames: int = 8,
         detection_filter: Optional[DetectionFilterCfg] = None,
+        clahe: Optional[ClaheCfg] = None,
     ):
         self.cam = cam
         self.osc = osc
@@ -803,6 +815,9 @@ class CamWorker:
         self.legacy_image_space = legacy_image_space
         self.raw_per_cam = raw_per_cam
         self.detection_filter = detection_filter or DetectionFilterCfg()
+        self.clahe = clahe or ClaheCfg()
+        self._clahe_filter: Optional[cv2.CLAHE] = None
+        self._clahe_params: Optional[tuple[float, tuple[int, int]]] = None
         # last_ids per region_id; legacy uses the empty-string key.
         self.last_ids: dict[str, set[int]] = {r.id: set() for r in cam.regions}
         self.last_ids[""] = set()  # legacy bucket
@@ -838,7 +853,10 @@ class CamWorker:
         self,
         projections: dict[str, Projection],
         detection_filter: DetectionFilterCfg,
+        clahe: ClaheCfg,
         tracking_enabled: bool,
+        role: str,
+        conf: Optional[float],
         body_catch_inference_crop: BodyCatchInferenceCropCfg,
         regions: list[Region],
         preserve_tracking: bool = False,
@@ -847,6 +865,10 @@ class CamWorker:
             forced_lost_sources: list[tuple[str, int]] = []
             self.projections = projections
             self.detection_filter = detection_filter
+            if self.clahe != clahe:
+                self.clahe = clahe
+                self._clahe_filter = None
+                self._clahe_params = None
             if self.cam.tracking_enabled != tracking_enabled:
                 if self.cam.tracking_enabled and not tracking_enabled:
                     forced_lost_sources = [
@@ -855,6 +877,16 @@ class CamWorker:
                 self.cam.tracking_enabled = tracking_enabled
                 preserve_tracking = False
                 self._last_inference_crop_rect = None
+            if self.cam.role != role:
+                if self.cam.role == "primary" and role == "auxiliary":
+                    forced_lost_sources = [
+                        (self.cam.name, tid) for tid in sorted(self.last_projection_tids)
+                    ]
+                self.cam.role = role
+                preserve_tracking = False
+            if self.cam.conf != conf:
+                self.cam.conf = conf
+                preserve_tracking = False
             if self.cam.body_catch_inference_crop != body_catch_inference_crop:
                 self.cam.body_catch_inference_crop = body_catch_inference_crop
                 preserve_tracking = False
@@ -866,6 +898,25 @@ class CamWorker:
         if self.model is None:
             self.model = YOLO(self.model_path)
         return self.model
+
+    def _apply_preprocessing(self, frame: np.ndarray) -> np.ndarray:
+        cfg = self.clahe
+        if not cfg.enabled:
+            return frame
+        if cfg.cameras and self.cam.name not in cfg.cameras:
+            return frame
+        params = (cfg.clip_limit, cfg.tile_grid)
+        if self._clahe_filter is None or self._clahe_params != params:
+            self._clahe_filter = cv2.createCLAHE(
+                clipLimit=cfg.clip_limit,
+                tileGridSize=cfg.tile_grid,
+            )
+            self._clahe_params = params
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l_chan, a_chan, b_chan = cv2.split(lab)
+        enhanced_l = self._clahe_filter.apply(l_chan)
+        enhanced = cv2.merge((enhanced_l, a_chan, b_chan))
+        return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
     def _update_regions_unlocked(
         self,
@@ -951,9 +1002,15 @@ class CamWorker:
             and lo_v + margin <= v <= hi_v - margin
         )
 
-    def _is_confirmed_detection(self, tid: int, now: float) -> bool:
+    def _is_confirmed_detection(
+        self,
+        tid: int,
+        now: float,
+        confirm_hits: Optional[int] = None,
+    ) -> bool:
         cfg = self.detection_filter
-        if not cfg.enabled or cfg.confirm_hits <= 1:
+        required_hits = max(int(confirm_hits if confirm_hits is not None else cfg.confirm_hits), 1)
+        if not cfg.enabled or required_hits <= 1:
             self._confirmed_tids.add(tid)
             return True
         if tid in self._confirmed_tids:
@@ -964,7 +1021,7 @@ class CamWorker:
             return False
         pending.hits += 1
         pending.last_t = now
-        if pending.hits >= cfg.confirm_hits:
+        if pending.hits >= required_hits:
             self._confirmed_tids.add(tid)
             self._pending_detections.pop(tid, None)
             return True
@@ -1109,11 +1166,14 @@ class CamWorker:
                 speed_ms={},
                 step_ms=(time.perf_counter() - step_started) * 1000.0,
             )
+        is_auxiliary = self.cam.role == "auxiliary"
         inference_frame, inference_offset = self._select_inference_frame(frame)
+        inference_frame = self._apply_preprocessing(inference_frame)
+        inference_conf = self.cam.conf if self.cam.conf is not None else conf
         results = self._ensure_model().track(
             inference_frame,
             imgsz=imgsz,
-            conf=conf,
+            conf=inference_conf,
             iou=iou,
             classes=[PERSON_CLASS_ID],
             persist=True,
@@ -1140,6 +1200,7 @@ class CamWorker:
             reg.relaxed_presence_enabled and reg.relaxed_presence_points
             for reg in self.cam.regions
         )
+        has_body_catch_regions = any(reg.body_catch_points for reg in self.cam.regions)
 
         if r.boxes is not None and r.boxes.id is not None:
             ids = r.boxes.id.cpu().numpy().astype(int)
@@ -1152,9 +1213,22 @@ class CamWorker:
 
             for tid, box, c in zip(ids, xyxy, confs):
                 accepted, _reason = self._classify_detection(box, float(c))
-                if not accepted and _reason != "low-conf" and not has_relaxed_regions:
+                if (
+                    not accepted
+                    and _reason != "low-conf"
+                    and not (_reason == "too-small" and has_body_catch_regions)
+                    and not has_relaxed_regions
+                ):
                     continue
-                if not self._is_confirmed_detection(int(tid), now):
+                if not self._is_confirmed_detection(
+                    int(tid),
+                    now,
+                    confirm_hits=(
+                        self.detection_filter.auxiliary_confirm_hits
+                        if is_auxiliary
+                        else None
+                    ),
+                ):
                     continue
                 x1, y1, x2, y2 = (float(v) for v in box)
                 bbox_h = y2 - y1
@@ -1212,7 +1286,7 @@ class CamWorker:
                     if not accepted and not caught and not relaxed:
                         continue
                     in_projection = True
-                    in_dispatch = (
+                    in_dispatch = False if is_auxiliary else (
                         _is_inside_expanded_u((u, v), reg.dispatch_uv)
                         if relaxed
                         else is_inside_uv((u, v), reg.dispatch_uv)
@@ -1239,6 +1313,7 @@ class CamWorker:
                             (u, v),
                             reg.dispatch_uv,
                         ),
+                        auxiliary=is_auxiliary,
                     ))
                     if in_dispatch:
                         if self.raw_per_cam:
@@ -1319,22 +1394,25 @@ class CamWorker:
         # A miss buffer absorbs short YOLO/BoT-SORT detection drops: a tid
         # only counts as lost after `miss_buffer_frames` consecutive absent
         # frames. If it returns before that, the counter resets silently.
-        for tid in projection_tids:
-            self._tid_miss.pop(tid, None)
-        for tid in self.last_projection_tids - projection_tids:
-            self._tid_miss[tid] = 1
-        for tid in list(self._tid_miss.keys()):
-            if tid in projection_tids or tid in self.last_projection_tids:
-                continue
-            self._tid_miss[tid] += 1
-        threshold = max(self.miss_buffer_frames, 1)
         lost_sources: list[tuple[str, int]] = []
-        for tid in list(self._tid_miss.keys()):
-            if self._tid_miss[tid] >= threshold:
-                lost_sources.append((self.cam.name, tid))
-                del self._tid_miss[tid]
-                self._confirmed_tids.discard(tid)
-                self._pending_detections.pop(tid, None)
+        if is_auxiliary:
+            self._tid_miss.clear()
+        else:
+            for tid in projection_tids:
+                self._tid_miss.pop(tid, None)
+            for tid in self.last_projection_tids - projection_tids:
+                self._tid_miss[tid] = 1
+            for tid in list(self._tid_miss.keys()):
+                if tid in projection_tids or tid in self.last_projection_tids:
+                    continue
+                self._tid_miss[tid] += 1
+            threshold = max(self.miss_buffer_frames, 1)
+            for tid in list(self._tid_miss.keys()):
+                if self._tid_miss[tid] >= threshold:
+                    lost_sources.append((self.cam.name, tid))
+                    del self._tid_miss[tid]
+                    self._confirmed_tids.discard(tid)
+                    self._pending_detections.pop(tid, None)
         self.last_projection_tids = projection_tids
         self._prune_pending_detections(now)
 
@@ -1393,6 +1471,18 @@ def _optional_bool(value: object, default: bool, label: str) -> bool:
         if normalized in {"false", "no", "off", "0"}:
             return False
     raise ConfigError(f"{label} must be a boolean")
+
+
+def _optional_nonnegative_float(value: object, label: str) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as ex:
+        raise ConfigError(f"{label} must be numeric") from ex
+    if parsed < 0.0:
+        raise ConfigError(f"{label} must be >= 0")
+    return parsed
 
 
 def _optional_points(value: object, label: str) -> list[tuple[float, float]]:
@@ -1569,7 +1659,7 @@ def _parse_regions(cam_entry: dict, projections: dict[str, Projection]) -> list[
         if "image_points" not in r:
             raise ConfigError(f"{label} {rid} is missing required field 'image_points'")
         proj_uv = _require_uv_rect(r["projection_uv"], f"{label} {rid}.projection_uv")
-        if "dispatch_uv" in r:
+        if "dispatch_uv" in r and r.get("dispatch_uv") not in (None, []):
             disp_uv = _require_uv_rect(r["dispatch_uv"], f"{label} {rid}.dispatch_uv")
         else:
             disp_uv = proj_uv
@@ -1690,6 +1780,13 @@ def _parse_body_catch_inference_crop(
     return BodyCatchInferenceCropCfg(enabled=enabled, margin_px=margin_px)
 
 
+def _parse_camera_role(camera_entry: dict, label: str) -> str:
+    role = str(camera_entry.get("role", "primary")).strip().lower()
+    if role not in {"primary", "auxiliary"}:
+        raise ConfigError(f"{label}.role must be 'primary' or 'auxiliary', got {role!r}")
+    return role
+
+
 def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg]:
     if "cameras" not in cfg:
         raise ConfigError("config is missing required top-level 'cameras' list")
@@ -1710,6 +1807,7 @@ def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg
             _require_field(entry, "url", label),
             f"camera {name}",
         )
+        role = _parse_camera_role(entry, label)
         cams.append(
             CamCfg(
                 name=name,
@@ -1721,6 +1819,8 @@ def _parse_cameras(cfg: dict, projections: dict[str, Projection]) -> list[CamCfg
                     True,
                     f"{label}.tracking_enabled",
                 ),
+                role=role,
+                conf=_optional_nonnegative_float(entry.get("conf"), f"{label}.conf"),
                 body_catch_inference_crop=_parse_body_catch_inference_crop(
                     entry,
                     label,
@@ -1744,6 +1844,7 @@ def _parse_detection_filter(cfg: dict) -> DetectionFilterCfg:
         projection_inner_margin_uv=float(raw.get("projection_inner_margin_uv", 0.0)),
         confirm_hits=max(int(raw.get("confirm_hits", 3)), 1),
         confirm_window_s=max(float(raw.get("confirm_window_s", 0.8)), 0.0),
+        auxiliary_confirm_hits=max(int(raw.get("auxiliary_confirm_hits", 1)), 1),
         relaxed_min_confidence=float(raw.get("relaxed_min_confidence", 0.12)),
         relaxed_min_bbox_height_px=float(raw.get("relaxed_min_bbox_height_px", 24.0)),
         relaxed_min_bbox_area_px=float(raw.get("relaxed_min_bbox_area_px", 500.0)),
@@ -1756,6 +1857,35 @@ def _parse_detection_filter(cfg: dict) -> DetectionFilterCfg:
         relaxed_max_width_over_height=float(
             raw.get("relaxed_max_width_over_height", 2.4)
         ),
+    )
+
+
+def _parse_clahe(cfg: dict) -> ClaheCfg:
+    raw_preprocessing = _require_mapping(cfg.get("preprocessing", {}) or {}, "preprocessing")
+    raw = raw_preprocessing.get("clahe", {}) or {}
+    if isinstance(raw, bool):
+        return ClaheCfg(enabled=raw)
+    raw = _require_mapping(raw, "preprocessing.clahe")
+    tile_items = _require_sequence(raw.get("tile_grid", [8, 8]), "preprocessing.clahe.tile_grid")
+    if len(tile_items) != 2:
+        raise ConfigError("preprocessing.clahe.tile_grid must contain exactly two values")
+    try:
+        tile_grid = (max(int(tile_items[0]), 1), max(int(tile_items[1]), 1))
+    except (TypeError, ValueError) as ex:
+        raise ConfigError("preprocessing.clahe.tile_grid must contain integers") from ex
+    cameras_raw = raw.get("cameras", [])
+    if cameras_raw in (None, ""):
+        cameras: set[str] = set()
+    else:
+        cameras = {
+            str(item)
+            for item in _require_sequence(cameras_raw, "preprocessing.clahe.cameras")
+        }
+    return ClaheCfg(
+        enabled=_optional_bool(raw.get("enabled"), False, "preprocessing.clahe.enabled"),
+        clip_limit=max(float(raw.get("clip_limit", 2.0)), 0.01),
+        tile_grid=tile_grid,
+        cameras=cameras,
     )
 
 
@@ -1772,7 +1902,7 @@ def _parse_processing(cfg: dict) -> ProcessingCfg:
 def _validate_dispatch_overlaps(cams: list[CamCfg]) -> None:
     by_proj: dict[str, list[tuple[str, str, tuple[float, float, float, float]]]] = {}
     for cam in cams:
-        if not cam.tracking_enabled:
+        if not cam.tracking_enabled or cam.role == "auxiliary":
             continue
         for reg in cam.regions:
             by_proj.setdefault(reg.projection_id, []).append(
@@ -1912,6 +2042,7 @@ def _reload_runtime_calibration(
     next_projections = _parse_projections(next_cfg)
     next_cams = _parse_cameras(next_cfg, next_projections)
     next_detection_filter = _parse_detection_filter(next_cfg)
+    next_clahe = _parse_clahe(next_cfg)
     _validate_dispatch_overlaps(next_cams)
 
     next_by_name = {cam.name: cam for cam in next_cams}
@@ -1928,7 +2059,10 @@ def _reload_runtime_calibration(
             worker.update_runtime_calibration(
                 next_projections,
                 next_detection_filter,
+                next_clahe,
                 next_cam.tracking_enabled,
+                next_cam.role,
+                next_cam.conf,
                 next_cam.body_catch_inference_crop,
                 next_cam.regions,
                 preserve_tracking=True,
@@ -2123,6 +2257,7 @@ def main() -> int:
         projections = _parse_projections(cfg)
         cams = _parse_cameras(cfg, projections)
         detection_filter = _parse_detection_filter(cfg)
+        clahe = _parse_clahe(cfg)
         processing = _parse_processing(cfg)
         _validate_dispatch_overlaps(cams)
     except (OSError, yaml.YAMLError, ConfigError) as ex:
@@ -2168,6 +2303,11 @@ def main() -> int:
             max_update_jump_uv=float(fusion_cfg.get("max_update_jump_uv", 0.0)),
             relaxed_hold_s=float(fusion_cfg.get("relaxed_hold_s", 3.0)),
             reuse_lost_gids=bool(fusion_cfg.get("reuse_lost_gids", True)),
+            aux_match_uv_radius=float(fusion_cfg.get("aux_match_uv_radius", 0.08)),
+            aux_match_time_window_s=float(
+                fusion_cfg.get("aux_match_time_window_s", 0.5)
+            ),
+            aux_position_alpha=float(fusion_cfg.get("aux_position_alpha", 0.25)),
         )
         zone_tracker = InteractionZoneTracker()
         print(
@@ -2180,6 +2320,9 @@ def main() -> int:
             f"max_update_jump_uv={person_tracker.max_update_jump_uv} "
             f"relaxed_hold_s={person_tracker.relaxed_hold_s} "
             f"reuse_lost_gids={person_tracker.reuse_lost_gids} "
+            f"aux_match_uv_radius={person_tracker.aux_match_uv_radius} "
+            f"aux_match_time_window_s={person_tracker.aux_match_time_window_s} "
+            f"aux_position_alpha={person_tracker.aux_position_alpha} "
             f"miss_buffer_frames={miss_buffer_frames}"
         )
     else:
@@ -2205,7 +2348,15 @@ def main() -> int:
         f"aspect={detection_filter.min_aspect_h_over_w}..{detection_filter.max_aspect_h_over_w} "
         f"relaxed_conf={detection_filter.relaxed_min_confidence} "
         f"relaxed_aspect={detection_filter.relaxed_min_aspect_h_over_w}..{detection_filter.relaxed_max_aspect_h_over_w} "
-        f"confirm_hits={detection_filter.confirm_hits}/{detection_filter.confirm_window_s:.1f}s"
+        f"confirm_hits={detection_filter.confirm_hits}/{detection_filter.confirm_window_s:.1f}s "
+        f"aux_confirm_hits={detection_filter.auxiliary_confirm_hits}"
+    )
+    print(
+        "preprocessing.clahe: "
+        f"enabled={clahe.enabled} "
+        f"clip_limit={clahe.clip_limit} "
+        f"tile_grid={clahe.tile_grid[0]}x{clahe.tile_grid[1]} "
+        f"cameras={','.join(sorted(clahe.cameras)) if clahe.cameras else 'all'}"
     )
     print(
         "processing: "
@@ -2223,6 +2374,11 @@ def main() -> int:
     disabled_cams = [cam.name for cam in cams if not cam.tracking_enabled]
     if disabled_cams:
         print("tracking disabled: " + ", ".join(disabled_cams))
+    auxiliary_cams = [
+        cam.name for cam in cams if cam.tracking_enabled and cam.role == "auxiliary"
+    ]
+    if auxiliary_cams:
+        print("tracking auxiliary: " + ", ".join(auxiliary_cams))
 
     grabbers = [FrameGrabber(c) for c in cams]
     for g in grabbers:
@@ -2231,7 +2387,7 @@ def main() -> int:
     workers = [
         CamWorker(c, model_path, device, osc, projections, legacy_image_space,
                   raw_per_cam=raw_per_cam, miss_buffer_frames=miss_buffer_frames,
-                  detection_filter=detection_filter)
+                  detection_filter=detection_filter, clahe=clahe)
         for c in cams
     ]
     camera_processors: list[CameraProcessor] = []
@@ -2601,6 +2757,8 @@ def main() -> int:
                             "skipped_stale_frames": snapshot["skipped_stale_frames"],
                             "yolo_speed_ms": snapshot["yolo_speed_ms"],
                             "tracking_enabled": w.cam.tracking_enabled,
+                            "role": w.cam.role,
+                            "conf": w.cam.conf if w.cam.conf is not None else conf,
                             "body_catch_inference_crop": (
                                 {
                                     "enabled": w.cam.body_catch_inference_crop.enabled,

@@ -23,7 +23,11 @@ cp config.example.yaml config.yaml
 
 그 다음 `config.yaml`에 실제 카메라 URL, 비밀번호, 모델, OSC 대상 주소를 입력합니다. 카메라 IP는 공간과 네트워크 구성마다 달라질 수 있으므로 현장에서 확인한 값을 넣습니다. `config.yaml`에는 RTSP 인증 정보가 들어갈 수 있으므로 git에 커밋하지 않습니다.
 
-첫 실행 시 `yolo26n.pt`가 작업 폴더에 다운로드됩니다. YOLO26은 Ultralytics가 2026-01-14에 공개한 모델로, NMS 없는 end-to-end inference, CPU 기준 약 43% 속도 향상, 긴 복도 끝의 작은 사람 감지에 도움이 되는 small-target STAL head가 특징입니다.
+첫 실행 시 설정된 YOLO weight가 작업 폴더에 다운로드됩니다. 현장 기본 후보는
+`yolo26s.pt`이며, 더 가벼운 테스트가 필요할 때만 `yolo26n.pt`로 내립니다.
+YOLO26은 Ultralytics가 2026-01-14에 공개한 모델로, NMS 없는 end-to-end inference,
+CPU 기준 약 43% 속도 향상, 긴 복도 끝의 작은 사람 감지에 도움이 되는 small-target
+STAL head가 특징입니다.
 
 ## 실행
 
@@ -252,8 +256,10 @@ projections:
 가방, 그림자, ROI 경계부, 한 프레임짜리 검출이 OSC identity를 만들지 않도록
 confidence, bbox 크기, bbox 비율을 검사하고 `confirm_hits`만큼 반복 검출된 뒤에만
 person/fusion 이벤트로 넘깁니다.
-야간처럼 confidence가 낮게 나오는 현장에서는 상단 YOLO `conf`를 `0.22` 안팎으로 낮추고,
+야간처럼 confidence가 낮게 나오는 현장에서는 상단 YOLO `conf`를 `0.16` 안팎으로 낮추고,
 `detection_filter.min_confidence`로 actor 승격 기준을 잡는 편이 더 안정적입니다.
+cam2처럼 `role: auxiliary`인 카메라는 새 actor를 만들지 않으므로 카메라별 `conf`와
+`auxiliary_confirm_hits`를 더 낮게 잡아 약한 sighting 후보를 먼저 살릴 수 있습니다.
 
 ```yaml
 detection_filter:
@@ -273,12 +279,24 @@ detection_filter:
   relaxed_max_width_over_height: 2.4
   confirm_hits: 2
   confirm_window_s: 0.35
+  auxiliary_confirm_hits: 1
 ```
 
 값을 강하게 잡을수록 오검출 actor는 줄지만, 멀리 있거나 어두운 사람의 진입 반응은
 늦어질 수 있습니다. 실제 설치에서는 `--show` viewer에서 raw 트랙과 person stream을
 보면서 `min_bbox_height_px`, `confirm_hits`, `confirm_window_s`를 먼저 조정합니다.
 `fusion.miss_buffer_frames`는 사라짐/lost 반응을 바꾸는 값이고 첫 등장 지연은 줄이지 않습니다.
+
+저조도 대비 보강이 필요하면 `preprocessing.clahe`를 특정 카메라에만 적용할 수 있습니다.
+
+```yaml
+preprocessing:
+  clahe:
+    enabled: true
+    clip_limit: 2.0
+    tile_grid: [8, 8]
+    cameras: [cam2]
+```
 
 ### Raw per-cam (호환/디버깅)
 
@@ -363,14 +381,14 @@ cameras:
 
 ## 다중 카메라 캘리브레이션 절차
 
-복도 양쪽 끝 카메라(cam0/cam1)를 주 tracking source로 잡고, 중앙 카메라(cam2)는 필요할 때만 preview/calibration-only 또는 보조 tracking source로 켜는 절차입니다. 모든 카메라가 같은 `projection_id`를 공유하고, `projection_uv`는 hand-off 후보를 위해 겹쳐도 되지만 enabled camera의 `dispatch_uv`는 절대 겹치면 안 됩니다(같은 사람이 두 OSC stream으로 동시에 나갑니다). `tracking_enabled: false`인 카메라는 headless 실행의 dispatch overlap 검증과 actor 생성에서 제외됩니다.
+복도 양쪽 끝 카메라(cam0/cam1)를 primary tracking source로 잡고, 중앙 카메라(cam2)는 필요할 때만 preview/calibration-only 또는 `role: auxiliary` 보조 sighting source로 켜는 절차입니다. 모든 카메라가 같은 `projection_id`를 공유하고, `projection_uv`는 hand-off 후보를 위해 겹쳐도 됩니다. primary 카메라의 `dispatch_uv`는 절대 겹치면 안 됩니다(같은 사람이 두 OSC stream으로 동시에 나갑니다). `tracking_enabled: false`인 카메라는 headless 실행의 dispatch overlap 검증과 actor 생성에서 제외되고, `role: auxiliary` 카메라는 YOLO 추론은 하지만 새 actor나 raw per-cam OSC를 만들지 않습니다.
 
 1. 먼저 `config.yaml`에 모든 카메라가 같은 `projection_id`를 쓰도록 항목을 만들어 둡니다 (`projections:` 아래에 `corridor` 같은 id를 한 번만 정의하고, 각 카메라가 그 id를 region에 씁니다).
 2. `python tracker.py --show`로 viewer를 띄우고 `1`로 cam0을 focus 합니다. 좌측 패널 상단이 `[saved]`인지 확인하고, `d` -> 카메라 화면에서 projection 기준으로 top-left -> top-right -> bottom-right -> bottom-left 순서로 4점을 클릭합니다. 이 카메라는 가까운 절반을 담당할 것이므로 4점은 카메라가 실제로 잘 보이는 가까운 영역만 둘러쌉니다.
 3. `w`로 일단 저장합니다. 새 region은 `projection_uv = [0.0, 0.0, 1.0, 1.0]`, `dispatch_uv`도 동일하게 만들어집니다. `[saved]`가 떠야 디스크에 반영된 상태입니다.
 4. 에디터에서 `config.yaml`의 cam0 region을 열어 분담 범위를 줄입니다. 예를 들어 cam0이 복도 왼쪽 절반이면 `projection_uv: [0.0, 0.0, 0.55, 1.0]`, `dispatch_uv: [0.0, 0.0, 0.50, 1.0]`로 바꿉니다. `projection_uv`는 살짝 더 넓게(0.55) 두고 `dispatch_uv`는 안전 마진(0.50)을 두면 카메라 끝부분 떨림이 송신에 영향을 덜 줍니다.
 5. cam1도 같은 방식으로 진행합니다. viewer에서 `2`로 focus를 옮긴 뒤 `d`로 region을 그립니다. 이 카메라는 마주 보는 방향이라 같은 바닥인데도 영상이 좌우 반전돼 보이지만, 4점 클릭 순서는 여전히 **projection-UV 기준** top-left -> top-right -> bottom-right -> bottom-left 입니다. cam0과 동일한 `projection_id`를 쓰도록 `config.yaml`을 정리합니다.
-6. cam2가 정면/옆모습 문제로 불안정하면 `tracking_enabled: false`로 둡니다. 앱 Projection Workbench에서는 cam2 overlay가 흐리게 보이고, seam/dispatch 판단은 cam0/cam1 기준으로 계산됩니다. 시작점은 cam0 `dispatch_uv [0.00, 0.0, 0.50, 1.0]`, cam1 `dispatch_uv [0.50, 0.0, 1.00, 1.0]`입니다.
+6. cam2를 중앙 hand-off 보강에 쓰려면 `tracking_enabled: true`, `role: auxiliary`로 둡니다. 이 상태에서는 cam2가 actor ownership을 갖지 않으므로 `dispatch_uv`는 비워도 됩니다. cam2 raw detection이 너무 약하면 `tracking_enabled: false`로 돌려 preview/calibration-only로 두고, seam/dispatch 판단은 cam0/cam1 기준으로 계산합니다. 시작점은 cam0 `dispatch_uv [0.00, 0.0, 0.50, 1.0]`, cam1 `dispatch_uv [0.50, 0.0, 1.00, 1.0]`입니다.
 7. 저장 후 viewer를 다시 시작하면 좌측 패널에 모든 카메라의 region 목록이 보이고, enabled camera 기준 상단 `overlap` 카운터가 `0`이어야 합니다. UV canvas 패널 좌하단에 빨간 경고가 뜨면 어떤 쌍의 `dispatch_uv`가 겹치는지 알려주므로 그 부분만 다시 분할 비율을 조정합니다.
 8. 마지막으로 사람이 한 명 복도 끝에서 끝까지 천천히 걸어가게 하고, `python tracker.py --show` dashboard에서 같은 `gid` 색상이 유지되는지 확인합니다. 중앙 경계에서 detection이 실제로 끊기면 held로 붙잡지 않고 `/lost`가 나가는 것이 정상입니다. 같은 사람이 여러 카메라에서 동시에 송신되는 구간이 있으면 `dispatch_uv`가 아직 겹치는 것이므로 4번~6번 단계로 돌아갑니다.
 

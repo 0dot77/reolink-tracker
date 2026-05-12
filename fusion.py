@@ -34,6 +34,9 @@ class PersonEvent:
     # center of the camera's dispatch slice so simultaneous cross-camera
     # duplicates can keep the source that is deeper inside its ownership band.
     dispatch_center_distance: float = 0.0
+    # Auxiliary observations can confirm that an existing primary gid is still
+    # near the hand-off area, but they never spawn or take ownership of a gid.
+    auxiliary: bool = False
 
 
 @dataclass
@@ -361,6 +364,9 @@ class PersonTracker:
         max_update_jump_uv: float = 0.0,
         relaxed_hold_s: float = 0.0,
         reuse_lost_gids: bool = True,
+        aux_match_uv_radius: float = 0.08,
+        aux_match_time_window_s: float = 0.5,
+        aux_position_alpha: float = 0.25,
     ):
         self.hand_off_window_s = hand_off_window_s
         self.match_uv_radius = match_uv_radius
@@ -386,6 +392,9 @@ class PersonTracker:
         # new person instead of dragging the OSC actor across the floor.
         self.max_update_jump_uv = max(0.0, float(max_update_jump_uv))
         self.relaxed_hold_s = max(0.0, float(relaxed_hold_s))
+        self.aux_match_uv_radius = max(0.0, float(aux_match_uv_radius))
+        self.aux_match_time_window_s = max(0.0, float(aux_match_time_window_s))
+        self.aux_position_alpha = max(0.0, min(float(aux_position_alpha), 1.0))
         # Reuse gids only after they are terminally lost. This keeps OSC
         # address/key cardinality bounded by peak concurrent occupancy instead
         # of total historical visitors.
@@ -421,6 +430,8 @@ class PersonTracker:
         whose last coordinates should remain active for interaction slots.
         """
         events = self._dedupe_events(events)
+        aux_events = [ev for ev in events if ev.auxiliary]
+        events = [ev for ev in events if not ev.auxiliary]
         for person in self._persons.values():
             person.state = "held"
 
@@ -434,11 +445,22 @@ class PersonTracker:
             if person is None:
                 continue
             person.state = "held"
+            aux_ev = self._best_aux_match(person, aux_events, now)
             if not self._allows_held(person):
-                self._just_lost.append(LostPerson(person.projection_id, gid))
-                self._release_gid(gid)
-                self.lost_count += 1
+                if aux_ev is None:
+                    self._just_lost.append(LostPerson(person.projection_id, gid))
+                    self._release_gid(gid)
+                    self.lost_count += 1
+                    continue
+                self._apply_aux_sighting(person, aux_ev, now)
+                self._pending[gid] = _Pending(
+                    person=person,
+                    lost_t=now,
+                    hold_s=self._aux_pending_hold_s(person),
+                )
                 continue
+            if aux_ev is not None:
+                self._apply_aux_sighting(person, aux_ev, now)
             self._pending[gid] = _Pending(
                 person=person,
                 lost_t=now,
@@ -514,6 +536,8 @@ class PersonTracker:
                 continue
             new_gid = self._spawn_person(src, ev, now)
             fresh.add(new_gid)
+
+        self._refresh_pending_with_aux(aux_events, now)
 
         evicted = [
             gid for gid, p in self._pending.items()
@@ -730,6 +754,65 @@ class PersonTracker:
         if p is None:
             return False
         return self._allows_update_distance(p, ev)
+
+    def _best_aux_match(
+        self,
+        person: Person,
+        aux_events: list[PersonEvent],
+        now: float,
+    ) -> Optional[PersonEvent]:
+        if self.aux_match_uv_radius <= 0.0 or self.aux_match_time_window_s <= 0.0:
+            return None
+        best_ev: Optional[PersonEvent] = None
+        best_dist = self.aux_match_uv_radius
+        for ev in aux_events:
+            if ev.projection_id != person.projection_id:
+                continue
+            if now - ev.t > self.aux_match_time_window_s:
+                continue
+            if not self._allows_update_distance(person, ev):
+                continue
+            du = ev.u - person.u
+            dv = ev.v - person.v
+            dist = (du * du + dv * dv) ** 0.5
+            if dist <= best_dist:
+                best_dist = dist
+                best_ev = ev
+        return best_ev
+
+    def _apply_aux_sighting(
+        self,
+        person: Person,
+        ev: PersonEvent,
+        now: float,
+    ) -> None:
+        a = self.aux_position_alpha
+        if a > 0.0:
+            person.u = person.u + (ev.u - person.u) * a
+            person.v = person.v + (ev.v - person.v) * a
+            person.raw_u = person.u
+            person.raw_v = person.v
+        person.conf = max(person.conf, ev.conf)
+        person.last_t = now
+        person.state = "held"
+
+    def _refresh_pending_with_aux(
+        self,
+        aux_events: list[PersonEvent],
+        now: float,
+    ) -> None:
+        if not aux_events:
+            return
+        for pending in self._pending.values():
+            ev = self._best_aux_match(pending.person, aux_events, now)
+            if ev is None:
+                continue
+            self._apply_aux_sighting(pending.person, ev, now)
+            pending.lost_t = now
+            pending.hold_s = max(pending.hold_s, self._aux_pending_hold_s(pending.person))
+
+    def _aux_pending_hold_s(self, person: Person) -> float:
+        return max(self._pending_hold_s(person), self.aux_match_time_window_s)
 
     def _allows_update_distance(self, person: Person, ev: PersonEvent) -> bool:
         limit = self.max_update_jump_uv
@@ -1236,6 +1319,60 @@ if __name__ == "__main__":
         "(m3) unmatched projection-only source does not spawn",
         {p.gid for p in persons} == {1} and pt.spawned_count == 1,
         f"persons={[p.gid for p in persons]}, spawned={pt.spawned_count}",
+    )
+
+    # (m3a) Auxiliary sightings are not ownership sources. They can keep a
+    # primary gid pending across an interior miss, but cannot spawn or take
+    # over source ownership by themselves.
+    pt = PersonTracker(
+        hold_boundary_margin_uv=0.1,
+        aux_match_uv_radius=0.08,
+        aux_match_time_window_s=0.5,
+        aux_position_alpha=0.25,
+    )
+    t = 0.0
+    pt.update([PersonEvent("corridor", "cam0", 1, 0.40, 0.50, 0.90, t)], [], t)
+    t += 0.05
+    persons = pt.update(
+        [PersonEvent("corridor", "cam2", 9, 0.43, 0.50, 0.70, t, auxiliary=True)],
+        [("cam0", 1)],
+        t,
+    )
+    lost = pt.drain_lost_gids()
+    _check(
+        "(m3a) auxiliary sighting prevents immediate interior lost",
+        {p.gid for p in persons} == {1}
+        and lost == []
+        and pt.spawned_count == 1
+        and ("cam2", 9) not in pt._source_to_gid,
+        f"persons={[p.gid for p in persons]}, lost={lost}, source={pt._source_to_gid}",
+    )
+    t += 0.10
+    persons = pt.update(
+        [PersonEvent("corridor", "cam1", 5, 0.44, 0.50, 0.90, t)],
+        [],
+        t,
+    )
+    _check(
+        "(m3b) primary camera can claim gid after auxiliary-confirmed gap",
+        {p.gid for p in persons} == {1}
+        and pt._source_to_gid.get(("cam1", 5)) == 1
+        and pt.spawned_count == 1,
+        f"persons={[p.gid for p in persons]}, source={pt._source_to_gid}, spawned={pt.spawned_count}",
+    )
+
+    pt = PersonTracker(hold_boundary_margin_uv=0.1, aux_match_uv_radius=0.03)
+    pt.update([PersonEvent("corridor", "cam0", 1, 0.40, 0.50, 0.90, 0.0)], [], 0.0)
+    persons = pt.update(
+        [PersonEvent("corridor", "cam2", 9, 0.55, 0.50, 0.70, 0.05, auxiliary=True)],
+        [("cam0", 1)],
+        0.05,
+    )
+    lost = pt.drain_lost_gids()
+    _check(
+        "(m3c) far auxiliary sighting does not suppress lost",
+        persons == [] and lost == [LostPerson("corridor", 1)],
+        f"persons={persons}, lost={lost}",
     )
 
     # (m4) Simultaneous cross-camera fresh duplicates inside the narrow

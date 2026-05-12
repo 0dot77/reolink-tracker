@@ -127,8 +127,11 @@ type ProjectionInfo = {
   zones: Array<{ id: string; uv_rect: number[] }>;
 };
 
+type CameraRole = "primary" | "auxiliary";
+
 type RegionInfo = {
   camera: string;
+  camera_role: CameraRole;
   tracking_enabled: boolean;
   id: string;
   projection_id: string;
@@ -145,7 +148,8 @@ type RegionInfo = {
   relaxed_presence_enabled: boolean;
 };
 
-type RawRegionInfo = Omit<RegionInfo, "relaxed_presence_enabled" | "tracking_enabled"> & {
+type RawRegionInfo = Omit<RegionInfo, "camera_role" | "relaxed_presence_enabled" | "tracking_enabled"> & {
+  camera_role?: string | null;
   relaxed_presence_enabled?: boolean | null;
   tracking_enabled?: boolean | null;
 };
@@ -153,11 +157,15 @@ type RawRegionInfo = Omit<RegionInfo, "relaxed_presence_enabled" | "tracking_ena
 type CameraInfo = {
   name: string;
   tracking_enabled: boolean;
+  role: CameraRole;
+  conf: number | null;
 };
 
 type RawCameraInfo = {
   name?: string | null;
   tracking_enabled?: boolean | null;
+  role?: string | null;
+  conf?: number | null;
 };
 
 type ProjectionSnapshot = {
@@ -433,6 +441,10 @@ function relaxedPresenceEnabled(region: Pick<RegionInfo, "relaxed_presence_enabl
   return region?.relaxed_presence_enabled !== false;
 }
 
+function normalizeCameraRole(role: unknown): CameraRole {
+  return role === "auxiliary" ? "auxiliary" : "primary";
+}
+
 function hasRelaxedPresenceMask(region: Pick<RegionInfo, "relaxed_presence_points"> | undefined): boolean {
   return Boolean(region?.relaxed_presence_points?.length);
 }
@@ -463,19 +475,28 @@ function stairMaskSummary(counts: { configured: number; enabled: number; disable
 
 function normalizeProjectionSnapshot(snapshot: RawProjectionSnapshot): ProjectionSnapshot {
   const rawCameras = snapshot.cameras ?? [];
+  const cameras = rawCameras
+    .map((camera, index) => ({
+      name: String(camera.name ?? `cam${index}`),
+      tracking_enabled: camera.tracking_enabled !== false,
+      role: normalizeCameraRole(camera.role),
+      conf: typeof camera.conf === "number" && Number.isFinite(camera.conf) ? camera.conf : null,
+    }))
+    .filter((camera) => camera.name.length > 0);
+  const roleByCamera = new Map(cameras.map((camera) => [camera.name, camera.role]));
   return {
     ...snapshot,
-    cameras: rawCameras
-      .map((camera, index) => ({
-        name: String(camera.name ?? `cam${index}`),
-        tracking_enabled: camera.tracking_enabled !== false,
-      }))
-      .filter((camera) => camera.name.length > 0),
-    regions: (snapshot.regions ?? []).map((region) => ({
-      ...region,
-      tracking_enabled: region.tracking_enabled !== false,
-      relaxed_presence_enabled: relaxedPresenceEnabled(region),
-    })),
+    cameras,
+    regions: (snapshot.regions ?? []).map((region) => {
+      const cameraName = String(region.camera ?? "");
+      return {
+        ...region,
+        camera: cameraName,
+        camera_role: normalizeCameraRole(region.camera_role ?? roleByCamera.get(cameraName)),
+        tracking_enabled: region.tracking_enabled !== false,
+        relaxed_presence_enabled: relaxedPresenceEnabled(region),
+      };
+    }),
   };
 }
 
@@ -1046,6 +1067,9 @@ function projectionSection(): string {
   const regions = snapshot?.regions ?? [];
   const enabledRegionCount = regions.filter((region) => region.tracking_enabled).length;
   const stairCounts = stairMaskCounts(regions);
+  const enabledCameras = enabledCameraCount(cameras);
+  const enabledAuxiliaryCameras = enabledAuxiliaryCameraCount(cameras);
+  const cameraCountLabel = `${enabledCameras} / ${snapshot?.camera_count ?? cameraNames().length}${enabledAuxiliaryCameras ? ` (${enabledAuxiliaryCameras} aux)` : ""}`;
   const projection = projections[0];
   const projectionId = projection?.id ?? "corridor";
   const projectionRegions = regions.filter((region) => region.projection_id === projectionId || !projection);
@@ -1088,7 +1112,7 @@ function projectionSection(): string {
         <span>world <b>${formatVector(projection?.world_size_m, "m")}</b></span>
         <span>pixels <b id="workbenchPixelsValue">${canvas.width} x ${canvas.height} px</b></span>
         <span>config <b>${formatVector(projection?.pixel_size, "px")}</b></span>
-        <span>cameras <b>${enabledCameraCount(cameras)} / ${snapshot?.camera_count ?? cameraNames().length}</b></span>
+        <span>cameras <b>${cameraCountLabel}</b></span>
         <span>regions <b>${enabledRegionCount} / ${regions.length}</b></span>
         <span>stairs <b>${escapeHtml(stairMaskSummary(stairCounts))}</b></span>
       </div>
@@ -1111,8 +1135,8 @@ function projectionSection(): string {
     </section>
     <section class="metric-grid">
       ${validationCard("projection config", projections.length ? `${projections.length}` : "none", projections.length ? "ok" : "warn", "read from config.yaml projections[]")}
-      ${validationCard("calibrated regions", regions.length ? `${regions.length}` : "none", regions.length ? "ok" : "warn", "camera regions with projection_uv and dispatch_uv")}
-      ${validationCard("tracking sources", `${enabledCameraCount(cameras)} / ${snapshot?.camera_count ?? cameraNames().length}`, enabledCameraCount(cameras) ? "ok" : "warn", "disabled cameras stay available for preview/calibration but do not spawn actors")}
+      ${validationCard("calibrated regions", regions.length ? `${regions.length}` : "none", regions.length ? "ok" : "warn", "camera projection_uv plus primary dispatch_uv ownership")}
+      ${validationCard("tracking sources", cameraCountLabel, enabledCameras ? "ok" : "warn", "disabled cameras stay available for preview/calibration; auxiliary cameras detect handoff sightings but do not spawn actors")}
       ${validationCard("interaction zones", zones.length ? `${zones.length}` : "none", zones.length ? "ok" : "warn", "read-only zone overlay from interaction_zones[]")}
       ${validationCard("output warp", projection?.output_warp_points?.length === 4 ? "saved" : "identity", "ok", "projection-level output_warp_points")}
       ${validationCard("stair relaxed masks", stairMaskSummary(stairCounts), stairCounts.enabled ? "ok" : stairCounts.disabled ? "warn" : "warn", "camera-image polygons used only for relaxed seated-person detection")}
@@ -1149,6 +1173,10 @@ function calibrationSection(): string {
   const stairV = selectedRegion?.relaxed_presence_v ?? null;
   const mappingKey = calibrationMappingKey(state.calibrationCamera, selectedRegion?.id ?? state.calibrationRegionId);
   const calibrationTrackingEnabled = cameraTrackingEnabled(state.calibrationCamera);
+  const calibrationRole = cameraRoleForName(state.calibrationCamera);
+  const calibrationTrackingLabel = calibrationTrackingEnabled
+    ? calibrationRole === "auxiliary" ? "Auxiliary on" : "Tracking on"
+    : "Tracking off";
   const stairEnabled = mappingDraftChecked(mappingKey, "stairEnabled", relaxedPresenceEnabled(selectedRegion));
   const stairConfigured = hasRelaxedPresenceMask(selectedRegion);
   const frameSrc = frame && hasTauriRuntime ? convertFileSrc(frame.path) : "";
@@ -1174,7 +1202,7 @@ function calibrationSection(): string {
             <button class="btn ${state.calibrationTool === "body" ? "active body" : ""}" data-calibration-tool="body">Body catch</button>
             <button class="btn ${state.calibrationTool === "stair" ? "active stair" : ""} ${stairConfigured && !stairEnabled ? "stair-off" : ""}" data-calibration-tool="stair">Stair relaxed${stairConfigured && !stairEnabled ? " off" : ""}</button>
           </div>
-          <button class="btn ${calibrationTrackingEnabled ? "" : "warn"}" data-action="toggle-camera-tracking" data-camera-name="${escapeAttr(state.calibrationCamera)}" data-tracking-enabled="${calibrationTrackingEnabled ? "true" : "false"}" ${buttonDisabled(!hasTauriRuntime)}>${calibrationTrackingEnabled ? "Tracking on" : "Tracking off"}</button>
+          <button class="btn ${calibrationTrackingEnabled ? "" : "warn"}" data-action="toggle-camera-tracking" data-camera-name="${escapeAttr(state.calibrationCamera)}" data-tracking-enabled="${calibrationTrackingEnabled ? "true" : "false"}" ${buttonDisabled(!hasTauriRuntime)}>${calibrationTrackingLabel}</button>
           <button class="btn" data-action="clear-calibration-points" ${buttonDisabled(!points.length)}>Clear points</button>
           <button class="btn primary" data-action="save-calibration-points" ${buttonDisabled(saveDisabled)}>Save ${toolLabel}</button>
         </div>
@@ -1573,29 +1601,42 @@ function trackingSourceControls(cameras: CameraInfo[], regions: RegionInfo[]): s
   cameras.forEach((camera) => byName.set(camera.name, camera));
   regions.forEach((region) => {
     if (!byName.has(region.camera)) {
-      byName.set(region.camera, { name: region.camera, tracking_enabled: region.tracking_enabled });
+      byName.set(region.camera, {
+        name: region.camera,
+        tracking_enabled: region.tracking_enabled,
+        role: region.camera_role,
+        conf: null,
+      });
     }
   });
   cameraNames().forEach((name) => {
     if (!byName.has(name)) {
-      byName.set(name, { name, tracking_enabled: true });
+      byName.set(name, { name, tracking_enabled: true, role: "primary", conf: null });
     }
   });
   const sourceCameras = [...byName.values()];
   if (!sourceCameras.length) {
     return "";
   }
-  const enabled = sourceCameras.filter((camera) => camera.tracking_enabled !== false).length;
+  const enabledCameras = sourceCameras.filter((camera) => camera.tracking_enabled !== false);
+  const primaryEnabled = enabledCameras.filter((camera) => camera.role === "primary").length;
+  const auxiliaryEnabled = enabledCameras.filter((camera) => camera.role === "auxiliary").length;
+  const roleSummary = auxiliaryEnabled ? ` · ${primaryEnabled} primary · ${auxiliaryEnabled} aux` : "";
   return `<div class="tracking-source-grid" aria-label="Tracking source controls">
-    <span class="tracking-source-label">Tracking sources <b>${enabled}/${sourceCameras.length}</b></span>
+    <span class="tracking-source-label">Tracking sources <b>${enabledCameras.length}/${sourceCameras.length}</b>${roleSummary}</span>
     ${sourceCameras
       .map((camera, index) => {
         const enabled = camera.tracking_enabled !== false;
         const camClass = cameraClassForName(camera.name, index);
-        return `<button class="camera-toggle ${enabled ? "is-enabled" : "is-disabled"}" data-action="toggle-camera-tracking" data-camera-name="${escapeAttr(camera.name)}" data-tracking-enabled="${enabled ? "true" : "false"}" ${buttonDisabled(!hasTauriRuntime)}>
+        const roleLabel = camera.role === "auxiliary" ? "auxiliary" : "primary";
+        const confLabel = camera.conf !== null ? ` · conf ${camera.conf.toFixed(2)}` : "";
+        const title = camera.role === "auxiliary"
+          ? "Auxiliary camera: detects handoff sightings but does not spawn actors"
+          : "Primary camera: owns actor dispatch in its region";
+        return `<button class="camera-toggle ${enabled ? "is-enabled" : "is-disabled"}" title="${escapeAttr(title)}" data-action="toggle-camera-tracking" data-camera-name="${escapeAttr(camera.name)}" data-tracking-enabled="${enabled ? "true" : "false"}" ${buttonDisabled(!hasTauriRuntime)}>
           <span class="cam-swatch ${camClass}"></span>
           <span>${escapeHtml(camera.name)}</span>
-          <b>${enabled ? "tracking on" : "tracking off"}</b>
+          <b>${enabled ? `${roleLabel}${confLabel}` : "tracking off"}</b>
         </button>`;
       })
       .join("")}
@@ -1607,6 +1648,10 @@ function enabledCameraCount(cameras: CameraInfo[]): number {
     return configuredCameraNames().length;
   }
   return cameras.filter((camera) => camera.tracking_enabled !== false).length;
+}
+
+function enabledAuxiliaryCameraCount(cameras: CameraInfo[]): number {
+  return cameras.filter((camera) => camera.tracking_enabled !== false && camera.role === "auxiliary").length;
 }
 
 function workbenchLayerControls(): string {
@@ -1746,20 +1791,24 @@ function effectiveWorkbenchLayers(): Record<WorkbenchLayer, boolean> {
 }
 
 function workbenchRegionTile(region: RegionInfo, index: number, kind: "projection" | "dispatch", selected?: RegionInfo): string {
+  if (kind === "dispatch" && region.camera_role === "auxiliary") {
+    return "";
+  }
   const values = kind === "projection" ? region.projection_uv : region.dispatch_uv;
   const rect = uvRect(values.length === 4 ? values : region.projection_uv);
   const camClass = cameraClassForName(region.camera, index);
   const isSelected = selected ? regionKey(selected) === regionKey(region) : false;
   const trackingOff = region.tracking_enabled === false;
+  const kindLabel = kind === "projection" && region.camera_role === "auxiliary" ? "aux sighting" : kind;
   return `<div class="dispatch wb-${kind} ${camClass} ${isSelected ? "selected-region" : ""} ${trackingOff ? "tracking-off" : ""}" style="${rectStyle(rect)}">
     <span>${escapeHtml(region.camera)} · ${escapeHtml(region.id)}</span>
-    <b>${trackingOff ? "off · " : ""}${escapeHtml(kind)} ${formatUvRange(values)}</b>
+    <b>${trackingOff ? "off · " : ""}${escapeHtml(kindLabel)} ${formatUvRange(values)}</b>
   </div>`;
 }
 
 function workbenchSeams(regions: RegionInfo[]): string {
   const slices = regions
-    .filter((region) => region.tracking_enabled !== false)
+    .filter((region) => region.tracking_enabled !== false && region.camera_role !== "auxiliary")
     .map((region) => {
       const rect = normalizedUv(region.dispatch_uv, region.projection_uv.length === 4 ? region.projection_uv : [0, 0, 1, 1]);
       return {
@@ -2470,15 +2519,17 @@ function minimalAddressRows(): string {
 }
 
 function regionTile(region: RegionInfo, index: number): string {
-  const rect = uvRect(region.dispatch_uv.length === 4 ? region.dispatch_uv : region.projection_uv);
+  const isAuxiliary = region.camera_role === "auxiliary";
+  const rect = uvRect(isAuxiliary ? region.projection_uv : region.dispatch_uv.length === 4 ? region.dispatch_uv : region.projection_uv);
   const camClass = cameraClassForName(region.camera, index);
   const hasRelaxed = hasRelaxedPresenceMask(region);
   const relaxedEnabled = relaxedPresenceEnabled(region);
   const relaxedMeta = `stair ${relaxedEnabled ? "on" : "off"} · m ${formatOptionalNumber(region.relaxed_presence_margin_uv)}`;
   const trackingOff = region.tracking_enabled === false;
+  const roleMeta = isAuxiliary ? "aux" : "primary";
   return `<div class="dispatch ${camClass} ${hasRelaxed ? `has-relaxed${relaxedEnabled ? "" : " disabled"}` : ""} ${trackingOff ? "tracking-off" : ""}" style="${rectStyle(rect)}">
-    <span>${escapeHtml(region.camera)} · ${escapeHtml(region.id)}</span>
-    <b>${trackingOff ? "tracking off · " : ""}${formatUvRange(region.dispatch_uv)}</b>
+    <span>${escapeHtml(region.camera)} · ${escapeHtml(region.id)} · ${roleMeta}</span>
+    <b>${trackingOff ? "tracking off · " : isAuxiliary ? "aux sighting · " : ""}${formatUvRange(isAuxiliary ? region.projection_uv : region.dispatch_uv)}</b>
     ${hasRelaxed ? `<em class="${relaxedEnabled ? "" : "disabled"}">${escapeHtml(relaxedMeta)}</em>` : ""}
   </div>`;
 }
@@ -2496,7 +2547,7 @@ function projectionRegionRows(regions: RegionInfo[]): string {
     .map(
       (region) => `<div class="row">
         <span class="k">${escapeHtml(region.camera)} / ${escapeHtml(region.id)}</span>
-        <span class="v">${escapeHtml(region.projection_id)} · tracking ${region.tracking_enabled ? "on" : "off"} · proj ${formatUvRange(region.projection_uv)} · dispatch ${formatUvRange(region.dispatch_uv)}${hasRelaxedPresenceMask(region) ? ` · stair ${region.relaxed_presence_points.length}pt ${relaxedPresenceEnabled(region) ? "on" : "off"} margin ${formatOptionalNumber(region.relaxed_presence_margin_uv)} conf ${formatOptionalNumber(region.relaxed_presence_min_confidence)}` : ""}</span>
+        <span class="v">${escapeHtml(region.projection_id)} · tracking ${region.tracking_enabled ? region.camera_role : "off"} · proj ${formatUvRange(region.projection_uv)} · dispatch ${region.camera_role === "auxiliary" ? "ignored" : formatUvRange(region.dispatch_uv)}${hasRelaxedPresenceMask(region) ? ` · stair ${region.relaxed_presence_points.length}pt ${relaxedPresenceEnabled(region) ? "on" : "off"} margin ${formatOptionalNumber(region.relaxed_presence_margin_uv)} conf ${formatOptionalNumber(region.relaxed_presence_min_confidence)}` : ""}</span>
       </div>`,
     )
     .join("")}</div>`;
@@ -2639,6 +2690,15 @@ function cameraTrackingEnabled(cameraName: string): boolean {
   }
   const fromRegion = state.projection?.regions.find((region) => region.camera === cameraName);
   return fromRegion?.tracking_enabled !== false;
+}
+
+function cameraRoleForName(cameraName: string): CameraRole {
+  const fromCamera = state.projection?.cameras.find((camera) => camera.name === cameraName);
+  if (fromCamera) {
+    return fromCamera.role;
+  }
+  const fromRegion = state.projection?.regions.find((region) => region.camera === cameraName);
+  return fromRegion?.camera_role ?? "primary";
 }
 
 function calibrationRegionsForCamera(camera: string): RegionInfo[] {
@@ -3147,9 +3207,9 @@ cameras:
     return {
       camera_count: 3,
       cameras: [
-        { name: "cam0", tracking_enabled: true },
-        { name: "cam2", tracking_enabled: false },
-        { name: "cam1", tracking_enabled: true },
+        { name: "cam0", tracking_enabled: true, role: "primary", conf: null },
+        { name: "cam2", tracking_enabled: false, role: "auxiliary", conf: 0.08 },
+        { name: "cam1", tracking_enabled: true, role: "primary", conf: null },
       ],
       projections: [
         {

@@ -62,6 +62,12 @@
   `dispatch_uv` overlap 검증에서는 제외합니다. Projection Workbench의 seam/dispatch 판단도
   enabled camera만 기준으로 보므로 cam2를 끄고 cam0/cam1 중심의 `projection_uv`/`dispatch_uv`
   구성을 잡을 수 있습니다.
+- 카메라별 `role: primary | auxiliary`는 YOLO를 돌리는 카메라가 actor ownership을 갖는지
+  분리합니다. 기본 `primary`는 기존처럼 새 `gid` 생성, raw per-cam OSC 송신, dispatch
+  ownership을 수행합니다. `auxiliary`는 YOLO 추론과 projection sighting은 만들지만 새 `gid`
+  또는 raw per-cam OSC를 만들지 않고, primary gid가 중앙에서 lost 되려 할 때
+  `fusion.aux_match_uv_radius`, `fusion.aux_match_time_window_s`,
+  `fusion.aux_position_alpha` 조건으로만 pending/held gid를 보강합니다.
 - camera region의 `relaxed_presence_points`는 계단/착석자용 별도 image polygon입니다.
   `image_points`는 UV 변환용 기준 영역으로 유지하고, relaxed polygon은 그 안에서만
   가로로 넓거나 짧은 bbox를 완화해 actor 후보로 승격합니다. `relaxed_presence_uv`가 있으면
@@ -74,20 +80,17 @@
   `stair_catch_points`는 같은 의미의 입력 alias입니다. 이 경로에서 생성된
   fused actor는 `source_zone=stair_relaxed`로 유지되어 TouchDesigner가 보행자와 다른
   y lane으로 remap할 수 있습니다.
-- `preprocessing.clahe.enabled`가 true이면 `CamWorker.step()`에서 YOLO 추론 직전에 BGR을
-  LAB로 바꾸고 L 채널에 `cv2.createCLAHE(clipLimit, tileGridSize)`를 적용한 뒤 다시 BGR로
-  되돌립니다. 720p 기준 ~3-5 ms로 30 FPS 파이프라인에 영향이 사실상 없습니다. 야간 저조도
-  보강용이며, primary와 auxiliary 카메라 모두 동일하게 적용합니다.
-- 카메라별 `role`은 `primary`(기본) 또는 `auxiliary`입니다. auxiliary 카메라는 YOLO 추론은
-  수행하지만 `PersonTracker`에서 새 gid를 만들지 않고 sighting buffer로만 기여하며,
-  raw per-cam OSC도 송신하지 않습니다. `tracking_enabled: false`(YOLO 자체 비활성)와는
-  다른 축이며, `role: auxiliary` + `tracking_enabled: true` 조합으로 함께 씁니다.
-- `fusion.aux_match_uv_radius`와 `fusion.aux_match_time_window_s`는 primary에서 lost로
-  가려는 gid의 마지막 좌표와 auxiliary sighting 좌표가 이 UV 거리/시간 윈도우 안에 있을
-  때만 stitch해 lost 발송을 미룹니다. cross-projection 매칭은 차단됩니다.
-- `model_path`는 fine-tuned weight를 가리키며 비어 있으면 stock `yolo26n.pt` 다운로드 동작을
-  유지합니다. 사이트 fine-tuned weight의 권장 위치는 `models/site/best.pt`이며 `.gitignore`로
-  유지합니다.
+- 저조도 보강의 현재 1차 실험은 `_sub` stream을 유지한 채 `imgsz: 1280`,
+  `model: yolo26s.pt`, cam2 `role: auxiliary`를 함께 보는 것입니다. FPS가 15 아래로
+  떨어지거나 OSC/ID latency가 나빠지면 `imgsz: 960`으로 내립니다. 자세한 순서는
+  `docs/cam2-low-light-research.md`를 따릅니다.
+- `preprocessing.clahe.*`는 YOLO 추론 직전 BGR을 LAB로 바꾸고 L 채널에
+  `cv2.createCLAHE(clipLimit, tileGridSize)`를 적용한 뒤 다시 BGR로 되돌립니다.
+  `cameras: [cam2]`처럼 특정 카메라에만 적용할 수 있어 cam0/cam1 primary baseline을
+  유지한 채 중앙 보강 카메라만 저조도 대비를 올릴 수 있습니다.
+- 사이트 fine-tuned weight는 아직 별도 `model_path` key로 구현되어 있지 않습니다. 현재 모델
+  선택은 top-level `model` 또는 `--model`로 합니다. fine-tune 도입 시 권장 산출 위치는
+  `models/site/best.pt`이며, 모델 weight는 git에 넣지 않습니다.
 - 같은 projection을 공유하는 카메라들의 `dispatch_uv` slice는 겹치지 않아야 합니다. 겹치면 count가 부풀 수 있습니다.
 - cross-camera fusion은 `fresh`와 `held` 상태를 구분합니다. `held` gid는 짧은 detection drop 중 마지막 좌표로 active 목록에 남겨 TouchDesigner 슬롯이 깜박이지 않게 합니다.
 - `fusion.relaxed_hold_s`가 0보다 크면 계단/착석자 relaxed polygon에서 생성된 actor만 detection drop 이후 더 오래 held로 남습니다. 일반 바닥 보행자 hold 정책은 그대로 둡니다.

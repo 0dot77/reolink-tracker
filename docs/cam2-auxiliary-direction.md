@@ -11,16 +11,21 @@
 - 2026-05-11 `tracking_enabled: false`: cam2의 detection이 cam0/cam1 hand-off보다 오히려
   중앙 actor를 끊거나 ghost로 만들어, 보행자 tracking source에서 제외했다.
 
-근본 원인은 두 가지다. 첫째, cam2는 사람의 옆모습을 본다. YOLO는 정면/후면에 비해
+근본 원인은 세 가지다. 첫째, cam2는 사람의 옆모습을 본다. YOLO는 정면/후면에 비해
 옆모습 silhouette의 anchor/aspect-ratio 분포에서 안정성이 떨어진다. 둘째, 야간 조도가
-낮으면 Reolink가 IR B&W로 전환하면서 RGB로 학습된 YOLO가 더 무너진다.
+낮으면 Reolink가 IR B&W로 전환하면서 RGB로 학습된 YOLO가 더 무너진다. 셋째, 이전
+baseline이 `_sub` stream + `yolo26n.pt` + `imgsz: 640`이라 중앙의 작은 옆모습 사람은
+모델 입력에서 이미 픽셀 수가 부족하다.
 
 새 방향은 cam2를 primary detector로 되돌리지 않는다. cam2는 **auxiliary confirmer**로만
 쓴다. YOLO 추론은 돌리되, 새 `gid`도 raw per-cam OSC도 만들지 않고, primary 카메라가
 hand-off 윈도우에서 사람을 놓칠 때 "방금 cam2가 같은 projection 근처에서 봤다"는 sighting
 buffer만 fusion에 흘려보낸다.
 
-이 방향은 다음 PR에서 코드로 도입한다. 이 문서는 그 작업의 spec이다.
+이 방향은 현재 코드에 `role: auxiliary`와 `fusion.aux_match_*`로 반영되어 있다. 단,
+스폿라이트를 쓸 수 없는 현재 현장 조건에서는 먼저 `imgsz: 1280` + `yolo26s.pt` 조합을
+기준 baseline으로 잡고, cam2 auxiliary가 그 baseline 대비 중앙 hand-off를 실제로 줄이는지
+비교한다.
 
 ## 역할 분리
 
@@ -35,21 +40,20 @@ buffer만 fusion에 흘려보낸다.
 
 cam2의 운영 상태는 다음과 같이 단계적으로 갈 수 있다.
 
-1. `tracking_enabled: false` (현재) — calibration only.
-2. `role: auxiliary`, `tracking_enabled: true` (이번 방향) — sighting만.
+1. `tracking_enabled: false` — calibration only.
+2. `role: auxiliary`, `tracking_enabled: true` (현재 권장) — sighting만.
 3. `role: primary` (옛 방향) — 다시 채택하지 않는다.
 
 ## 설치 가정
 
 - `cam2`는 도면 중앙 위치. 중앙 hand-off 구간을 가능한 한 사선으로 바라봐서 정면 옆모습
   보행자가 카메라 화면을 가로지르는 비율을 줄인다.
-- 야간 모드는 IR B&W가 아니라 ColorX/Color + spotlight로 고정한다. 자세한 배경은
-  `decisions.md`의 2026-05-12 ColorX 결정 참고.
+- 스폿라이트는 현재 현장에서 쓸 수 없다. 야간 모드는 가능하면 Auto B&W 전환을 피하고
+  Color/RGB 상태를 유지하되, 실제 저조도 RGB frame에서 raw YOLO detection이 살아나는지를
+  먼저 확인한다. 자세한 단기 실험 순서는 `docs/cam2-low-light-research.md`를 따른다.
 - 모든 카메라는 같은 `projection_id`를 공유한다.
 
-## Config 예시 (다음 PR에서 도입)
-
-아래 키는 현재 코드에는 없으며 다음 PR에서 함께 도입된다.
+## Config 예시
 
 ```yaml
 cameras:
@@ -83,7 +87,8 @@ sighting buffer에서 같은 시간 윈도우 안의 항목만 후보로 본다.
 
 ## 현장 검증 절차
 
-다음 PR이 끝난 뒤 검증한다.
+비교 기준은 예전 `640+n` baseline이 아니라, 먼저 실행한 `_sub + imgsz 1280 + yolo26s.pt`
+2카메라 baseline이다.
 
 1. 앱에서 cam2를 `role: auxiliary`, `tracking_enabled: true`, `dispatch_uv: []`로 설정한다.
 2. Projection Workbench에서 dispatch overlap 경고가 없는지 확인한다 (auxiliary는 dispatch가
@@ -109,7 +114,8 @@ sighting buffer에서 같은 시간 윈도우 안의 항목만 후보로 본다.
 - cam2의 옆모습 검출이 sighting조차 만들지 못할 만큼 약하면 이 방향만으로는 hand-off
   보강 효과가 작다. 그 경우 사이트 footage YOLO fine-tune (`decisions.md` 2026-05-12 entry
   참고)이 다음 단계다.
-- 야간 IR B&W로 무심코 전환되면 cam2 sighting 자체가 무너진다. 운용 절차로
-  ColorX/Color 고정이 우선이다.
+- 야간 IR B&W로 무심코 전환되면 cam2 sighting 자체가 무너질 수 있다. 스폿라이트 없이
+  Color/RGB를 유지해야 하므로 noise, motion blur, projector/background pattern 영향을
+  raw detection 단계에서 따로 봐야 한다.
 - auxiliary가 잘못된 sighting을 만들면 primary lost가 부당하게 미뤄질 수 있다.
   `aux_match_uv_radius`, `aux_match_time_window_s`는 보수적으로 시작한다 (위 예시값 참고).

@@ -195,6 +195,7 @@ struct ZoneInfo {
 #[derive(Debug, Clone, Serialize)]
 struct RegionInfo {
     camera: String,
+    camera_role: Option<String>,
     tracking_enabled: bool,
     id: String,
     projection_id: String,
@@ -215,6 +216,8 @@ struct RegionInfo {
 struct CameraInfo {
     name: String,
     tracking_enabled: bool,
+    role: Option<String>,
+    conf: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -847,14 +850,22 @@ fn parse_projection_snapshot(config: &str) -> Result<ProjectionSnapshot, String>
                 .unwrap_or("camera")
                 .to_string();
             let tracking_enabled = camera_tracking_enabled(camera);
+            let role = camera
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(|value| value.to_string());
+            let conf = yaml_optional_f64(camera.get("conf"));
             cameras_info.push(CameraInfo {
                 name: camera_name.clone(),
                 tracking_enabled,
+                role: role.clone(),
+                conf,
             });
             if let Some(region_items) = camera.get("regions").and_then(|v| v.as_sequence()) {
                 for region in region_items {
                     regions.push(RegionInfo {
                         camera: camera_name.clone(),
+                        camera_role: role.clone(),
                         tracking_enabled,
                         id: region
                             .get("id")
@@ -3971,6 +3982,8 @@ cameras:
         relaxed_presence_min_confidence: 0.12
   - name: cam2
     tracking_enabled: false
+    role: auxiliary
+    conf: 0.08
     regions:
       - id: center
         projection_id: corridor
@@ -3984,6 +3997,8 @@ cameras:
         assert!(snapshot.cameras[0].tracking_enabled);
         assert_eq!(snapshot.cameras[1].name, "cam2");
         assert!(!snapshot.cameras[1].tracking_enabled);
+        assert_eq!(snapshot.cameras[1].role.as_deref(), Some("auxiliary"));
+        assert_eq!(snapshot.cameras[1].conf, Some(0.08));
         assert_eq!(snapshot.projections[0].id, "corridor");
         assert_eq!(
             snapshot.projections[0].output_warp_points[0],
@@ -3994,6 +4009,7 @@ cameras:
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
         assert_eq!(snapshot.regions[1].camera, "cam2");
         assert!(!snapshot.regions[1].tracking_enabled);
+        assert_eq!(snapshot.regions[1].camera_role.as_deref(), Some("auxiliary"));
         assert_eq!(snapshot.regions[1].dispatch_uv, vec![0.4, 0.0, 0.6, 1.0]);
         assert!(!snapshot.regions[0].relaxed_presence_enabled);
         assert!(snapshot.regions[1].relaxed_presence_enabled);
