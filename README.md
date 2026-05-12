@@ -57,6 +57,7 @@ npm run tauri:dev
 앱의 Setup은 repo root의 engine 파일을 macOS app data runtime으로 복사하고, 그 runtime 안에서
 Python 3.12 venv와 dependencies, YOLO model을 준비합니다. 실제 카메라 credential이 들어가는
 `config.yaml`은 저장소 root가 아니라 app data의 `runtime/config.yaml`에 저장됩니다.
+다른 현장 Mac으로 옮겨 실행하는 절차는 `docs/field-mac-transfer.md`에 정리되어 있습니다.
 
 앱이 tracker를 시작할 때의 기본 형태는 아래와 같습니다. Show Preview는 `--show`만 추가합니다.
 repo에서 직접 `python tracker.py` 또는 `$sim`을 실행할 때도 앱 runtime config가 있으면
