@@ -53,6 +53,20 @@ struct RuntimeStatus {
     uv_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+struct OperatorSettings {
+    start_tracker_on_launch: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OperatorSettingsStatus {
+    open_app_at_login: bool,
+    start_tracker_on_launch: bool,
+    settings_path: String,
+    launch_agent_path: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CommandOutput {
     ok: bool,
@@ -243,6 +257,13 @@ struct SaveConfigRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SaveOperatorSettingsRequest {
+    open_app_at_login: bool,
+    start_tracker_on_launch: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct VideoTestRequest {
     video_path: String,
     camera_name: Option<String>,
@@ -304,6 +325,8 @@ const MOBILE_PREVIEW_MAX_WIDTH: &str = "640";
 const MOBILE_PREVIEW_INTERVAL_S: &str = "0.75";
 const MOBILE_PREVIEW_REQUEST_TTL_S: &str = "4.0";
 const MOBILE_PREVIEW_JPEG_QUALITY: &str = "65";
+const APP_BUNDLE_ID: &str = "com.taeyang.reolink-tracker";
+const LOGIN_AGENT_LABEL: &str = "com.taeyang.reolink-tracker.autostart";
 const TRACKER_EVENT_STALE_FAIL_S: f64 = 8.0;
 const CAMERA_FRAME_WARN_S: f64 = 2.5;
 const CAMERA_FRAME_FAIL_S: f64 = 6.0;
@@ -385,12 +408,7 @@ fn mobile_auth_is_blocked(state: &AppState, client_id: &str, now: Instant) -> bo
     }
 }
 
-fn record_mobile_auth_result(
-    state: &AppState,
-    client_id: &str,
-    ok: bool,
-    now: Instant,
-) -> bool {
+fn record_mobile_auth_result(state: &AppState, client_id: &str, ok: bool, now: Instant) -> bool {
     let Ok(mut failures) = state.mobile_auth.lock() else {
         return false;
     };
@@ -469,6 +487,18 @@ fn engine_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(runtime_dir(app)?.join("config.yaml"))
+}
+
+fn operator_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(runtime_dir(app)?.join("operator-settings.json"))
+}
+
+fn launch_agent_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "failed to resolve home directory".to_string())?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LOGIN_AGENT_LABEL}.plist")))
 }
 
 fn mobile_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -550,6 +580,68 @@ fn write_text_atomically(path: &Path, content: &str) -> Result<(), String> {
             path.display(),
             tmp_path.display()
         )
+    })
+}
+
+fn read_operator_settings_from(path: &Path) -> Result<OperatorSettings, String> {
+    if !path.exists() {
+        return Ok(OperatorSettings::default());
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    serde_json::from_str::<OperatorSettings>(&text)
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+}
+
+fn write_operator_settings_to(path: &Path, settings: &OperatorSettings) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(settings)
+        .map_err(|err| format!("failed to serialize operator settings: {err}"))?;
+    write_text_atomically(path, &(text + "\n"))
+}
+
+fn launch_agent_plist() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{LOGIN_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>-b</string>
+    <string>{APP_BUNDLE_ID}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+fn set_launch_agent_enabled(path: &Path, enabled: bool) -> Result<(), String> {
+    if enabled {
+        write_text_atomically(path, &launch_agent_plist())
+    } else if path.exists() {
+        fs::remove_file(path).map_err(|err| format!("failed to remove {}: {err}", path.display()))
+    } else {
+        Ok(())
+    }
+}
+
+fn operator_settings_status(app: &AppHandle) -> Result<OperatorSettingsStatus, String> {
+    let settings_path = operator_settings_path(app)?;
+    let launch_agent_path = launch_agent_path()?;
+    let settings = read_operator_settings_from(&settings_path)?;
+    Ok(OperatorSettingsStatus {
+        open_app_at_login: launch_agent_path.exists(),
+        start_tracker_on_launch: settings.start_tracker_on_launch,
+        settings_path: settings_path.display().to_string(),
+        launch_agent_path: launch_agent_path.display().to_string(),
     })
 }
 
@@ -3613,6 +3705,41 @@ cameras:
     }
 
     #[test]
+    fn operator_settings_default_and_roundtrip() {
+        let root = temp_ops_dir("operator-settings");
+        let path = root.join("operator-settings.json");
+
+        let default = read_operator_settings_from(&path).expect("missing settings should default");
+        assert!(!default.start_tracker_on_launch);
+
+        let saved = OperatorSettings {
+            start_tracker_on_launch: true,
+        };
+        write_operator_settings_to(&path, &saved).expect("settings should write");
+        let loaded = read_operator_settings_from(&path).expect("settings should read");
+        assert_eq!(loaded, saved);
+
+        fs::remove_dir_all(&root).expect("temp settings dir should be removable");
+    }
+
+    #[test]
+    fn launch_agent_write_and_remove_uses_bundle_id() {
+        let root = temp_ops_dir("launch-agent");
+        let path = root.join(format!("{LOGIN_AGENT_LABEL}.plist"));
+
+        set_launch_agent_enabled(&path, true).expect("launch agent should write");
+        let plist = fs::read_to_string(&path).expect("launch agent should be readable");
+        assert!(plist.contains(LOGIN_AGENT_LABEL));
+        assert!(plist.contains(APP_BUNDLE_ID));
+        assert!(plist.contains("/usr/bin/open"));
+
+        set_launch_agent_enabled(&path, false).expect("launch agent should remove");
+        assert!(!path.exists());
+
+        fs::remove_dir_all(&root).expect("temp launch agent dir should be removable");
+    }
+
+    #[test]
     fn ops_day_format_uses_civil_dates() {
         assert_eq!(ops_day_from_epoch_day(0), "1970-01-01");
         assert_eq!(
@@ -4009,7 +4136,10 @@ cameras:
         assert_eq!(snapshot.regions[0].dispatch_uv, vec![0.0, 0.0, 0.5, 1.0]);
         assert_eq!(snapshot.regions[1].camera, "cam2");
         assert!(!snapshot.regions[1].tracking_enabled);
-        assert_eq!(snapshot.regions[1].camera_role.as_deref(), Some("auxiliary"));
+        assert_eq!(
+            snapshot.regions[1].camera_role.as_deref(),
+            Some("auxiliary")
+        );
         assert_eq!(snapshot.regions[1].dispatch_uv, vec![0.4, 0.0, 0.6, 1.0]);
         assert!(!snapshot.regions[0].relaxed_presence_enabled);
         assert!(snapshot.regions[1].relaxed_presence_enabled);
@@ -4662,6 +4792,24 @@ fn save_config(app: AppHandle, request: SaveConfigRequest) -> Result<(), String>
     write_text_atomically(&path, &request.content)
 }
 
+#[tauri::command]
+fn read_operator_settings(app: AppHandle) -> Result<OperatorSettingsStatus, String> {
+    operator_settings_status(&app)
+}
+
+#[tauri::command]
+fn save_operator_settings(
+    app: AppHandle,
+    request: SaveOperatorSettingsRequest,
+) -> Result<OperatorSettingsStatus, String> {
+    let settings = OperatorSettings {
+        start_tracker_on_launch: request.start_tracker_on_launch,
+    };
+    write_operator_settings_to(&operator_settings_path(&app)?, &settings)?;
+    set_launch_agent_enabled(&launch_agent_path()?, request.open_app_at_login)?;
+    operator_settings_status(&app)
+}
+
 fn ensure_tracker_not_running(state: &AppState) -> Result<(), String> {
     let mut guard = state
         .child
@@ -5234,6 +5382,8 @@ pub fn run() {
             prepare_runtime,
             read_config,
             save_config,
+            read_operator_settings,
+            save_operator_settings,
             start_tracker,
             start_video_test,
             capture_calibration_frame,

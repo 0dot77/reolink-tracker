@@ -38,6 +38,8 @@ Ultralytics가 다운로드합니다.
 5. 앱을 다시 열고 Projection/Calibration 화면에서 cam0/cam1은 primary, cam2는 auxiliary로
    보이는지 확인합니다.
 6. `Start` 또는 `Show Preview`로 실행합니다.
+7. 무인 운영이 필요하면 `Showtime` 화면에서 `Open app at login`과
+   `Start tracker on launch`를 켭니다.
 
 ## 주의
 
@@ -47,4 +49,7 @@ Ultralytics가 다운로드합니다.
 - 앱 Setup은 기존 config를 덮어쓰지 않아야 하지만, 안전하게 하려면 Setup을 먼저 끝낸 뒤
   `config.yaml`을 복사합니다.
 - repo root의 `config.yaml`이 아니라 앱 runtime의 `config.yaml`이 현장 앱 실행 기준입니다.
-
+- `Open app at login`은 새 Mac의 사용자 계정 아래
+  `~/Library/LaunchAgents/com.taeyang.reolink-tracker.autostart.plist`를 만들거나 삭제합니다.
+- `Start tracker on launch`는 앱 runtime의 `operator-settings.json`에 저장됩니다. Setup과
+  config가 준비된 상태에서만 앱 시작 직후 tracker를 자동으로 시작합니다.

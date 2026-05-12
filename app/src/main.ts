@@ -31,6 +31,13 @@ type MobileServerStatus = {
   error: string | null;
 };
 
+type OperatorSettingsStatus = {
+  open_app_at_login: boolean;
+  start_tracker_on_launch: boolean;
+  settings_path: string;
+  launch_agent_path: string;
+};
+
 type TrackerLog = {
   stream: string;
   line: string;
@@ -266,6 +273,7 @@ const state: {
   section: SectionId;
   runtime: RuntimeStatus | null;
   mobile: MobileServerStatus | null;
+  operatorSettings: OperatorSettingsStatus | null;
   process: ProcessStatus;
   config: string;
   logs: TrackerLog[];
@@ -306,6 +314,7 @@ const state: {
   section: "live",
   runtime: null,
   mobile: null,
+  operatorSettings: null,
   process: { running: false, exit_code: null },
   config: "",
   logs: [],
@@ -383,6 +392,7 @@ let pendingWorkbenchWarpPersistRefresh = false;
 let workbenchWarpPersistTimer: number | null = null;
 let workbenchWarpPersistInFlight = false;
 let workbenchCanvasEditStart: WorkbenchCanvasSize | null = null;
+let launchAutoStartAttempted = false;
 
 function isConfigEditorActive(): boolean {
   return state.section === "config" && document.activeElement?.id === "configEditor";
@@ -647,6 +657,9 @@ function render(): void {
   }
   root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => {
     button.addEventListener("click", () => void handleAction(button.dataset.action ?? "", button));
+  });
+  root.querySelectorAll<HTMLInputElement>('input[type="checkbox"][data-action]').forEach((input) => {
+    input.addEventListener("change", () => void handleAction(input.dataset.action ?? "", input));
   });
   root.querySelectorAll<HTMLButtonElement>("button[data-section]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1429,7 +1442,37 @@ function showtimeSection(): string {
           ${report ? `<div class="field-summary">last run ${formatCheckTime(report.generated_at)} · targets ${report.target_count}</div>` : ""}
         </div>
       </article>
+      ${startupAutomationPanel()}
     </section>
+  `;
+}
+
+function startupAutomationPanel(): string {
+  const settings = state.operatorSettings;
+  const openAtLogin = Boolean(settings?.open_app_at_login);
+  const startOnLaunch = Boolean(settings?.start_tracker_on_launch);
+  return `
+    <article class="panel startup-panel">
+      <div class="panel-head"><h3>startup automation</h3><span class="sub">${openAtLogin || startOnLaunch ? "armed" : "manual"}</span></div>
+      <div class="panel-body">
+        <div class="automation-grid">
+          <label class="check-control automation-control">
+            <input type="checkbox" data-action="toggle-open-at-login" ${openAtLogin ? "checked" : ""} ${buttonDisabled(!hasTauriRuntime)}>
+            <span>Open app at login</span>
+            <b class="${openAtLogin ? "is-on" : "is-off"}">${openAtLogin ? "on" : "off"}</b>
+          </label>
+          <label class="check-control automation-control">
+            <input type="checkbox" data-action="toggle-start-on-launch" ${startOnLaunch ? "checked" : ""} ${buttonDisabled(!hasTauriRuntime)}>
+            <span>Start tracker on launch</span>
+            <b class="${startOnLaunch ? "is-on" : "is-off"}">${startOnLaunch ? "on" : "off"}</b>
+          </label>
+        </div>
+        <div class="kv compact">
+          <div class="row"><span class="k">settings</span><span class="v">${escapeHtml(shortPath(settings?.settings_path))}</span></div>
+          <div class="row"><span class="k">launch agent</span><span class="v">${escapeHtml(shortPath(settings?.launch_agent_path))}</span></div>
+        </div>
+      </div>
+    </article>
   `;
 }
 
@@ -3056,6 +3099,15 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       error: null,
     } as T;
   }
+  if (command === "read_operator_settings" || command === "save_operator_settings") {
+    const request = args?.request as { openAppAtLogin?: boolean; startTrackerOnLaunch?: boolean } | undefined;
+    return {
+      open_app_at_login: Boolean(request?.openAppAtLogin),
+      start_tracker_on_launch: Boolean(request?.startTrackerOnLaunch),
+      settings_path: "app-data/runtime/operator-settings.json",
+      launch_agent_path: "~/Library/LaunchAgents/com.taeyang.reolink-tracker.autostart.plist",
+    } as T;
+  }
   if (command === "start_video_test") {
     return { running: true, exit_code: null } as T;
   }
@@ -3699,6 +3751,19 @@ async function handleAction(action: string, source?: HTMLElement): Promise<void>
       state.network = await invoke<NetworkReport>("collect_network_report");
     } else if (action === "field-checks") {
       state.fieldChecks = await invoke<FieldCheckReport>("run_field_checks");
+    } else if (action === "toggle-open-at-login" || action === "toggle-start-on-launch") {
+      const current = state.operatorSettings ?? {
+        open_app_at_login: false,
+        start_tracker_on_launch: false,
+        settings_path: "",
+        launch_agent_path: "",
+      };
+      state.operatorSettings = await invoke<OperatorSettingsStatus>("save_operator_settings", {
+        request: {
+          openAppAtLogin: action === "toggle-open-at-login" ? !current.open_app_at_login : current.open_app_at_login,
+          startTrackerOnLaunch: action === "toggle-start-on-launch" ? !current.start_tracker_on_launch : current.start_tracker_on_launch,
+        },
+      });
     } else if (action === "operations-refresh") {
       await refreshOperations();
     } else if (action === "projection-refresh") {
@@ -3780,6 +3845,14 @@ async function refreshMobile(): Promise<void> {
   }
 }
 
+async function refreshOperatorSettings(): Promise<void> {
+  try {
+    state.operatorSettings = await invoke<OperatorSettingsStatus>("read_operator_settings");
+  } catch {
+    state.operatorSettings = null;
+  }
+}
+
 async function refreshOperations(): Promise<void> {
   try {
     state.opsDays = await invoke<OpsDay[]>("list_ops_days");
@@ -3804,10 +3877,28 @@ async function refreshOpsSummary(): Promise<void> {
 async function refreshAll(): Promise<void> {
   state.runtime = await invoke<RuntimeStatus>("get_runtime_status");
   state.process = await invoke<ProcessStatus>("tracker_status");
+  await refreshOperatorSettings();
   await refreshMobile();
   await refreshConfig();
   await refreshProjection();
   await refreshOperations();
+}
+
+async function maybeStartTrackerOnLaunch(): Promise<void> {
+  if (launchAutoStartAttempted) {
+    return;
+  }
+  launchAutoStartAttempted = true;
+  if (!state.operatorSettings?.start_tracker_on_launch || state.process.running || !isSetupReady()) {
+    return;
+  }
+  try {
+    await refreshConfig();
+    await refreshProjection();
+    state.process = await invoke<ProcessStatus>("start_tracker", { showPreview: false });
+  } catch (error) {
+    state.error = `Auto-start failed: ${String(error)}`;
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -3940,6 +4031,7 @@ setInterval(() => {
 }, 2500);
 
 void refreshAll()
+  .then(maybeStartTrackerOnLaunch)
   .catch((error) => {
     state.error = String(error);
   })
